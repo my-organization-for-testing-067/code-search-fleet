@@ -21,6 +21,8 @@ repos: a fleet directory holding every repo on main, ticket workspaces built
 from git worktrees, and the search model layered over them.
 
 ```sh
+scripts/cs uses "/api/v1/inventory/reserve"        # search: one facade over 5 engines
+scripts/cs engines                                 # which engines are installed
 scripts/refresh-fleet                              # daily: pull every repo to origin main
 scripts/new-ticket PROJ-123 repo-a repo-b          # worktrees + indexes for a ticket
 scripts/close-ticket PROJ-123                      # tear it down when merged

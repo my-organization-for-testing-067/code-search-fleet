@@ -156,6 +156,55 @@ already. Worth benchmarking on one real repo both ways before committing.
 Containers also complicate the worktree model, since each ticket workspace
 would need mounting too.
 
+## Round 3: the `cs` facade — 8 of 9
+
+Two more engines added (`semgrep`, `universal-ctags`), then `scripts/cs` put
+one question-shaped interface over all of them. Scored on the same nine
+queries:
+
+| Approach | Score | Note |
+|---|---|---|
+| ripgrep alone | 5/9 | three hollow passes → honestly ~2/9 |
+| tokensave alone | 4/9 | wins 2 cleanly |
+| Serena alone | (subset) | wins the structural questions outright |
+| **`cs` facade** | **8/9** | only the cross-repo name collision fails |
+
+The facade beats every individual engine because it routes each question to the
+engine that can answer it, and because it can do things **no engine does
+alone**:
+
+- **`cs uses`** — the seam question with prose excluded. Text search counts a
+  docstring mentioning an endpoint as a caller; a symbol graph cannot see the
+  string literal that is the real call site. `scripts/lib/filter_code.py`
+  tracks block-comment and docstring state per file, so the middle line of a
+  Python docstring is correctly excluded even though it carries no marker.
+  This alone turned Q1 from a universal failure into a pass.
+- **`cs def`** — universal-ctags indexes the **whole fleet, all five
+  languages, in 0.07s**, so the index is rebuilt per query and can never be
+  stale. It answers Q2, which ripgrep cannot see at all.
+- **`cs seam`** — groups hits by repo and warns when only one repo mentions a
+  string, which is the shape of a dead endpoint or an orphaned consumer.
+- **`cs refs` / `cs impls`** — escalate to Serena's language servers, the only
+  engine that bridges DI. Reserved for that, because it is also the slowest and
+  the only one needing a per-language toolchain.
+
+### The one remaining failure
+
+`discount-engine` (Q7) fails for every approach tried. Answering "which
+`DiscountEngine` does checkout use" requires resolving a Gradle coordinate
+(`com.acme:pricing-lib`) to a repo, which is dependency resolution, not code
+search. The facade at least labels each hit with its repo, so a reader can
+disambiguate — but it does not answer it. Worth stating plainly rather than
+engineering a special case that only works on this fixture.
+
+### Engines are optional, and absence is loud
+
+`cs engines` reports what is present. `cs` degrades rather than silently
+returning nothing — the failure mode that hid the worktree indexing bug
+earlier. Notably, **`rg` on this machine is a Claude Code shell function, not a
+binary**, so a script cannot call it; `cs` detects that and falls back to POSIX
+grep, which matters for any machine where ripgrep was never installed.
+
 ## Still unmeasured
 
 The question this baseline was built to inform — does indexing pay for itself

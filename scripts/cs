@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# cs -- one code-search interface over several engines.
+#
+# Why a facade: measured across nine fixture queries (fixtures/BASELINE.md), no
+# single engine won more than two, and each failed where another succeeded.
+# ripgrep cannot see a route assembled from two C# attributes; a symbol graph
+# cannot see a string literal in argument position; only an LSP resolves an
+# interface to its implementation. Picking one engine means accepting its blind
+# spot permanently.
+#
+# Subcommands are shaped like QUESTIONS, not like tools, so the caller does not
+# need to know which engine answers what -- and so the routing can change
+# without every caller changing. Output is normalized to
+#
+#     repo/path:line: text
+#
+# which keeps results compact (raw tokensave JSON measured ~7x the equivalent
+# ripgrep output) and lets any answer be scored by scripts/score-seams.
+#
+# Usage:
+#   cs text   <pattern>            literal or regex, every repo
+#   cs seam   <string>             cross-repo seam: which repos share this string
+#   cs uses   <string>             like seam, but code only -- comments excluded
+#   cs def    <symbol>             where a symbol is defined, every repo
+#   cs calls  <pattern> [lang]     structural: call shapes, literal arguments
+#   cs impls  <symbol> <repo>      implementations of an interface (LSP)
+#   cs refs   <symbol> <repo> <file>   references to a symbol (LSP)
+#   cs engines                     which engines are available here
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/lib" && pwd)"
+root="${FLEET_ROOT:-$PWD}"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# `rg` may exist only as a shell function (Claude Code proxies its bundled
+# ripgrep that way), which a script cannot call. Require a real binary, and
+# fall back to POSIX grep so the facade works on a machine without ripgrep.
+have_rg_binary() { [[ -x "$(command -v rg 2>/dev/null || true)" ]]; }
+
+# grep_fleet <extra-grep-args...> <pattern>
+grep_fleet() {
+  local pattern="${!#}"
+  local extra=("${@:1:$#-1}")
+  if have_rg_binary; then
+    (cd "$root" && rg --no-heading --line-number --color=never "${extra[@]}" "$pattern" .)
+  else
+    (cd "$root" && grep -rn --binary-files=without-match \
+        --exclude-dir=.git --exclude-dir=.origins --exclude-dir=node_modules \
+        --exclude-dir=bin --exclude-dir=obj --exclude-dir=.serena \
+        --exclude-dir=.tokensave --exclude-dir=.venv \
+        "${extra[@]}" -- "$pattern" .)
+  fi
+}
+ctags_bin() {
+  # Homebrew's universal-ctags is shadowed by the BSD ctags in /usr/bin.
+  if [[ -x /opt/homebrew/bin/ctags ]]; then echo /opt/homebrew/bin/ctags
+  elif have ctags && ctags --version 2>&1 | grep -qi universal; then echo ctags
+  else return 1; fi
+}
+
+# Normalize "path:line:text" to "path:line: text" with the fleet prefix removed.
+normalize() { sed -e "s|^${root}/||" -e 's|^\./||'; }
+
+usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+cmd_engines() {
+  local n=0
+  printf '%-12s %s\n' "ENGINE" "STATUS"
+  if have_rg_binary; then printf '%-12s %s\n' "ripgrep" "ok"; n=$((n+1))
+  else printf '%-12s %s\n' "ripgrep" "absent - using POSIX grep fallback"; fi
+  for e in ast-grep semgrep; do
+    if have "$e"; then printf '%-12s %s\n' "$e" "ok"; n=$((n+1))
+    else printf '%-12s %s\n' "$e" "MISSING"; fi
+  done
+  if ctags_bin >/dev/null; then printf '%-12s %s\n' "ctags" "ok ($(ctags_bin))"; n=$((n+1))
+  else printf '%-12s %s\n' "ctags" "MISSING (brew install universal-ctags)"; fi
+  if have uvx; then printf '%-12s %s\n' "serena" "ok (via uvx)"; n=$((n+1))
+  else printf '%-12s %s\n' "serena" "MISSING (needs uv)"; fi
+  printf '\nfleet root: %s\n' "$root"
+  [[ $n -gt 0 ]]
+}
+
+cmd_text() {
+  [[ $# -ge 1 ]] || die "cs text <pattern>"
+  grep_fleet -E "$1" | normalize
+}
+
+# A seam is a string two repos share. Grouping by repo is the answer -- a flat
+# hit list buries the fact that only one repo mentions it (a dead seam) or that
+# three do (a fan-out nobody expected).
+cmd_seam() {
+  [[ $# -ge 1 ]] || die "cs seam <string>"
+  local hits repos
+  hits=$(grep_fleet -F "$1" | normalize)
+  if [[ -z "$hits" ]]; then
+    info "no repo mentions '$1'"
+    return 1
+  fi
+  repos=$(printf '%s\n' "$hits" | cut -d/ -f1 | sort -u)
+  printf '%s\n' "$hits"
+  info ""
+  info "${C_BOLD}$(printf '%s\n' "$repos" | wc -l | tr -d ' ') repo(s):${C_OFF} $(printf '%s ' $repos)"
+  if [[ $(printf '%s\n' "$repos" | wc -l | tr -d ' ') -eq 1 ]]; then
+    warn "only one repo mentions this -- a producer with no consumer, or dead"
+  fi
+}
+
+# "Who actually uses this string in code?" -- the seam question with prose
+# removed. No single engine answered this: text search counts a docstring
+# mentioning an endpoint as a caller, and a symbol graph cannot see the string
+# literal that is the real call site.
+cmd_uses() {
+  [[ $# -ge 1 ]] || die "cs uses <string>"
+  local hits repos
+  hits=$(grep_fleet -F "$1" | normalize | python3 "$lib_dir/filter_code.py" --root "$root")
+  if [[ -z "$hits" ]]; then
+    info "no code uses '$1'"
+    local prose
+    prose=$(grep_fleet -F "$1" | normalize | python3 "$lib_dir/filter_code.py" --invert --root "$root")
+    if [[ -n "$prose" ]]; then
+      warn "mentioned only in comments/docs:"
+      printf '%s\n' "$prose"
+    fi
+    return 1
+  fi
+  printf '%s\n' "$hits"
+  repos=$(printf '%s\n' "$hits" | cut -d/ -f1 | sort -u)
+  info ""
+  info "${C_BOLD}$(printf '%s\n' "$repos" | wc -l | tr -d ' ') repo(s) use it:${C_OFF} $(printf '%s ' $repos)"
+}
+
+cmd_def() {
+  [[ $# -ge 1 ]] || die "cs def <symbol>"
+  local ct; ct=$(ctags_bin) || die "universal-ctags not installed"
+  local tags="${TMPDIR:-/tmp}/cs-tags.$$"
+  # Rebuilding is cheap (measured 0.07s over the whole fixture fleet), so the
+  # index is never stale.
+  (cd "$root" && "$ct" -R --fields=+n -f "$tags" . 2>/dev/null)
+  if [[ ! -s "$tags" ]]; then rm -f "$tags"; die "ctags produced no index under $root"; fi
+  awk -F'\t' -v want="$1" '$1 == want {
+      line = "?"; kind = "?";
+      for (i = 4; i <= NF; i++) {
+        if ($i ~ /^line:/) { line = substr($i, 6) }
+        else if (length($i) <= 2) { kind = $i }
+      }
+      printf "%s:%s: [%s] %s\n", $2, line, kind, want
+  }' "$tags" | sort -u
+  rm -f "$tags"
+}
+
+cmd_calls() {
+  [[ $# -ge 1 ]] || die "cs calls <pattern> [lang]"
+  local pattern="$1" lang="${2:-}"
+  if have ast-grep; then
+    local args=(-p "$pattern")
+    [[ -n "$lang" ]] && args+=(-l "$lang")
+    (cd "$root" && ast-grep "${args[@]}" 2>/dev/null) | normalize
+  elif have semgrep; then
+    local args=(-e "$pattern" --quiet --no-git-ignore)
+    [[ -n "$lang" ]] && args+=(-l "$lang")
+    (cd "$root" && semgrep "${args[@]}" 2>/dev/null) | normalize
+  else
+    die "neither ast-grep nor semgrep installed"
+  fi
+}
+
+# The LSP-backed answers are the only ones that resolve an interface to its
+# implementation, so they are worth the setup cost -- but only these.
+cmd_impls() {
+  [[ $# -ge 2 ]] || die "cs impls <symbol> <repo>"
+  have uvx || die "serena needs uv installed"
+  local repo_dir="$root/$2"
+  [[ -d "$repo_dir" ]] || die "no such repo: $2"
+  python3 "$lib_dir/serena_call.py" "$repo_dir" find_implementations \
+    "{\"trait\":\"$1\"}" 2>&1 || \
+  python3 "$lib_dir/serena_call.py" "$repo_dir" find_implementations \
+    "{\"method\":\"$1\"}"
+}
+
+cmd_refs() {
+  [[ $# -ge 3 ]] || die "cs refs <symbol> <repo> <file-relative-to-repo>"
+  have uvx || die "serena needs uv installed"
+  local repo_dir="$root/$2"
+  [[ -d "$repo_dir" ]] || die "no such repo: $2"
+  python3 "$lib_dir/serena_call.py" "$repo_dir" find_referencing_symbols \
+    "{\"name_path\":\"$1\",\"relative_path\":\"$3\"}"
+}
+
+[[ $# -ge 1 ]] || usage 1
+sub="$1"; shift
+case "$sub" in
+  text)    cmd_text "$@" ;;
+  seam)    cmd_seam "$@" ;;
+  uses)    cmd_uses "$@" ;;
+  def)     cmd_def "$@" ;;
+  calls)   cmd_calls "$@" ;;
+  impls)   cmd_impls "$@" ;;
+  refs)    cmd_refs "$@" ;;
+  engines) cmd_engines ;;
+  -h|--help|help) usage 0 ;;
+  *) err "unknown subcommand: $sub"; usage 1 ;;
+esac
