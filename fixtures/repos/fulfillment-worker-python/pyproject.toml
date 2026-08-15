@@ -1,0 +1,9 @@
+[project]
+name = "fulfillment-worker"
+version = "0.3.0"
+requires-python = ">=3.11"
+dependencies = [
+    "kafka-python>=2.0",
+    # Seam: shared contracts package, also depended on by web-monorepo-node.
+    "acme-schemas==2.4.0",
+]

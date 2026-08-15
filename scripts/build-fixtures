@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Materialize fixtures/repos/* as real git repos so the fleet and ticket
+# workflows can be exercised end to end. See fixtures/README.md.
+#
+# Each fixture becomes a bare "origin" plus a working clone, so fetch, reset,
+# worktree, and branch operations all behave like the real thing.
+#
+# Usage: build-fixtures [target-dir]     (default: ./fixture-fleet)
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+src="$repo_root/fixtures/repos"
+target="${1:-$PWD/fixture-fleet}"
+
+[[ -d "$src" ]] || die "fixture sources not found: $src"
+
+if [[ -e "$target" ]]; then
+  die "target already exists: $target (remove it first)"
+fi
+
+mkdir -p "$target/.origins"
+info "${C_BOLD}building fixture fleet${C_OFF} → $target"
+
+for dir in "$src"/*/; do
+  name=$(basename "$dir")
+  origin="$target/.origins/$name.git"
+  work="$target/$name"
+
+  git init --quiet --bare --initial-branch=main "$origin"
+
+  # Build the initial commit in a scratch clone, then discard it.
+  tmp=$(mktemp -d)
+  cp -R "$dir." "$tmp/"
+  git -C "$tmp" init --quiet --initial-branch=main
+  git -C "$tmp" add -A
+  git -C "$tmp" -c user.email=fixtures@local -c user.name=fixtures \
+      commit --quiet -m "Initial commit: $name fixture"
+  git -C "$tmp" remote add origin "$origin"
+  git -C "$tmp" push --quiet origin main
+  rm -rf "$tmp"
+
+  git clone --quiet "$origin" "$work"
+  git -C "$work" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  ok "$name"
+done
+
+info ""
+info "Fixture fleet ready. To exercise the workflow against it:"
+info ""
+info "  export FLEET_ROOT=$target"
+info "  export TICKETS_ROOT=$target/../fixture-tickets"
+info "  $repo_root/scripts/refresh-fleet"
+info "  $repo_root/scripts/new-ticket TEST-1 inventory-api-dotnet checkout-service-kotlin"
+info "  $repo_root/scripts/close-ticket TEST-1"
+info ""
+info "Seams to search for are listed in fixtures/GROUND-TRUTH.md."

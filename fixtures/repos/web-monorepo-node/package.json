@@ -1,0 +1,12 @@
+{
+  "name": "@acme/web-monorepo",
+  "private": true,
+  "workspaces": [
+    "packages/schemas",
+    "packages/admin-ui",
+    "packages/order-status"
+  ],
+  "dependencies": {
+    "acme-schemas": "2.4.0"
+  }
+}
