@@ -1,0 +1,2 @@
+*.kt diff=java
+*.kts diff=java

@@ -1,5 +1,8 @@
 package com.acme.checkout
 
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
@@ -29,8 +32,10 @@ class InventoryClient(
         }
     }
 
+    // Parsed as JSON rather than matched as text: the upstream serializer is
+    // free to change whitespace, field order, or escaping without notice.
     private fun parseReservationId(payload: String): String =
-        Regex("\"reservationId\":\"([^\"]+)\"").find(payload)?.groupValues?.get(1)
+        Json.parseToJsonElement(payload).jsonObject["reservationId"]?.jsonPrimitive?.content
             ?: error("no reservationId in response")
 }
 

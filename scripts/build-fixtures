@@ -5,19 +5,57 @@
 # Each fixture becomes a bare "origin" plus a working clone, so fetch, reset,
 # worktree, and branch operations all behave like the real thing.
 #
+# History is replayed rather than squashed into one commit: for every incident
+# in fixtures/incidents/ the buggy state is committed first (with the ticket ID
+# in the message), then unrelated commits, then the fix. This gives skills like
+# postmortem real archaeology to do -- `git log -L` lands on a genuine
+# introducing commit rather than on an import.
+#
 # Usage: build-fixtures [target-dir]     (default: ./fixture-fleet)
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 src="$repo_root/fixtures/repos"
+incidents_dir="$repo_root/fixtures/incidents"
 target="${1:-$PWD/fixture-fleet}"
 
-[[ -d "$src" ]] || die "fixture sources not found: $src"
+BASE_DATE="2026-01-12T09:03:00"
+BASE_AUTHOR="Priya Raman <priya.raman@acme.example>"
 
-if [[ -e "$target" ]]; then
-  die "target already exists: $target (remove it first)"
-fi
+[[ -d "$src" ]] || die "fixture sources not found: $src"
+[[ -e "$target" ]] && die "target already exists: $target (remove it first)"
+
+# git commit with a fixed identity and timestamp, so history is reproducible.
+commit_as() {
+  local dir="$1" author="$2" date="$3" msg_file="$4"
+  local name="${author%% <*}" email="${author#*<}"; email="${email%>}"
+  GIT_AUTHOR_NAME="$name" GIT_AUTHOR_EMAIL="$email" GIT_AUTHOR_DATE="$date" \
+  GIT_COMMITTER_NAME="$name" GIT_COMMITTER_EMAIL="$email" GIT_COMMITTER_DATE="$date" \
+    git -C "$dir" commit --quiet --allow-empty -F "$msg_file"
+}
+
+# Append a line to a changelog and commit it, so the introducing commit is not
+# adjacent to the fix in `git log`.
+noise_commit() {
+  local dir="$1" author="$2" date="$3" text="$4"
+  mkdir -p "$dir/docs"
+  printf -- '- %s\n' "$text" >> "$dir/docs/CHANGELOG.md"
+  git -C "$dir" add -A
+  local tmp; tmp=$(mktemp)
+  printf '%s\n' "$text" > "$tmp"
+  commit_as "$dir" "$author" "$date" "$tmp"
+  rm -f "$tmp"
+}
+
+incidents_for() {
+  local repo="$1" d
+  [[ -d "$incidents_dir" ]] || return 0
+  for d in "$incidents_dir"/*/; do
+    [[ -f "${d}incident.env" ]] || continue
+    if grep -q "^REPO=${repo}$" "${d}incident.env"; then printf '%s\n' "$d"; fi
+  done | sort
+}
 
 mkdir -p "$target/.origins"
 info "${C_BOLD}building fixture fleet${C_OFF} → $target"
@@ -29,20 +67,66 @@ for dir in "$src"/*/; do
 
   git init --quiet --bare --initial-branch=main "$origin"
 
-  # Build the initial commit in a scratch clone, then discard it.
   tmp=$(mktemp -d)
-  cp -R "$dir." "$tmp/"
   git -C "$tmp" init --quiet --initial-branch=main
+
+  # 1. The project as it was imported.
+  cp -R "$dir." "$tmp/"
   git -C "$tmp" add -A
-  git -C "$tmp" -c user.email=fixtures@local -c user.name=fixtures \
-      commit --quiet -m "Initial commit: $name fixture"
+  msg=$(mktemp); printf 'Import %s\n' "$name" > "$msg"
+  commit_as "$tmp" "$BASE_AUTHOR" "$BASE_DATE" "$msg"
+
+  n_inc=0
+  while IFS= read -r inc; do
+    [[ -n "$inc" ]] || continue
+    n_inc=$((n_inc + 1))
+    # shellcheck disable=SC1091
+    source "${inc}incident.env"
+
+    # 2. Regress the touched files to their buggy state.
+    cp -R "${inc}before/." "$tmp/"
+    git -C "$tmp" add -A
+    commit_as "$tmp" "$INTRODUCED_AUTHOR" "$INTRODUCED_DATE" "${inc}introduced.msg"
+
+    # 3. Unrelated work lands on top, so archaeology is not a one-step walk.
+    noise_commit "$tmp" "$BASE_AUTHOR" "$NOISE_DATE_1" "$NOISE_1"
+    noise_commit "$tmp" "$BASE_AUTHOR" "$NOISE_DATE_2" "$NOISE_2"
+
+    # 4. The fix restores exactly the files this incident touched.
+    (cd "${inc}before" && find . -type f) | while IFS= read -r rel; do
+      rel="${rel#./}"
+      if [[ -f "$dir/$rel" ]]; then
+        mkdir -p "$(dirname "$tmp/$rel")"
+        cp "$dir/$rel" "$tmp/$rel"
+      else
+        rm -f "$tmp/$rel"   # file did not exist before the fix introduced it
+      fi
+    done
+    git -C "$tmp" add -A
+    commit_as "$tmp" "$FIX_AUTHOR" "$FIX_DATE" "${inc}fix.msg"
+
+    unset REPO TICKET INTRODUCED_DATE INTRODUCED_AUTHOR FIX_DATE FIX_AUTHOR \
+          NOISE_1 NOISE_2 NOISE_DATE_1 NOISE_DATE_2
+  done < <(incidents_for "$name")
+
+  # Guard: the tip must match the canonical tree, or the fixture lies.
+  if ! diff -r -q --exclude=.git --exclude=docs "$dir" "$tmp" >/dev/null 2>&1; then
+    err "$name: replayed history does not end at the canonical tree"
+    diff -r -q --exclude=.git --exclude=docs "$dir" "$tmp" | head -5 >&2
+    exit 1
+  fi
+
   git -C "$tmp" remote add origin "$origin"
   git -C "$tmp" push --quiet origin main
-  rm -rf "$tmp"
+  rm -rf "$tmp" "$msg"
 
   git clone --quiet "$origin" "$work"
   git -C "$work" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
-  ok "$name"
+  if [[ $n_inc -gt 0 ]]; then
+    ok "$name ($n_inc incident(s), $(git -C "$work" rev-list --count HEAD) commits)"
+  else
+    ok "$name ($(git -C "$work" rev-list --count HEAD) commits)"
+  fi
 done
 
 info ""
@@ -52,6 +136,6 @@ info "  export FLEET_ROOT=$target"
 info "  export TICKETS_ROOT=$target/../fixture-tickets"
 info "  $repo_root/scripts/refresh-fleet"
 info "  $repo_root/scripts/new-ticket TEST-1 inventory-api-dotnet checkout-service-kotlin"
-info "  $repo_root/scripts/close-ticket TEST-1"
 info ""
-info "Seams to search for are listed in fixtures/GROUND-TRUTH.md."
+info "Seams to search for are in fixtures/GROUND-TRUTH.md."
+info "Seeded incidents for postmortem practice are in fixtures/INCIDENTS.md."
