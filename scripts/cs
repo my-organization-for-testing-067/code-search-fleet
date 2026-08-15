@@ -46,10 +46,12 @@
 #   --quiet          suppress the provenance line (stdout is unaffected either way)
 #   --all            no result cap for this query
 #   --engine=<name>  force one engine and fail rather than fall back
+#   --refresh        rebuild the cached symbol index instead of reusing it
 #
 # Environment:
 #   CS_MAX_RESULTS   result cap, default 200 (0 = unlimited)
 #   CS_TIMEOUT       per-engine timeout in seconds, default 120 (0 = none)
+#   CS_TAGS_TTL      how long `cs def` reuses its symbol index, default 60s
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
@@ -200,18 +202,38 @@ run_timed() {
 }
 timed_out() { [[ -s "$CS_TIMEOUT_FLAG" ]]; }
 
-# grep_fleet <extra-grep-args...> <pattern>
-# Extra args are given in grep spelling (-E, -F, -i); ripgrep accepts the same
-# three, which is why the callers can stay backend-agnostic.
+# grep_fleet <regex|literal> <pattern>
+#
+# The mode is named rather than passed as a flag, because the two backends do
+# NOT share a flag vocabulary and assuming they did was a real bug: `-E` means
+# --extended-regexp to grep and --encoding to ripgrep, so every `cs text` query
+# died with "unknown encoding" and reported "nothing found". It went unnoticed
+# because the machine it was written on had no ripgrep binary, which is the
+# whole argument for the parity check in verify-search.
 grep_fleet() {
-  local pattern="${!#}"
-  local extra=("${@:1:$#-1}")
-  if [[ "$(text_engine)" == ripgrep ]]; then
+  local mode="$1" pattern="$2" engine
+  engine=$(text_engine)
+  # An empty array expanded under `set -u` is an error on bash 3.2, which is
+  # what macOS ships, so the mode flag is always a single value rather than a
+  # possibly-empty list.
+  local extra="--regexp"
+  if [[ "$engine" == ripgrep ]]; then
+    # ripgrep is a regex engine by default; -F restricts it to a literal.
+    [[ "$mode" == literal ]] && extra="--fixed-strings"
+  else
+    case "$mode" in
+      literal) extra="-F" ;;
+      regex)   extra="-E" ;;
+    esac
+  fi
+  if [[ "$engine" == ripgrep ]]; then
+    # --regexp is ripgrep's default, so pass a harmless flag instead of none.
+    [[ "$extra" == "--regexp" ]] && extra="--no-config"
     local globs=() d
     for d in "${CS_EXCLUDE_DIRS[@]}"; do globs+=(--glob "!**/$d/**" --glob "!$d/**"); done
     (cd "$view" && run_timed rg --follow --hidden --no-ignore \
         --no-heading --line-number --color=never \
-        "${globs[@]}" "${extra[@]}" -- "$pattern" .)
+        "${globs[@]}" "$extra" -- "$pattern" .)
   else
     # BSD grep's -R follows a symlink named on the command line but NOT one it
     # meets while recursing, so `grep -R pattern .` silently finds nothing in a
@@ -221,7 +243,7 @@ grep_fleet() {
     local ex=() d
     for d in "${CS_EXCLUDE_DIRS[@]}"; do ex+=("--exclude-dir=$d"); done
     run_timed grep -Rn --binary-files=without-match \
-        "${ex[@]}" "${extra[@]}" -- "$pattern" "$view"/*/ 2>/dev/null
+        "${ex[@]}" "$extra" -- "$pattern" "$view"/*/ 2>/dev/null
   fi
 }
 ctags_bin() {
@@ -401,7 +423,7 @@ hint() { info ""; info "${C_BOLD}nothing found — try:${C_OFF}"; while [[ $# -g
 cmd_text() {
   [[ $# -ge 1 ]] || die "cs text <pattern>"
   answer textual "$(text_engine)" "regex"
-  local out; out=$(grep_fleet -E "$1" | normalize)
+  local out; out=$(grep_fleet regex "$1" | normalize)
   if [[ -z "$out" ]]; then
     report_answer 0 0
     hint "cs def $1              (it may be a symbol, not literal text)" \
@@ -419,7 +441,7 @@ cmd_seam() {
   [[ $# -ge 1 ]] || die "cs seam <string>"
   answer textual "$(text_engine)" "literal, grouped by repo"
   local hits repos n
-  hits=$(grep_fleet -F "$1" | normalize)
+  hits=$(grep_fleet literal "$1" | normalize)
   if [[ -z "$hits" ]]; then
     info "no repo mentions '$1'"
     report_answer 0 0
@@ -484,11 +506,11 @@ cmd_uses() {
   [[ $# -ge 1 ]] || die "cs uses <string>"
   answer heuristic "$(text_engine)" "literal, prose filtered"
   local hits repos
-  hits=$(grep_fleet -F "$1" | normalize | python3 "$lib_dir/filter_code.py" --root "$view")
+  hits=$(grep_fleet literal "$1" | normalize | python3 "$lib_dir/filter_code.py" --root "$view")
   if [[ -z "$hits" ]]; then
     info "no code uses '$1'"
     local prose
-    prose=$(grep_fleet -F "$1" | normalize | python3 "$lib_dir/filter_code.py" --invert --root "$view")
+    prose=$(grep_fleet literal "$1" | normalize | python3 "$lib_dir/filter_code.py" --invert --root "$view")
     if [[ -n "$prose" ]]; then
       warn "mentioned only in comments/docs:"
       printf '%s\n' "$prose"
@@ -503,15 +525,49 @@ cmd_uses() {
   report_answer "$(n_hits_in "$hits")" "$(n_repos_in "$hits")"
 }
 
+# The fleet's identity for caching: which repos are in the view and what commit
+# each sits on. Reading refs is milliseconds; it is the one cheap thing that
+# changes whenever the fleet is refreshed or a ticket branch moves.
+view_fingerprint() {
+  local d
+  { printf '%s\n' "$view"
+    for d in $(real_dirs); do
+      printf '%s %s\n' "$(basename "$d")" \
+        "$(git -C "$d" rev-parse HEAD 2>/dev/null || echo nogit)"
+    done
+  } | (md5 -q 2>/dev/null || md5sum 2>/dev/null | cut -d' ' -f1)
+}
+
 cmd_def() {
   [[ $# -ge 1 ]] || die "cs def <symbol> [repo]"
   local only="${2:-}"
   local ct; ct=$(ctags_bin) || die "universal-ctags not installed"
-  answer structural "ctags" "fleet-wide symbol index, rebuilt per query"
-  local tags="${TMPDIR:-/tmp}/cs-tags.$$"
-  # Rebuilding is cheap (measured 0.07s over the whole fixture fleet), so the
-  # index is never stale.
-  "$ct" -R --links=yes --fields=+n -f "$tags" "$view"/*/ 2>/dev/null
+
+  # The index was originally rebuilt on every query, on the grounds that it is
+  # cheap and therefore never stale. That held at 0.07s on a five-file fixture
+  # and does not hold at scale: measured 5.8s over 456k lines (scripts/
+  # bench-scale), which puts a real ten-repo fleet well past the point where
+  # anyone would keep using the command.
+  #
+  # So it is cached, keyed on the repos in view and the commit each is on, with
+  # a short TTL as the backstop for uncommitted edits -- which refs cannot see
+  # and which are exactly what you have while working a ticket. The staleness
+  # window is bounded and stated rather than hidden; --refresh forces a rebuild.
+  local fp tags age ttl="${CS_TAGS_TTL:-60}" cached=""
+  fp=$(view_fingerprint)
+  tags="${TMPDIR:-/tmp}/cs-tags-${fp}.tags"
+
+  if [[ $refresh_index -eq 0 && -s "$tags" ]]; then
+    age=$(( $(date +%s) - $(stat -f %m "$tags" 2>/dev/null || stat -c %Y "$tags" 2>/dev/null || echo 0) ))
+    if [[ $age -lt $ttl ]]; then cached="cached ${age}s ago"; fi
+  fi
+
+  if [[ -z "$cached" ]]; then
+    run_timed "$ct" -R --links=yes --fields=+n -f "$tags" "$view"/*/ 2>/dev/null
+    answer structural "ctags" "fleet-wide symbol index, rebuilt now"
+  else
+    answer structural "ctags" "fleet-wide symbol index, $cached — uncommitted edits within ${ttl}s may be missing (--refresh)"
+  fi
   if [[ ! -s "$tags" ]]; then rm -f "$tags"; die "ctags produced no index under $root"; fi
   awk -F'\t' -v want="$1" '$1 == want {
       line = "?"; kind = "?";
@@ -521,7 +577,6 @@ cmd_def() {
       }
       printf "%s:%s: [%s] %s\n", $2, line, kind, want
   }' "$tags" | normalize | sort -u | { if [[ -n "$only" ]]; then grep "^$only/" || true; else cat; fi; } > "$tags.out"
-  rm -f "$tags"
   if [[ ! -s "$tags.out" ]]; then
     rm -f "$tags.out"
     report_answer 0 0
@@ -768,6 +823,7 @@ fleet_only=0
 show_why=0
 quiet=0
 touched_mode=0
+refresh_index=0
 force_engine=""
 CS_MAX_RESULTS="${CS_MAX_RESULTS:-200}"
 args=()
@@ -780,6 +836,7 @@ for a in "$@"; do
     --all) CS_MAX_RESULTS=0 ;;
     --touched) touched_mode=1 ;;
     --engine=*) force_engine="${a#--engine=}" ;;
+    --refresh) refresh_index=1 ;;
     *) args+=("$a") ;;
   esac
 done

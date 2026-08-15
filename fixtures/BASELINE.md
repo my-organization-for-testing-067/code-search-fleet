@@ -251,3 +251,67 @@ grep, which matters for any machine where ripgrep was never installed.
 The question this baseline was built to inform — does indexing pay for itself
 on a 100K+ LOC repo with real queries — needs a real repo and a query set from
 real tickets. Nothing here substitutes for that.
+
+## Round 5: what happens at 456k lines (2026-08-15)
+
+Everything above was measured on five repos of five files each, where every
+engine looks instant and the index-versus-grep question cannot even be asked.
+`scripts/bench-scale` generates a synthetic fleet — 10 repos, 20,150 files,
+456,000 lines, 161MB — and times the facade against it.
+
+| Query | Cost | Hits |
+|---|---|---|
+| `cs uses` (literal, fleet-wide, prose filtered) | 299 ms | 242 |
+| `cs seam` (literal, fleet-wide) | 283 ms | 242 |
+| `cs text` (regex, fleet-wide) | 267 ms | — |
+| **`cs def` (ctags index built cold)** | **5,901 ms** | — |
+| **`cs def` (ctags index reused)** | **744 ms** | — |
+| `cs history` (git pickaxe, every repo) | 1,591 ms | 10 |
+| `cs deps` (build manifests) | 470 ms | — |
+| ripgrep vs POSIX grep, same query | 286 ms vs 885 ms | 242 |
+
+**This is a floor, not an estimate.** Synthetic files have no vendored trees,
+no generated code, no minified assets, and none of the drift that makes real
+repos expensive.
+
+### Three things it settled
+
+**1. Rebuilding the symbol index per query does not survive scale.** That design
+was justified by "0.07s, so it can never be stale" — true at five files, false
+at 456k lines, where it costs 5.9s. A real ten-repo fleet is several times
+larger again. `cs def` now caches the index keyed on the repos in view and the
+commit each is on, with a 60s TTL as the backstop for uncommitted edits, which
+refs cannot see. 5.9s → 0.74s. The staleness window is stated in the answer line
+rather than hidden, and `--refresh` forces a rebuild.
+
+**2. Fleet-wide grep is fast enough that indexed search is not the bottleneck.**
+280-300ms across 161MB. That is the measurement Zoekt was going to be evaluated
+against, and it argues against adopting it: an indexed engine would buy perhaps
+250ms per query in exchange for an index to build, host, and keep fresh. Revisit
+if the real fleet is an order of magnitude larger than this corpus — the
+`bench-scale` numbers are how to decide, rather than intuition.
+
+**3. The result cap earns its place.** `cs text '\bid\b'` returns **24,000
+lines** uncapped. Capped at 200 with the per-repo distribution printed, the same
+query stays readable and still says where the other 23,800 are. Before the cap
+existed, that query would have put roughly 1.5MB into an agent's context.
+
+### Two bugs it exposed
+
+Both were invisible on the small fixture, and both are the failure mode this
+project cares most about — a wrong answer that looks like a clean one.
+
+**`cs text` was broken for every regex whenever ripgrep was installed.** `-E`
+means `--extended-regexp` to grep and `--encoding` to ripgrep, so the query died
+with `unknown encoding` and `cs` reported *"nothing found"*. It survived because
+the machine it was written on had no ripgrep binary and silently used the grep
+fallback — the same shell-function trap recorded at the top of this file, in a
+new costume. The backends no longer share a flag vocabulary; the mode is named
+and translated per engine, and `verify-search` now diffs regex queries across
+both backends, not just literal ones.
+
+**ripgrep and grep were searching different file sets.** ripgrep skips dotted
+paths and honours `.gitignore`; grep does neither. A feature-flag key in
+`.github/workflows/` was therefore found on a machine without ripgrep and missed
+on one with it. Both backends now share one exclusion list, and `verify-search`
+asserts they agree.

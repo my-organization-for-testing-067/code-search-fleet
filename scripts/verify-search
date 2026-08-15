@@ -94,10 +94,21 @@ if [[ -x "$(command -v rg 2>/dev/null || true)" ]]; then
            'inventory.reserve.enabled' 'DiscountEngine'; do
     a=$(CS_TEXT_ENGINE=ripgrep "$here/cs" seam "$q" --quiet --all 2>/dev/null | sort)
     b=$(CS_TEXT_ENGINE=grep    "$here/cs" seam "$q" --quiet --all 2>/dev/null | sort)
-    [[ "$a" == "$b" ]] || parity_bad+=("$q")
+    [[ "$a" == "$b" ]] || parity_bad+=("literal:$q")
+  done
+  # Regex is checked separately because the two backends do not share a flag
+  # vocabulary: -E is --extended-regexp to grep and --encoding to ripgrep. That
+  # made every `cs text` query fail with "unknown encoding" and report "nothing
+  # found" on any machine that had ripgrep -- while the literal queries above,
+  # which use -F, kept passing.
+  for q in 'reserv[a-z]+Id' 'inventory\.reserve\.[a-z]+' 'class [A-Z][a-zA-Z]*'; do
+    a=$(CS_TEXT_ENGINE=ripgrep "$here/cs" text "$q" --quiet --all 2>/dev/null | sort)
+    b=$(CS_TEXT_ENGINE=grep    "$here/cs" text "$q" --quiet --all 2>/dev/null | sort)
+    [[ "$a" == "$b" && -n "$a" ]] || parity_bad+=("regex:$q")
   done
   if [[ ${#parity_bad[@]} -eq 0 ]]; then
-    ok "ripgrep and grep return identical results"; pass=$((pass + 1))
+    ok "ripgrep and grep return identical results (literal and regex)"
+    pass=$((pass + 1))
   else
     err "backends disagree on: ${parity_bad[*]}"; fail=$((fail + 1))
     failed_ids+=("engine-parity")

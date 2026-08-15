@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Measure the search stack on a fleet big enough to hurt.
+#
+# Everything measured so far ran on five repos of five files each, where every
+# engine looks instant and the index-vs-grep question cannot even be asked. The
+# decisive measurement is still a real fleet with real queries, and nothing here
+# substitutes for it -- but the *shape* of the cost is measurable now, and it
+# decides things:
+#
+#   - `cs def` rebuilds the ctags index on every query. That is defensible at
+#     0.07s and absurd at 30s. Where the crossover sits determines whether the
+#     no-stale-index design survives contact with ten large repos.
+#   - `cs uses` greps the whole fleet per query. If that is seconds, indexed
+#     search (Zoekt) is worth its operational cost; if it is milliseconds, it is
+#     not.
+#
+# The generated corpus is synthetic and its entropy is fake -- real repos have
+# vendored trees, generated code, and a decade of drift that this does not
+# reproduce. Treat these numbers as a floor on cost, not an estimate of it.
+#
+# Usage: bench-scale [--repos N] [--files-per-repo N] [--keep] [--fleet DIR]
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repos=10
+files=2000
+keep=0
+fleet=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repos) repos="$2"; shift 2 ;;
+    --files-per-repo) files="$2"; shift 2 ;;
+    --fleet) fleet="$2"; shift 2 ;;
+    --keep) keep=1; shift ;;
+    -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+owned=0
+if [[ -z "$fleet" ]]; then
+  fleet="$(mktemp -d)/fleet"
+  owned=1
+  info "${C_BOLD}generating${C_OFF} $repos repos x $files files…"
+  python3 "$here/lib/gen_corpus.py" "$fleet" "$repos" "$files" || die "generation failed"
+fi
+
+total_files=$(find "$fleet" -type f -name '*.*' | grep -c '')
+total_lines=$(find "$fleet" -type f \( -name '*.cs' -o -name '*.kt' -o -name '*.py' \
+              -o -name '*.ts' -o -name '*.java' \) -exec cat {} + | grep -c '')
+size=$(du -sh "$fleet" | cut -f1)
+info "fleet: $fleet"
+info "${C_BOLD}$total_files files, $total_lines lines, $size${C_OFF}"
+info ""
+
+export FLEET_ROOT="$fleet"
+
+# Wall-clock a command, discarding its output. Reported in milliseconds because
+# the interesting differences here are between 40ms and 40s.
+timed() {
+  local label="$1"; shift
+  local start end ms out rc
+  start=$(python3 -c 'import time; print(time.time())')
+  out=$("$@" 2>/dev/null); rc=$?
+  end=$(python3 -c 'import time; print(time.time())')
+  ms=$(python3 -c "print(f'{($end - $start) * 1000:.0f}')")
+  local hits; hits=$(printf '%s' "$out" | grep -c '')
+  printf '%-46s %8s ms  %6s hits\n' "$label" "$ms" "$hits"
+}
+
+info "${C_BOLD}per-query cost${C_OFF}"
+timed "cs uses (literal, fleet-wide, prose filtered)" \
+      "$here/cs" uses 'inventory.reserve.enabled' --quiet --all
+timed "cs seam (literal, fleet-wide)" \
+      "$here/cs" seam 'inventory.reserve.enabled' --quiet --all
+timed "cs text (regex, fleet-wide)" \
+      "$here/cs" text 'reserve[A-Z][a-z]+' --quiet --all
+timed "cs def  (ctags index built cold)" \
+      "$here/cs" def OrderSync0 --quiet --all --refresh
+timed "cs def  (ctags index reused)" \
+      "$here/cs" def OrderSync0 --quiet --all
+timed "cs history (git pickaxe, every repo)" \
+      "$here/cs" history 'inventory.reserve.enabled' --quiet --all
+timed "cs deps (build manifests)" \
+      "$here/cs" deps --quiet
+
+info ""
+info "${C_BOLD}a common token — the case that produces a wall of output${C_OFF}"
+timed "cs text 'id' capped at 200 (the default)" \
+      env CS_MAX_RESULTS=200 "$here/cs" text '\bid\b' --quiet
+timed "cs text 'id' uncapped" \
+      "$here/cs" text '\bid\b' --quiet --all
+
+info ""
+info "${C_BOLD}text backends, head to head${C_OFF}"
+if [[ -x "$(command -v rg 2>/dev/null || true)" ]]; then
+  timed "ripgrep" env CS_TEXT_ENGINE=ripgrep "$here/cs" seam 'inventory.reserve.enabled' --quiet --all
+  timed "POSIX grep" env CS_TEXT_ENGINE=grep "$here/cs" seam 'inventory.reserve.enabled' --quiet --all
+else
+  warn "only the grep backend is installed; nothing to compare"
+fi
+
+info ""
+info "Read these as a floor. Synthetic files have no vendored trees, no"
+info "generated code, and no decade of drift, all of which cost more."
+
+if [[ $owned -eq 1 && $keep -eq 0 ]]; then
+  rm -rf "$(dirname "$fleet")"
+else
+  info ""
+  info "fleet kept at $fleet"
+fi
