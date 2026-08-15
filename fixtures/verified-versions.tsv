@@ -1,0 +1,8 @@
+# engine	version	kind	outcome	note
+# verified 2026-08-15T15:58:51Z
+grep	2.6.0-FreeBSD	capability	PASS	literal text across repos
+ctags	6.2.1	capability	PASS	fleet-wide symbol index
+ast-grep	0.45.1	capability	PASS	literal in argument position
+semgrep	1.173.0	capability	PASS	structural fallback for ast-grep
+tokensave	7.9.0	known-limitation	CONFIRMED	still no C# implements edges
+serena	1.7.1.dev0	capability	PASS	C# interface to implementation

@@ -239,14 +239,42 @@ cmd_calls() {
 # The LSP-backed answers are the only ones that resolve an interface to its
 # implementation, so they are worth the setup cost -- but only these.
 cmd_impls() {
-  [[ $# -ge 2 ]] || die "cs impls <symbol> <repo>"
+  [[ $# -ge 2 ]] || die "cs impls <symbol> <repo> [file]"
   have uvx || die "serena needs uv installed"
-  local repo_dir="$root/$2"
+  local repo_dir="$root/$2" file="${3:-}"
   [[ -d "$repo_dir" ]] || die "no such repo: $2"
+
+  # Serena identifies a symbol by name_path plus the file holding it, so the
+  # symbol is looked up first rather than assuming a bare name is enough.
+  local resolved
+  resolved=$(python3 "$lib_dir/serena_call.py" "$repo_dir" find_symbol \
+             "{\"name_path\":\"$1\",\"include_body\":false}" 2>/dev/null \
+    | python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+try:
+    rows = json.loads(raw) if raw else []
+except json.JSONDecodeError:
+    rows = []
+want = sys.argv[1]
+pick = next((r for r in rows if r.get("kind") not in ("File",)
+             and r.get("name_path", "").split("/")[-1] == want), None)
+if pick:
+    print(pick["name_path"] + "\t" + pick["relative_path"])
+' "$1")
+
+  local name_path rel
+  name_path=$(printf '%s' "$resolved" | cut -f1)
+  rel=$(printf '%s' "$resolved" | cut -f2)
+  [[ -n "$file" ]] && rel="$file"
+  if [[ -z "$name_path" || -z "$rel" ]]; then
+    err "could not locate symbol '$1' in $2"
+    hint "cs def $1 $2            (check the symbol exists and how it is spelled)"
+    return 1
+  fi
+
   python3 "$lib_dir/serena_call.py" "$repo_dir" find_implementations \
-    "{\"trait\":\"$1\"}" 2>&1 || \
-  python3 "$lib_dir/serena_call.py" "$repo_dir" find_implementations \
-    "{\"method\":\"$1\"}"
+    "{\"name_path\":\"$name_path\",\"relative_path\":\"$rel\"}"
 }
 
 cmd_refs() {

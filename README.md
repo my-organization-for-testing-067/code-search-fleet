@@ -44,6 +44,7 @@ first.
 git clone <this repo> && cd ai-toolbox
 scripts/bootstrap                 # install the engines (--check to just report)
 scripts/verify-search             # 9/9 against a throwaway fixture fleet
+scripts/verify-engines            # per-engine probes; run after any tool upgrade
 export FLEET_ROOT=~/code/fleet    # then point it at real repos
 scripts/cs which                  # the decision table
 ```

@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# Probe each search engine directly and compare against the last verified run.
+#
+# Why this exists separately from verify-search: the facade routes around a
+# broken engine. `cs calls` falls back from ast-grep to semgrep, so ast-grep
+# could break completely and the end-to-end run would still score 9/9. A facade
+# hides exactly the regression you most want to see, so each engine is also
+# tested on its own, on the specific capability the facade depends on it for.
+#
+# Probes are of two kinds:
+#   capability      -- must keep working; losing it is a REGRESSION
+#   known-limitation-- currently fails; if it starts passing that is an
+#                      IMPROVEMENT and the routing should be reconsidered
+#
+# Versions are recorded in fixtures/verified-versions.tsv. A changed version is
+# not itself a failure -- it is a prompt to look at the probe results.
+#
+# Usage: verify-engines [--update] [--quiet]
+#   --update   record current versions and probe outcomes as the new baseline
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$here/.." && pwd)"
+baseline="$repo_root/fixtures/verified-versions.tsv"
+
+update=0
+quiet=0
+for a in "$@"; do
+  case "$a" in
+    --update) update=1 ;;
+    --quiet) quiet=1 ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown option: $a" ;;
+  esac
+done
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+owned=0
+if [[ -z "${FLEET_ROOT:-}" || ! -d "${FLEET_ROOT:-/nonexistent}" ]]; then
+  FLEET_ROOT="$(mktemp -d)/fleet"; export FLEET_ROOT; owned=1
+  "$here/build-fixtures" "$FLEET_ROOT" >/dev/null 2>&1 || die "could not build fixtures"
+fi
+F="$FLEET_ROOT"
+
+declare -a ROWS=()
+
+# record <engine> <version> <probe-kind> <outcome> <note>
+record() { ROWS+=("$1	$2	$3	$4	$5"); }
+
+prev_version() { [[ -f $baseline ]] && awk -F'\t' -v e="$1" '$1==e{print $2; exit}' "$baseline"; }
+prev_outcome() { [[ -f $baseline ]] && awk -F'\t' -v e="$1" '$1==e{print $4; exit}' "$baseline"; }
+
+version_of() {
+  case "$1" in
+    ripgrep)   rg --version 2>/dev/null | head -1 | awk '{print $2}' ;;
+    ctags)     "$($here/cs engines >/dev/null 2>&1; echo)" ;;
+    ast-grep)  ast-grep --version 2>/dev/null | awk '{print $2}' ;;
+    semgrep)   semgrep --version 2>/dev/null | head -1 ;;
+    tokensave) tokensave --version 2>/dev/null | awk '{print $2}' ;;
+    serena)    uvx --from git+https://github.com/oraios/serena serena -V 2>/dev/null | tail -1 | awk '{print $NF}' ;;
+  esac
+}
+
+ctags_bin() {
+  local c
+  for c in /opt/homebrew/bin/ctags /usr/local/bin/ctags /usr/bin/ctags-universal "$(command -v ctags 2>/dev/null || true)"; do
+    [[ -n "$c" && -x "$c" ]] || continue
+    "$c" --version 2>&1 | grep -qi universal && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+# ---- probes -----------------------------------------------------------------
+# Each asserts the one capability the facade relies on that engine for.
+
+probe_ctags() {
+  local ct; ct=$(ctags_bin) || { record ctags "-" capability MISSING "not installed"; return; }
+  local ver; ver=$("$ct" --version 2>&1 | head -1 | awk '{print $3}' | tr -d ,)
+  local tags; tags=$(mktemp)
+  (cd "$F" && "$ct" -R --fields=+n -f "$tags" . 2>/dev/null)
+  if grep -qP '^Reserve\t.*ReservationController\.cs' "$tags" 2>/dev/null \
+     || grep -q '^Reserve	' "$tags" 2>/dev/null; then
+    record ctags "$ver" capability PASS "fleet-wide symbol index"
+  else
+    record ctags "$ver" capability FAIL "did not index the Reserve method"
+  fi
+  rm -f "$tags"
+}
+
+probe_ast_grep() {
+  have ast-grep || { record ast-grep "-" capability MISSING "not installed"; return; }
+  local ver; ver=$(ast-grep --version 2>/dev/null | awk '{print $2}')
+  local out; out=$(cd "$F" && ast-grep -p '$X.IsEnabled($KEY)' -l cs 2>/dev/null)
+  if printf '%s' "$out" | grep -q 'ReservationController.cs'; then
+    record ast-grep "$ver" capability PASS "literal in argument position"
+  else
+    record ast-grep "$ver" capability FAIL "missed the IsEnabled literal"
+  fi
+}
+
+probe_semgrep() {
+  have semgrep || { record semgrep "-" capability MISSING "not installed"; return; }
+  local ver; ver=$(semgrep --version 2>/dev/null | head -1)
+  local out; out=$(cd "$F" && semgrep -e '$X.IsEnabled("...")' -l csharp --quiet --no-git-ignore 2>/dev/null)
+  if printf '%s' "$out" | grep -q 'ReservationController.cs'; then
+    record semgrep "$ver" capability PASS "structural fallback for ast-grep"
+  else
+    record semgrep "$ver" capability FAIL "missed the IsEnabled literal"
+  fi
+}
+
+probe_text() {
+  local ver engine
+  if [[ -x "$(command -v rg 2>/dev/null || true)" ]]; then
+    engine=ripgrep; ver=$(rg --version | head -1 | awk '{print $2}')
+  else
+    engine=grep; ver=$(grep --version 2>/dev/null | head -1 | awk '{print $NF}')
+  fi
+  if (cd "$F" && grep -rn --exclude-dir=.git -F 'orders.reserved.v1' . 2>/dev/null) | grep -q EventPublisher; then
+    record "$engine" "$ver" capability PASS "literal text across repos"
+  else
+    record "$engine" "$ver" capability FAIL "missed a known literal"
+  fi
+}
+
+probe_serena() {
+  have uvx || { record serena "-" capability MISSING "uv not installed"; return; }
+  local ver; ver=$(version_of serena)
+  local out
+  out=$(python3 "$here/lib/serena_call.py" "$F/inventory-api-dotnet" find_implementations \
+        '{"name_path":"Acme.Inventory.Domain/IInventoryStore","relative_path":"src/Domain/IInventoryStore.cs"}' 2>/dev/null)
+  if printf '%s' "$out" | grep -q 'SqlInventoryStore'; then
+    record serena "${ver:-unknown}" capability PASS "C# interface to implementation"
+  else
+    record serena "${ver:-unknown}" capability FAIL "lost C# find_implementations"
+  fi
+}
+
+# tokensave is probed on a limitation rather than a capability: its C# graph has
+# no `implements` edges, which is why it lost the routing. If a release fixes
+# that, this reports IMPROVED and the decision should be revisited -- upgrades
+# can remove reasons as well as introduce regressions.
+probe_tokensave() {
+  have tokensave || { record tokensave "-" known-limitation SKIP "not installed"; return; }
+  local ver; ver=$(tokensave --version 2>/dev/null | awk '{print $2}')
+  local dir="$F/inventory-api-dotnet"
+  [[ -d "$dir/.tokensave" ]] || (cd "$dir" && tokensave init >/dev/null 2>&1)
+  local n
+  n=$(cd "$dir" && tokensave tool rank --edge-kind implements 2>/dev/null \
+      | awk -F: '/result_count/{gsub(/[ ,]/,"",$2); print $2}')
+  if [[ "${n:-0}" -gt 0 ]]; then
+    record tokensave "$ver" known-limitation IMPROVED "C# implements edges now present ($n) — re-evaluate routing"
+  else
+    record tokensave "$ver" known-limitation CONFIRMED "still no C# implements edges"
+  fi
+}
+
+[[ $quiet -eq 1 ]] || info "probing engines against $F"
+probe_text
+probe_ctags
+probe_ast_grep
+probe_semgrep
+probe_tokensave
+probe_serena
+
+# ---- report -----------------------------------------------------------------
+printf '\n%-12s %-14s %-16s %-10s %s\n' ENGINE VERSION KIND OUTCOME NOTE
+regressions=0; changes=0; improvements=0
+
+for row in "${ROWS[@]}"; do
+  IFS=$'\t' read -r engine version kind outcome note <<< "$row"
+  local_prev_v=$(prev_version "$engine")
+  local_prev_o=$(prev_outcome "$engine")
+  flag=""
+  if [[ -n "$local_prev_v" && "$local_prev_v" != "$version" ]]; then
+    flag=" ${C_YELLOW}(was $local_prev_v)${C_OFF}"; changes=$((changes + 1))
+  fi
+  case "$outcome" in
+    PASS|CONFIRMED) colour="$C_GREEN" ;;
+    IMPROVED)       colour="$C_YELLOW"; improvements=$((improvements + 1)) ;;
+    FAIL)           colour="$C_RED"; regressions=$((regressions + 1)) ;;
+    *)              colour="$C_YELLOW" ;;
+  esac
+  # A probe that used to pass and now does not is the headline case.
+  if [[ "$local_prev_o" == "PASS" && "$outcome" == "FAIL" ]]; then
+    note="REGRESSION since last verified run — $note"
+  fi
+  printf '%-12s %-14s %-16s %s%-10s%s %s%s\n' \
+    "$engine" "$version" "$kind" "$colour" "$outcome" "$C_OFF" "$note" "$flag"
+done
+
+info ""
+[[ $changes -gt 0 ]] && warn "$changes engine version(s) changed since the last verified run"
+[[ $improvements -gt 0 ]] && warn "$improvements known limitation(s) no longer apply — revisit the routing in docs/repo-fleet.md"
+if [[ $regressions -gt 0 ]]; then
+  err "$regressions engine(s) failed their capability probe"
+else
+  ok "all capability probes passed"
+fi
+
+if [[ $update -eq 1 ]]; then
+  {
+    printf '# engine\tversion\tkind\toutcome\tnote\n'
+    printf '# verified %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    for row in "${ROWS[@]}"; do printf '%s\n' "$row"; done
+  } > "$baseline"
+  ok "baseline written to ${baseline#$repo_root/}"
+fi
+
+[[ $owned -eq 1 ]] && rm -rf "$(dirname "$F")"
+[[ $regressions -eq 0 ]]

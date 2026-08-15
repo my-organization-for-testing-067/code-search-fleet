@@ -96,8 +96,30 @@ cs uses "/api/v1/inventory/reserve" | scripts/score-seams reserve-consumers -
 
 `scripts/score-seams --list` shows all nine queries. `fixtures/BASELINE.md`
 records how each engine scores alone, and `fixtures/GROUND-TRUTH.md` explains
-what each query is testing. Use these to check a change to the search setup
-before trusting it.
+what each query is testing.
+
+**Two layers, and you need both:**
+
+```sh
+scripts/verify-search     # end-to-end: does the facade still answer all nine?
+scripts/verify-engines    # per-engine: is each engine still doing its job?
+```
+
+`verify-engines` exists because **the facade hides engine regressions**:
+`cs calls` falls back from ast-grep to semgrep, so ast-grep could break
+entirely and the end-to-end run would still score 9/9. Each engine is therefore
+probed directly on the one capability the routing depends on it for.
+
+Run both after upgrading any tool. `verify-engines` compares against
+`fixtures/verified-versions.tsv` and flags version changes as a prompt to look,
+not as a failure. `--update` records a new baseline once you have reviewed the
+results.
+
+It also probes **known limitations**, not just capabilities. tokensave is
+checked for whether its C# `implements` edges have appeared; if a release fixes
+that, the probe reports `IMPROVED` and the routing should be reconsidered.
+Upgrades can remove the reason a tool was rejected, and nothing else would
+notice.
 
 ## Reporting results
 
