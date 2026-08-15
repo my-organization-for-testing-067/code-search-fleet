@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest
+
+      # Note what this does NOT cover. The suite runs against the source tree
+      # rather than an installed package, so nothing here starts a consumer or
+      # replays a message through it -- the delivery semantics the handlers are
+      # written against are never exercised by CI.
+      - name: Test
+        run: pytest -q

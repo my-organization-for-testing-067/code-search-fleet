@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: checkout-service-kotlin
+
+      # com.acme:pricing-lib is not on any public index. settings.gradle.kts
+      # substitutes it for a local build when the repo is checked out beside
+      # this one, which mirrors the fleet layout developers work in.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/pricing-lib-java
+          path: pricing-lib-java
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # Unit tests only. Nothing here starts the inventory service, so the HTTP
+      # contract between the two -- which exists only as a route string and a
+      # response shape -- is never exercised by this pipeline.
+      - name: Test
+        working-directory: checkout-service-kotlin
+        run: gradle test --console=plain

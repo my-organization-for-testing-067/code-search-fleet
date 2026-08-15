@@ -7,3 +7,14 @@ dependencies = [
     # Seam: shared contracts package, also depended on by web-monorepo-node.
     "acme-schemas==2.4.0",
 ]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+# The package is not installed in CI, because acme-schemas is published to an
+# internal index this workflow has no credentials for. Tests import from the
+# source tree instead, which is why they exercise picking and contracts but
+# never the Kafka consumer that wires them together.
+pythonpath = ["."]
+testpaths = ["tests"]

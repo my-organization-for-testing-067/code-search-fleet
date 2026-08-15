@@ -125,6 +125,13 @@ gamed — a tool answering "everything is related to everything" scores perfectl
 `fixtures/GROUND-TRUTH.md` explains each; `fixtures/BASELINE.md` records how
 every engine scores alone.
 
+They also **build and test for real**, each with a GitHub Actions workflow:
+`dotnet test`, `gradle test`, `pytest`, and a TypeScript typecheck. That makes
+the declared dependency edge executable rather than decorative — Gradle
+substitutes `com.acme:pricing-lib` for the sibling `pricing-lib-java` checkout,
+so the edge `cs deps` reports is the edge the build actually resolves. It also
+gives anything layering incidents on top a real defense layer to inspect.
+
 ## Layering in your own incidents
 
 The fixture repos here exist to test search. If you are testing a *workflow* on

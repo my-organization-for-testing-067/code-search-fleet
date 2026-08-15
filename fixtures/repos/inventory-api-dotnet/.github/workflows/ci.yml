@@ -1,0 +1,32 @@
+name: CI
+
+# The defence layer a postmortem walks. It exists so that "was there CI, and
+# what did it check" has a real answer for these fixtures rather than an
+# asserted one -- including the answer "it was green, and the defect shipped
+# anyway", which is the interesting case.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore
+
+      # Warnings are not errors here, deliberately. A real repo at this age has
+      # accumulated some, and turning them into failures retroactively is the
+      # kind of change that gets reverted rather than fixed.
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Test
+        run: dotnet test --no-build --configuration Release --verbosity normal

@@ -8,6 +8,16 @@ plugins {
 group = "com.acme"
 version = "1.8.2"
 
+repositories {
+    mavenCentral()
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
 publishing {
     publications {
         create<MavenPublication>("maven") {

@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # No `npm ci`: acme-schemas is published to an internal registry this
+      # workflow has no credentials for. tsconfig maps the one import that
+      # matters to the workspace source, so the typecheck runs without
+      # installing anything.
+      #
+      # Worth being clear about what this proves and does not. It proves the
+      # packages are internally consistent. It says nothing about the feature
+      # flag keys in FeatureToggles.ts, which are strings that a .NET service in
+      # another repo reads by the same spelling -- no type on this side, or any
+      # side, connects the two.
+      - name: Typecheck
+        run: npx --yes -p typescript@5.6 tsc --noEmit -p tsconfig.json
