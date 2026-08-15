@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Install the search engines `cs` sits on top of, then verify.
+#
+# Every engine is optional -- cs reports what is missing and routes around it --
+# so this is a convenience, not a prerequisite. Run with --check to see what is
+# present without installing anything.
+#
+# Usage: bootstrap [--check] [--minimal]
+#   --minimal   skip Serena, which needs a language toolchain per language
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+check_only=0
+minimal=0
+for arg in "$@"; do
+  case "$arg" in
+    --check) check_only=1 ;;
+    --minimal) minimal=1 ;;
+    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown option: $arg" ;;
+  esac
+done
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+if have brew; then PM=brew
+elif have apt-get; then PM=apt
+elif have dnf; then PM=dnf
+else PM=none; fi
+
+install_one() {
+  local name="$1" brew_pkg="$2" apt_pkg="$3"
+  case "$PM" in
+    brew) brew install "$brew_pkg" >/dev/null 2>&1 ;;
+    apt)  sudo apt-get install -y "$apt_pkg" >/dev/null 2>&1 ;;
+    dnf)  sudo dnf install -y "$apt_pkg" >/dev/null 2>&1 ;;
+    *)    return 1 ;;
+  esac
+}
+
+# name | probe | brew | apt | why it earns its place
+ENGINES=(
+  "ripgrep|rg|ripgrep|ripgrep|fast text search; cs falls back to POSIX grep without it"
+  "universal-ctags|ctags|universal-ctags|universal-ctags|fleet-wide symbol index, rebuilt per query in well under a second"
+  "ast-grep|ast-grep|ast-grep||structural search: call shapes and literal arguments"
+  "semgrep|semgrep|semgrep||second structural engine, used when ast-grep is absent"
+)
+
+info "${C_BOLD}package manager:${C_OFF} $PM"
+[[ $PM == none ]] && warn "no supported package manager found; install the engines by hand"
+info ""
+
+missing=0
+for entry in "${ENGINES[@]}"; do
+  IFS='|' read -r name probe brew_pkg apt_pkg why <<< "$entry"
+  if have "$probe"; then
+    ok "$name — $why"
+    continue
+  fi
+  if [[ $check_only -eq 1 || $PM == none ]]; then
+    warn "$name MISSING — $why"
+    missing=$((missing + 1))
+    continue
+  fi
+  if [[ -z "$brew_pkg" && -z "$apt_pkg" ]]; then
+    warn "$name has no package for $PM; install it manually"
+    missing=$((missing + 1))
+    continue
+  fi
+  info "installing $name…"
+  if install_one "$name" "$brew_pkg" "$apt_pkg" && have "$probe"; then
+    ok "$name installed"
+  else
+    warn "$name failed to install — $why"
+    missing=$((missing + 1))
+  fi
+done
+
+# Serena is deliberately last and separable: it is the only engine needing a
+# working toolchain per language (a .NET SDK for C#, a JVM for Java/Kotlin), and
+# it is only reached for `cs impls` and `cs refs`.
+if [[ $minimal -eq 0 ]]; then
+  info ""
+  if have uvx; then
+    ok "uv present — Serena runs on demand via uvx (no install step)"
+    for tc in dotnet java; do
+      have "$tc" && ok "  $tc toolchain present" \
+                 || warn "  $tc missing — Serena cannot analyse that language"
+    done
+  else
+    warn "uv missing — cs impls / cs refs unavailable (install: brew install uv)"
+    missing=$((missing + 1))
+  fi
+fi
+
+info ""
+"$(dirname "${BASH_SOURCE[0]}")/cs" engines || true
+
+info ""
+if [[ $missing -eq 0 ]]; then
+  ok "${C_BOLD}ready${C_OFF} — try: cs which"
+else
+  warn "$missing engine(s) unavailable; cs still works with the rest"
+fi

@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Run every scored query through `cs` and report the score.
+#
+# This is the regression test for the search setup. Run it after changing an
+# engine, upgrading a tool, or adopting this on a new machine -- a search stack
+# that has quietly lost an engine still returns results, just worse ones, which
+# is exactly the failure that goes unnoticed.
+#
+# Builds its own throwaway fixture fleet unless FLEET_ROOT already points at one.
+#
+# Usage: verify-search [--keep]
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+keep=0
+[[ "${1:-}" == "--keep" ]] && keep=1
+
+owned_fleet=0
+if [[ -z "${FLEET_ROOT:-}" || ! -d "${FLEET_ROOT:-/nonexistent}" ]]; then
+  FLEET_ROOT="$(mktemp -d)/fleet"
+  export FLEET_ROOT
+  owned_fleet=1
+  info "building a throwaway fixture fleet…"
+  "$here/build-fixtures" "$FLEET_ROOT" >/dev/null 2>&1 || die "could not build fixtures"
+fi
+
+info "${C_BOLD}fleet:${C_OFF} $FLEET_ROOT"
+info ""
+
+pass=0; fail=0; failed_ids=()
+
+check() {
+  local id="$1"; shift
+  local out
+  out=$("$@" 2>/dev/null)
+  if printf '%s\n' "$out" | "$here/score-seams" "$id" - >/dev/null 2>&1; then
+    ok "$id"; pass=$((pass + 1))
+  else
+    err "$id"; fail=$((fail + 1)); failed_ids+=("$id")
+  fi
+}
+
+check reserve-consumers       "$here/cs" uses '/api/v1/inventory/reserve'
+check reserve-definition      "$here/cs" def Reserve
+check release-consumers       "$here/cs" uses '/api/v1/inventory/release'
+check orders-reserved-v1      "$here/cs" uses 'orders.reserved.v1'
+check orphaned-consumer       "$here/cs" uses 'orders.reserved.v2'
+check reservation-event-shape "$here/cs" uses 'reservationId'
+check reserve-flag            "$here/cs" uses 'inventory.reserve.enabled'
+
+# Needs the dependency graph as well as the search, so it is run as a pair.
+owner=$("$here/cs" provides com.acme:pricing-lib 2>/dev/null)
+if [[ -n "$owner" ]]; then
+  check discount-engine "$here/cs" def DiscountEngine "$owner"
+else
+  err "discount-engine (cs provides returned nothing)"; fail=$((fail + 1))
+fi
+
+# The LSP-backed query is slow and needs a per-language toolchain, so it is
+# skipped rather than failed when Serena cannot run here.
+if command -v uvx >/dev/null 2>&1; then
+  info "  running the LSP query (slow, starts a language server)…"
+  refs_out=$("$here/cs" refs IInventoryStore inventory-api-dotnet \
+              src/Domain/IInventoryStore.cs 2>/dev/null \
+              | sed 's|"\([a-z]*\)/|"inventory-api-dotnet/\1/|g')
+  if printf '%s\n' "$refs_out" | "$here/score-seams" reserve-implementation - >/dev/null 2>&1; then
+    ok "reserve-implementation"; pass=$((pass + 1))
+  else
+    err "reserve-implementation"; fail=$((fail + 1)); failed_ids+=("reserve-implementation")
+  fi
+else
+  warn "reserve-implementation SKIPPED (uv not installed; cs refs unavailable)"
+fi
+
+info ""
+info "${C_BOLD}$pass passed, $fail failed${C_OFF}"
+for f in "${failed_ids[@]:-}"; do
+  [[ -n "$f" ]] && info "  re-run one: $here/score-seams $f -"
+done
+
+if [[ $owned_fleet -eq 1 && $keep -eq 0 ]]; then
+  rm -rf "$(dirname "$FLEET_ROOT")"
+else
+  [[ $owned_fleet -eq 1 ]] && info "fleet kept at $FLEET_ROOT"
+fi
+
+[[ $fail -eq 0 ]]

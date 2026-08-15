@@ -21,10 +21,14 @@
 #   cs text   <pattern>            literal or regex, every repo
 #   cs seam   <string>             cross-repo seam: which repos share this string
 #   cs uses   <string>             like seam, but code only -- comments excluded
-#   cs def    <symbol>             where a symbol is defined, every repo
+#   cs def    <symbol> [repo]      where a symbol is defined (optionally one repo)
+#   cs provides <coordinate>       which repo publishes a package coordinate
+#   cs deps   [repo]               fleet dependency edges, from build manifests
+#   cs publishes                   what each repo publishes
 #   cs calls  <pattern> [lang]     structural: call shapes, literal arguments
 #   cs impls  <symbol> <repo>      implementations of an interface (LSP)
 #   cs refs   <symbol> <repo> <file>   references to a symbol (LSP)
+#   cs which                       decision table: which subcommand answers what
 #   cs engines                     which engines are available here
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
@@ -54,16 +58,22 @@ grep_fleet() {
   fi
 }
 ctags_bin() {
-  # Homebrew's universal-ctags is shadowed by the BSD ctags in /usr/bin.
-  if [[ -x /opt/homebrew/bin/ctags ]]; then echo /opt/homebrew/bin/ctags
-  elif have ctags && ctags --version 2>&1 | grep -qi universal; then echo ctags
-  else return 1; fi
+  # On macOS, Homebrew's universal-ctags is shadowed by the BSD ctags in
+  # /usr/bin, which is a different program with a different output format --
+  # so check for the Universal banner rather than trusting the name.
+  local c
+  for c in /opt/homebrew/bin/ctags /usr/local/bin/ctags /usr/bin/ctags-universal \
+           "$(command -v ctags 2>/dev/null || true)"; do
+    [[ -n "$c" && -x "$c" ]] || continue
+    if "$c" --version 2>&1 | grep -qi universal; then echo "$c"; return 0; fi
+  done
+  return 1
 }
 
 # Normalize "path:line:text" to "path:line: text" with the fleet prefix removed.
 normalize() { sed -e "s|^${root}/||" -e 's|^\./||'; }
 
-usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 cmd_engines() {
   local n=0
@@ -82,9 +92,17 @@ cmd_engines() {
   [[ $n -gt 0 ]]
 }
 
+hint() { info ""; info "${C_BOLD}nothing found — try:${C_OFF}"; while [[ $# -gt 0 ]]; do info "  $1"; shift; done; }
+
 cmd_text() {
   [[ $# -ge 1 ]] || die "cs text <pattern>"
-  grep_fleet -E "$1" | normalize
+  local out; out=$(grep_fleet -E "$1" | normalize)
+  if [[ -z "$out" ]]; then
+    hint "cs def $1              (it may be a symbol, not literal text)" \
+         "cs calls '<pattern>'   (it may only appear as a call shape)"
+    return 1
+  fi
+  printf '%s\n' "$out"
 }
 
 # A seam is a string two repos share. Grouping by repo is the answer -- a flat
@@ -105,6 +123,33 @@ cmd_seam() {
   if [[ $(printf '%s\n' "$repos" | wc -l | tr -d ' ') -eq 1 ]]; then
     warn "only one repo mentions this -- a producer with no consumer, or dead"
   fi
+}
+
+# Deliberately not a natural-language router: guessing intent from a sentence
+# fails quietly and is hard to debug. This prints the decision table instead, so
+# the caller picks with the reasoning visible.
+cmd_which() {
+  cat <<'TABLE'
+What do you want to know?                        Use
+------------------------------------------------ ----------------------------
+Who calls / uses this endpoint, topic, key?      cs uses <string>
+Which repos share this string?                   cs seam <string>
+Any text or regex, including comments            cs text <pattern>
+Where is this symbol defined?                    cs def <symbol> [repo]
+What calls look like X, or take literal Y?       cs calls '<pattern>' [lang]
+What implements this interface?                  cs impls <symbol> <repo>
+What references this symbol (bridges DI)?        cs refs <symbol> <repo> <file>
+Which repo publishes this package?               cs provides <coordinate>
+Which repos depend on which?                     cs deps [repo]
+
+Two same-named symbols in different repos: resolve the dependency first, then
+filter, because code search alone cannot tell them apart:
+
+  cs def DiscountEngine "$(cs provides com.acme:pricing-lib)"
+
+Start cheap. cs uses and cs def answer most questions in well under a second;
+cs impls and cs refs start language servers and are far slower.
+TABLE
 }
 
 # "Who actually uses this string in code?" -- the seam question with prose
@@ -132,7 +177,8 @@ cmd_uses() {
 }
 
 cmd_def() {
-  [[ $# -ge 1 ]] || die "cs def <symbol>"
+  [[ $# -ge 1 ]] || die "cs def <symbol> [repo]"
+  local only="${2:-}"
   local ct; ct=$(ctags_bin) || die "universal-ctags not installed"
   local tags="${TMPDIR:-/tmp}/cs-tags.$$"
   # Rebuilding is cheap (measured 0.07s over the whole fixture fleet), so the
@@ -146,8 +192,32 @@ cmd_def() {
         else if (length($i) <= 2) { kind = $i }
       }
       printf "%s:%s: [%s] %s\n", $2, line, kind, want
-  }' "$tags" | sort -u
+  }' "$tags" | sort -u | { if [[ -n "$only" ]]; then grep "^$only/" || true; else cat; fi; } > "$tags.out"
   rm -f "$tags"
+  if [[ ! -s "$tags.out" ]]; then
+    rm -f "$tags.out"
+    hint "cs text '$1'           (ctags misses symbols built dynamically)" \
+         "cs refs $1 <repo> <file>  (for a precise, LSP-backed answer)"
+    return 1
+  fi
+  cat "$tags.out"; rm -f "$tags.out"
+}
+
+# Which repo publishes a coordinate, and which repos depend on which. Answers
+# the one question code search structurally cannot: choosing between two
+# same-named symbols requires knowing which repo the caller actually depends
+# on, and that lives in build manifests, not in code.
+cmd_provides() {
+  [[ $# -ge 1 ]] || die "cs provides <coordinate>"
+  python3 "$lib_dir/deps.py" "$root" provides "$1"
+}
+
+cmd_deps() {
+  python3 "$lib_dir/deps.py" "$root" deps "${1:-}"
+}
+
+cmd_publishes() {
+  python3 "$lib_dir/deps.py" "$root" publishes
 }
 
 cmd_calls() {
@@ -195,9 +265,13 @@ case "$sub" in
   seam)    cmd_seam "$@" ;;
   uses)    cmd_uses "$@" ;;
   def)     cmd_def "$@" ;;
+  provides) cmd_provides "$@" ;;
+  deps)    cmd_deps "$@" ;;
+  publishes) cmd_publishes ;;
   calls)   cmd_calls "$@" ;;
   impls)   cmd_impls "$@" ;;
   refs)    cmd_refs "$@" ;;
+  which)   cmd_which ;;
   engines) cmd_engines ;;
   -h|--help|help) usage 0 ;;
   *) err "unknown subcommand: $sub"; usage 1 ;;

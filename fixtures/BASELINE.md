@@ -188,14 +188,55 @@ alone**:
   engine that bridges DI. Reserved for that, because it is also the slowest and
   the only one needing a per-language toolchain.
 
-### The one remaining failure
+## Round 4: 9 of 9 — and why that number now means less
 
-`discount-engine` (Q7) fails for every approach tried. Answering "which
-`DiscountEngine` does checkout use" requires resolving a Gradle coordinate
-(`com.acme:pricing-lib`) to a repo, which is dependency resolution, not code
-search. The facade at least labels each hit with its repo, so a reader can
-disambiguate — but it does not answer it. Worth stating plainly rather than
-engineering a special case that only works on this fixture.
+Adding dependency resolution (`cs provides` / `cs deps`, reading build
+manifests rather than code) closed the last query. `scripts/verify-search`
+reproduces the full run in one command.
+
+| Approach | Score |
+|---|---|
+| ripgrep alone | 5/9 (three hollow) |
+| tokensave alone | 4/9 |
+| `cs` facade | 8/9 |
+| **`cs` + dependency graph** | **9/9** |
+
+**Read this number with suspicion.** These nine queries were written here, and
+a tool scoring full marks on its author's own test set has exhausted the test
+set, not solved search. What 9/9 legitimately says is that the *architecture*
+covers the known question types: text, structure, symbols, and dependencies.
+What it cannot say is anything about entropy at scale — 400 call sites of a
+generic name, reflection, ORM indirection, a decade of drift.
+
+Getting to 100% on real repos is not achievable in the way this table suggests,
+because some questions are undecidable statically at any budget: a container
+resolving an implementation from a config string, an identifier assembled at
+runtime, a route built by concatenation. The honest target is not a perfect
+score but a tool that **says which kind of answer it is giving** — a resolved
+reference, a textual match, or a guess.
+
+The real measure remains the query set drawn from actual tickets, run against a
+real repo. That is still outstanding and nothing here substitutes for it.
+
+### How the last one was closed
+
+`discount-engine` (Q7) failed for every search engine tried, because it is not
+a search question. "Which `DiscountEngine` does checkout use" is answered by
+resolving the Gradle coordinate `com.acme:pricing-lib` to the repo that
+publishes it — information that lives in build manifests, which no code search
+engine reads.
+
+`scripts/lib/deps.py` parses publish and dependency declarations across Gradle,
+Maven, npm, PyPI, and NuGet manifests, giving a fleet dependency graph. The
+query then composes:
+
+```sh
+cs def DiscountEngine "$(cs provides com.acme:pricing-lib)"
+```
+
+This is a general capability, not a special case for the fixture: `cs deps`
+answers "which repos depend on this one", which is the first question of any
+impact analysis.
 
 ### Engines are optional, and absence is loud
 
