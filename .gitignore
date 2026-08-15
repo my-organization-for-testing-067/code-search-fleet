@@ -1,2 +1,6 @@
 .DS_Store
 *.local.*
+
+# .NET build output in fixtures
+bin/
+obj/
