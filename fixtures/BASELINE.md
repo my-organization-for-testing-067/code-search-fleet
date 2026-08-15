@@ -1,43 +1,78 @@
-# Naive-grep baseline
+# Baseline: naive grep vs tokensave
 
-Run 2026-08-15 against the fixture fleet, scoring a single `rg` invocation per
-query with `scripts/score-seams`. This is the floor any indexed tool has to
-beat. Reproduce with the commands in each row.
+Run 2026-08-15 against the fixture fleet, scoring one query per tool per
+question with `scripts/score-seams`. tokensave 7.9.0, installed via Homebrew;
+all five fixture repos indexed with `tokensave init` (4–5 files each, 12–29ms).
 
-**5 of 9 pass — but 3 of those passes are hollow (see below), so the honest
-score is closer to 2/9.**
+**Headline: grep 5/9, tokensave 4/9 — and they fail on different questions.**
+Neither is close to sufficient alone. Three of grep's passes are hollow (right
+file, wrong or absent reasoning), so the honest read is that tokensave wins two
+questions cleanly, grep wins one cleanly, and both fail three.
 
-| Query | Result | Why |
+| # | Query | grep | tokensave | Notes |
+|---|---|---|---|---|
+| 1 | `reserve-consumers` | FAIL | FAIL | Both find the two real callers and both add the Python docstring as a third. Different mechanisms: grep matched prose text, tokensave matched symbol names in the same file. |
+| 2 | `reserve-definition` | FAIL | **PASS** | tokensave's win. It surfaces the `Reserve` method with signature `[HttpPost("reserve")]`; grep can't, because the full path is assembled from two attributes and exists nowhere as a literal. |
+| 3 | `release-consumers` | PASS | PASS | Both correctly report the dead endpoint has no consumers. |
+| 4 | `orders-reserved-v1` | FAIL | **PASS** | tokensave's win. Matching the symbol `ORDERS_RESERVED_TOPIC` naturally excludes the v2 analytics consumer; grep's string match drags it in. |
+| 5 | `orphaned-consumer` | PASS\* | PASS\* | Both name the file; neither actually compares produced against consumed topic sets. |
+| 6 | `reservation-event-shape` | PASS\* | FAIL | tokensave misses the inline JSON literal in Kotlin — it isn't a symbol. grep's "pass" came from a *comment* containing the word, not the literal either. |
+| 7 | `discount-engine` | FAIL | FAIL | Both conflate the unrelated Python `DiscountEngine` with the Java one. Name-based matching fails identically in both. |
+| 8 | `reserve-flag` | **PASS** | FAIL | grep's win. tokensave misses `_flags.IsEnabled("inventory.reserve.enabled")` in C# entirely, because the key is a bare string literal, not a symbol. |
+| 9 | `reserve-implementation` | PASS\* | FAIL | tokensave finds `SqlInventoryStore` but not the controller or the DI registration. grep's "pass" was naming three files by symbol match without bridging DI at all. |
+
+\* Hollow pass: `score-seams` checks which files an answer names, not whether
+the reasoning was sound. A FAIL is trustworthy; a PASS still needs reading.
+
+## The two findings that should drive the decision
+
+**1. String literals are not symbols.** tokensave indexes a symbol graph, so
+route paths, topic names, and config keys are invisible to it unless they
+happen to be bound to a named constant. Query 8 is the clean demonstration:
+the .NET side passes the flag key as a bare argument and tokensave cannot see
+it. This matters because cross-repo seams *are* strings — which is precisely
+the "global relations across repos" use case. A symbol graph does not replace
+grep for that; it cannot.
+
+**2. `implements` edges exist only for Java.** Ranking the graph by that edge
+kind across the fleet:
+
+| repo | language | `implements` edges |
 |---|---|---|
-| `reserve-consumers` | FAIL | Both real callers found, but the Python docstring that merely *mentions* the path counts as a third caller. |
-| `reserve-definition` | FAIL | Missed entirely. The .NET side assembles the path from `[Route("api/v1/inventory")]` + `[HttpPost("reserve")]`, so the full literal exists nowhere in that repo. |
-| `release-consumers` | PASS | Correctly returns nothing for the dead endpoint. |
-| `orders-reserved-v1` | FAIL | Pulls in the analytics consumer, which subscribes to `orders.reserved.v2` — a relationship that does not exist. |
-| `orphaned-consumer` | PASS\* | Names the right file, but only because the grep output happens to contain it. |
-| `reservation-event-shape` | PASS\* | Found the Kotlin file via a *comment* containing "ReservationEvent", not via the inline JSON literal that is the actual third definition. |
-| `reserve-flag` | PASS | Both sides found; the `.legacy` superstring did not mislead. |
-| `discount-engine` | FAIL | Conflates the unrelated Python `DiscountEngine` with the Java one checkout actually uses. |
-| `reserve-implementation` | PASS\* | Names all three files by symbol match without bridging the DI registration at all. |
+| pricing-lib-java | Java | 1 (correct) |
+| inventory-api-dotnet | C# | **0** |
+| checkout-service-kotlin | Kotlin | **0** |
+| fulfillment-worker-python | Python | **0** |
+| web-monorepo-node | TypeScript | **0** |
 
-## What the hollow passes reveal about the scorer
+`SqlInventoryStore : IInventoryStore` is not in the C# graph, and
+`implementations --trait IInventoryStore` returns zero matches. Interface to
+implementation is the single most valuable relation in a DI-heavy .NET
+codebase, and for four of the five languages here it is simply absent. All five
+are in tokensave's "lite" tier, its best-supported one. Note also that the
+installed binary reports 34 languages, not the 50+ the README advertises.
 
-`score-seams` checks **which files an answer names**, not whether the tool
-understood the relationship. Three queries pass on that basis while getting the
-reasoning wrong or skipping it:
+## Token cost
 
-- `reservation-event-shape` — right file, wrong reason (comment, not code).
-- `reserve-implementation` — right files, no DI bridging. A tool that lists
-  these three files and *claims a complete call graph* is wrong in a way this
-  scorer cannot see.
-- `orphaned-consumer` — the question needs produced-vs-consumed topic sets
-  compared across repos; grep just dumps both and leaves the reasoning to the
-  reader.
+Bytes of raw tool output for the same question:
 
-So treat the score as necessary, not sufficient. For those three, read the
-answer's reasoning too. The failures are trustworthy in a way the passes are
-not: a FAIL means the tool definitely got something wrong.
+| Query | ripgrep | tokensave |
+|---|---|---|
+| Q2 (find definition) | 389 | 2,858 |
+| Q9 (trace implementation) | 936 | 1,311 |
 
-## Not yet run
+tokensave's own savings counter read `0` after this run. **On this fixture it
+costs more tokens than grep, not fewer** — its JSON carries signatures and
+method bodies.
 
-Nothing has been measured against tokensave or any other index — it is not
-installed. The comparison this baseline exists for is still outstanding.
+Read that with care in both directions: the fixture is five files per repo,
+where grep output is trivially small anyway. The savings argument is about
+avoiding *file reads* while an agent explores a large codebase, and that cannot
+be validated or refuted at this scale. What this does show is that the raw
+output is verbose, and verbosity does not shrink on bigger repos.
+
+## Still unmeasured
+
+The question this baseline was built to inform — does indexing pay for itself
+on a 100K+ LOC repo with real queries — needs a real repo and a query set from
+real tickets. Nothing here substitutes for that.
