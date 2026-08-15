@@ -17,6 +17,12 @@
 # which keeps results compact (raw tokensave JSON measured ~7x the equivalent
 # ripgrep output) and lets any answer be scored by scripts/score-seams.
 #
+# Every answer is labelled with HOW it was obtained -- resolved, structural,
+# textual, declared, or heuristic -- because on a real codebase the difference
+# decides whether you can act on it. A resolved reference is a fact; a textual
+# match is an occurrence; and no static answer here can see reflection, string
+# concatenation, or generated code. `cs why <kind>` spells out the blind spots.
+#
 # Usage:
 #   cs text   <pattern>            literal or regex, every repo
 #   cs seam   <string>             cross-repo seam: which repos share this string
@@ -28,11 +34,22 @@
 #   cs calls  <pattern> [lang]     structural: call shapes, literal arguments
 #   cs impls  <symbol> <repo>      implementations of an interface (LSP)
 #   cs refs   <symbol> <repo> <file>   references to a symbol (LSP)
+#   cs history <string> [repo]     when a seam entered or left history (git -S)
+#   cs repos                       what is in the current view, and from where
 #   cs which                       decision table: which subcommand answers what
+#   cs why    [kind]               what each kind of answer cannot see
 #   cs engines                     which engines are available here
 #
 #   --fleet          ignore the ticket workspace, search the fleet only
 #   --ticket=<id>    search a named ticket workspace layered over the fleet
+#   --why            print the blind spots of this answer's kind
+#   --quiet          suppress the provenance line (stdout is unaffected either way)
+#   --all            no result cap for this query
+#   --engine=<name>  force one engine and fail rather than fall back
+#
+# Environment:
+#   CS_MAX_RESULTS   result cap, default 200 (0 = unlimited)
+#   CS_TIMEOUT       per-engine timeout in seconds, default 120 (0 = none)
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
@@ -55,7 +72,11 @@ view_tmp=""
 ticket_root="${TICKET_ROOT:-}"
 layer_note=""
 
-cleanup_view() { [[ -n "$view_tmp" && -d "$view_tmp" ]] && rm -rf "$view_tmp"; }
+cleanup_view() {
+  [[ -n "$view_tmp" && -d "$view_tmp" ]] && rm -rf "$view_tmp"
+  [[ -n "${CS_TIMEOUT_FLAG:-}" ]] && rm -f "$CS_TIMEOUT_FLAG"
+  return 0
+}
 trap cleanup_view EXIT
 
 detect_ticket() {
@@ -110,28 +131,97 @@ real_dirs() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# ---- what gets searched ----------------------------------------------------
+# One exclusion list, shared by every text backend. This exists so that the
+# answer does not depend on which engine happens to be installed: ripgrep and
+# POSIX grep must see the SAME set of files, or a machine without ripgrep gets
+# quietly different results from one with it. `verify-search` asserts that
+# parity by running the scored queries through both backends and diffing.
+#
+# Two consequences worth stating, because both were parity bugs:
+#   - ripgrep is run with --no-ignore. Respecting .gitignore would make results
+#     depend on each repo's ignore file, which grep cannot read. Deterministic
+#     beats clever; the list below covers the build output .gitignore would have
+#     hidden anyway, and CS_EXCLUDE_EXTRA adds to it per site.
+#   - ripgrep is run with --hidden. Without it, rg skips dotted paths, so
+#     .github/, .circleci/ and .env are invisible to it and visible to grep.
+#     Config keys and CI wiring live in exactly those files, and a config key
+#     that a service reads but a chart no longer writes is a seam worth finding.
+CS_EXCLUDE_DIRS=(
+  .git .origins .hg .svn
+  node_modules bower_components vendor Pods DerivedData
+  target build dist out bin obj .gradle .m2
+  .venv venv __pycache__ .mypy_cache .pytest_cache .tox .ruff_cache
+  .next .nuxt .parcel-cache .turbo coverage .nyc_output
+  .terraform .serena .tokensave .idea .vscode-test
+)
+# shellcheck disable=SC2206
+[[ -n "${CS_EXCLUDE_EXTRA:-}" ]] && CS_EXCLUDE_DIRS+=(${CS_EXCLUDE_EXTRA})
+
 # `rg` may exist only as a shell function (Claude Code proxies its bundled
 # ripgrep that way), which a script cannot call. Require a real binary, and
 # fall back to POSIX grep so the facade works on a machine without ripgrep.
 have_rg_binary() { [[ -x "$(command -v rg 2>/dev/null || true)" ]]; }
 
+# Which text backend will actually run. CS_TEXT_ENGINE forces one, so the two
+# can be compared against each other rather than trusted.
+text_engine() {
+  case "${CS_TEXT_ENGINE:-auto}" in
+    rg|ripgrep) echo ripgrep ;;
+    grep|posix)  echo grep ;;
+    *) if have_rg_binary; then echo ripgrep; else echo grep; fi ;;
+  esac
+}
+
+# Run an engine under a wall-clock limit. A language server or a fleet-wide
+# structural scan can hang on a real repo, and a search tool that never returns
+# is worse than one that says it gave up. macOS has no `timeout` unless GNU
+# coreutils is installed, so its absence degrades to running unbounded.
+timeout_bin() {
+  local t
+  for t in timeout gtimeout; do have "$t" && { echo "$t"; return 0; }; done
+  return 1
+}
+# Engines run inside subshells and command substitutions, so a shell variable
+# set here would be discarded before anything could report it -- a timeout would
+# silently look like "no results", which is the single worst failure mode this
+# tool can have. The flag is a file for that reason: it crosses process
+# boundaries where a variable cannot.
+CS_TIMEOUT_FLAG="$(mktemp -t cs-timeout.XXXXXX)"
+run_timed() {
+  local tb secs="${CS_TIMEOUT:-120}"
+  if [[ "$secs" != 0 ]] && tb=$(timeout_bin); then
+    "$tb" "$secs" "$@"
+    local rc=$?
+    [[ $rc -eq 124 ]] && printf '%s\n' "${secs}s" >> "$CS_TIMEOUT_FLAG"
+    return $rc
+  fi
+  "$@"
+}
+timed_out() { [[ -s "$CS_TIMEOUT_FLAG" ]]; }
+
 # grep_fleet <extra-grep-args...> <pattern>
+# Extra args are given in grep spelling (-E, -F, -i); ripgrep accepts the same
+# three, which is why the callers can stay backend-agnostic.
 grep_fleet() {
   local pattern="${!#}"
   local extra=("${@:1:$#-1}")
-  if have_rg_binary; then
-    (cd "$view" && rg --follow --no-heading --line-number --color=never "${extra[@]}" "$pattern" .)
+  if [[ "$(text_engine)" == ripgrep ]]; then
+    local globs=() d
+    for d in "${CS_EXCLUDE_DIRS[@]}"; do globs+=(--glob "!**/$d/**" --glob "!$d/**"); done
+    (cd "$view" && run_timed rg --follow --hidden --no-ignore \
+        --no-heading --line-number --color=never \
+        "${globs[@]}" "${extra[@]}" -- "$pattern" .)
   else
     # BSD grep's -R follows a symlink named on the command line but NOT one it
     # meets while recursing, so `grep -R pattern .` silently finds nothing in a
     # view made of symlinks. Passing the repo directories explicitly with a
     # trailing slash works on both BSD and GNU grep and does not depend on
     # symlink-following semantics at all.
-    grep -Rn --binary-files=without-match \
-        --exclude-dir=.git --exclude-dir=.origins --exclude-dir=node_modules \
-        --exclude-dir=bin --exclude-dir=obj --exclude-dir=.serena \
-        --exclude-dir=.tokensave --exclude-dir=.venv \
-        "${extra[@]}" -- "$pattern" "$view"/*/ 2>/dev/null
+    local ex=() d
+    for d in "${CS_EXCLUDE_DIRS[@]}"; do ex+=("--exclude-dir=$d"); done
+    run_timed grep -Rn --binary-files=without-match \
+        "${ex[@]}" "${extra[@]}" -- "$pattern" "$view"/*/ 2>/dev/null
   fi
 }
 ctags_bin() {
@@ -150,7 +240,134 @@ ctags_bin() {
 # Normalize "path:line:text" to "path:line: text" with the fleet prefix removed.
 normalize() { sed -e "s|^${view}/||" -e "s|^${root}/||" -e 's|^\./||'; }
 
-usage() { sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+# ---- answer provenance -----------------------------------------------------
+# Scoring 9/9 on a fixture means the test set is exhausted, not that search is
+# solved: on a real repo some questions are undecidable statically at any
+# budget -- an implementation chosen from a config string, an identifier built
+# by concatenation, a route assembled at runtime. A tool that cannot reach
+# those should not be silent about it.
+#
+# So every answer carries its KIND, which is what decides whether you can act
+# on it and, more importantly, what a NEGATIVE result is worth. "cs uses found
+# nothing" is weak evidence of no callers; "cs refs found nothing" is strong.
+# The kinds, in descending order of weight:
+#
+#   resolved    a language server resolved the symbol. Same symbol, not merely
+#               the same spelling. The only kind that survives a rename.
+#   declared    read from a build manifest. Authoritative for what a repo
+#               publishes and depends on, because that is where it is stated.
+#   structural  a parser matched a syntax shape. The shape is real; whether two
+#               matches mean the same entity is not checked.
+#   historical  git history. Authoritative about the past of tracked files.
+#   heuristic   a text match with prose filtered out. Best effort at "is this a
+#               use", and the filter can be wrong in both directions.
+#   textual     a byte or regex match. An occurrence, which is not a use.
+CS_KIND=""; CS_ENGINE=""; CS_NOTE=""; CS_TRUNCATED=""; CS_DEGRADED=""
+
+answer() { CS_KIND="$1"; CS_ENGINE="$2"; CS_NOTE="${3:-}"; }
+
+blind_spots() {
+  case "$1" in
+    resolved) cat <<'X'
+Cannot see: a type chosen at runtime from configuration or reflection; code the
+language server failed to load (an unresolved build is the usual reason, and it
+degrades quietly); anything outside the one repo the server was pointed at.
+A negative here is strong evidence -- but only within that repo, and only if
+the project actually built.
+X
+;;
+    declared) cat <<'X'
+Cannot see: dependencies injected by a parent build file, a BOM, or a plugin
+rather than declared in the manifest; vendored code with no coordinate at all;
+version ranges resolved at build time. States what the manifest says, which is
+not always what is on the classpath.
+X
+;;
+    structural) cat <<'X'
+Cannot see: two matches that resolve to different entities -- it matches shape,
+not identity, so a same-named method on an unrelated class matches too. Cannot
+see calls made through an alias, a wrapper, or reflection. Coverage is
+per-language and uneven; a language the parser does not support returns nothing
+rather than an error.
+X
+;;
+    historical) cat <<'X'
+Cannot see: anything untracked, anything in a repo not in the view, or a change
+that never took this exact string form (a rename that also reformatted). Finds
+where a string entered or left history, which is not always where the behaviour
+changed.
+X
+;;
+    heuristic) cat <<'X'
+Cannot see: a use assembled from parts ("/api/v1/" + resource), a value read
+from configuration, or a generated call site. Also over-reports: a string in a
+test fixture or a dead branch counts as a use. The prose filter is per-file
+comment-state tracking, so an unusual comment syntax can misclassify a line in
+either direction. A negative is weak evidence of absence.
+X
+;;
+    textual) cat <<'X'
+Cannot see: anything not spelled exactly this way -- concatenation, interpolation,
+a constant holding the value, generated code. Counts comments, docs, changelogs
+and test fixtures as hits. This is an occurrence, not a use; a negative is weak
+evidence of absence.
+X
+;;
+    *) return 1 ;;
+  esac
+}
+
+# Print the provenance line. Goes to stderr, so stdout stays exactly the
+# scoreable "repo/path:line: text" stream every caller and score-seams expect.
+report_answer() {
+  local hits="${1:-}" repos="${2:-}"
+  [[ $quiet -eq 1 || -z "$CS_KIND" ]] && return 0
+  local line="${C_BOLD}answer:${C_OFF} $CS_KIND via $CS_ENGINE"
+  [[ -n "$CS_NOTE" ]] && line="$line ($CS_NOTE)"
+  [[ -n "$hits" ]] && line="$line · $hits hit(s)"
+  [[ -n "$repos" ]] && line="$line · $repos repo(s)"
+  info "$line"
+  [[ -n "$CS_DEGRADED" ]] && warn "degraded: $CS_DEGRADED"
+  if timed_out; then
+    warn "an engine hit the ${CS_TIMEOUT:-120}s timeout $(grep -c '' "$CS_TIMEOUT_FLAG") time(s); these results are PARTIAL, not complete (raise CS_TIMEOUT)"
+  fi
+  if [[ -n "$CS_TRUNCATED" ]]; then
+    warn "showing $CS_MAX_RESULTS of $CS_TRUNCATED — rerun with --all, or narrow the query"
+  fi
+  if [[ $show_why -eq 1 ]]; then
+    info ""
+    blind_spots "$CS_KIND" >&2
+  else
+    info "  ${C_BOLD}--why${C_OFF} for what a $CS_KIND answer cannot see"
+  fi
+}
+
+# Print at most CS_MAX_RESULTS lines. A fleet-wide query for a common token can
+# return tens of thousands of lines on real repos; dumping those into an agent's
+# context is worse than saying how many there were and where they live.
+emit_capped() {
+  local out="$1" total
+  total=$(printf '%s\n' "$out" | grep -c '' )
+  if [[ "${CS_MAX_RESULTS:-200}" -gt 0 && "$total" -gt "${CS_MAX_RESULTS}" ]]; then
+    printf '%s\n' "$out" | head -n "$CS_MAX_RESULTS"
+    CS_TRUNCATED="$total"
+    # When truncating, the distribution is the useful part of what was cut.
+    info ""
+    info "${C_BOLD}hits per repo (all $total, not just those shown):${C_OFF}"
+    printf '%s\n' "$out" | cut -d/ -f1 | sort | uniq -c | sort -rn | sed 's/^/  /' >&2
+  else
+    printf '%s\n' "$out"
+  fi
+}
+
+n_repos_in() { printf '%s\n' "$1" | cut -d/ -f1 | sort -u | grep -c ''; }
+n_hits_in()  { printf '%s\n' "$1" | grep -c ''; }
+
+# Print the comment header verbatim, so usage cannot drift from the file.
+usage() {
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+  exit "${1:-0}"
+}
 
 cmd_engines() {
   local n=0
@@ -165,7 +382,17 @@ cmd_engines() {
   else printf '%-12s %s\n' "ctags" "MISSING (brew install universal-ctags)"; fi
   if have uvx; then printf '%-12s %s\n' "serena" "ok (via uvx)"; n=$((n+1))
   else printf '%-12s %s\n' "serena" "MISSING (needs uv)"; fi
-  printf '\nfleet root: %s\n' "$root"
+  if have git; then printf '%-12s %s\n' "git" "ok (cs history)"; n=$((n+1))
+  else printf '%-12s %s\n' "git" "MISSING (cs history unavailable)"; fi
+  printf '\nfleet root:  %s\n' "$root"
+  printf 'text engine: %s\n' "$(text_engine)"
+  printf 'result cap:  %s\n' \
+    "$([[ "${CS_MAX_RESULTS:-200}" -eq 0 ]] && echo "none" || echo "${CS_MAX_RESULTS:-200} (CS_MAX_RESULTS, or --all)")"
+  if timeout_bin >/dev/null; then
+    printf 'timeout:     %ss (CS_TIMEOUT)\n' "${CS_TIMEOUT:-120}"
+  else
+    printf 'timeout:     %s\n' "NONE — no timeout(1) on this machine, so a hung engine hangs cs (brew install coreutils)"
+  fi
   [[ $n -gt 0 ]]
 }
 
@@ -173,13 +400,16 @@ hint() { info ""; info "${C_BOLD}nothing found — try:${C_OFF}"; while [[ $# -g
 
 cmd_text() {
   [[ $# -ge 1 ]] || die "cs text <pattern>"
+  answer textual "$(text_engine)" "regex"
   local out; out=$(grep_fleet -E "$1" | normalize)
   if [[ -z "$out" ]]; then
+    report_answer 0 0
     hint "cs def $1              (it may be a symbol, not literal text)" \
          "cs calls '<pattern>'   (it may only appear as a call shape)"
     return 1
   fi
-  printf '%s\n' "$out"
+  emit_capped "$out"
+  report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
 }
 
 # A seam is a string two repos share. Grouping by repo is the answer -- a flat
@@ -187,19 +417,23 @@ cmd_text() {
 # three do (a fan-out nobody expected).
 cmd_seam() {
   [[ $# -ge 1 ]] || die "cs seam <string>"
-  local hits repos
+  answer textual "$(text_engine)" "literal, grouped by repo"
+  local hits repos n
   hits=$(grep_fleet -F "$1" | normalize)
   if [[ -z "$hits" ]]; then
     info "no repo mentions '$1'"
+    report_answer 0 0
     return 1
   fi
   repos=$(printf '%s\n' "$hits" | cut -d/ -f1 | sort -u)
-  printf '%s\n' "$hits"
+  n=$(printf '%s\n' "$repos" | grep -c '')
+  emit_capped "$hits"
   info ""
-  info "${C_BOLD}$(printf '%s\n' "$repos" | wc -l | tr -d ' ') repo(s):${C_OFF} $(printf '%s ' $repos)"
-  if [[ $(printf '%s\n' "$repos" | wc -l | tr -d ' ') -eq 1 ]]; then
+  info "${C_BOLD}$n repo(s):${C_OFF} $(printf '%s ' $repos)"
+  if [[ $n -eq 1 ]]; then
     warn "only one repo mentions this -- a producer with no consumer, or dead"
   fi
+  report_answer "$(n_hits_in "$hits")" "$n"
 }
 
 # Deliberately not a natural-language router: guessing intent from a sentence
@@ -218,14 +452,27 @@ What implements this interface?                  cs impls <symbol> <repo>
 What references this symbol (bridges DI)?        cs refs <symbol> <repo> <file>
 Which repo publishes this package?               cs provides <coordinate>
 Which repos depend on which?                     cs deps [repo]
+When did this seam appear, or last change?       cs history <string> [repo]
+What am I actually searching right now?           cs repos
+How much should I trust this answer?             cs why [kind]
 
 Two same-named symbols in different repos: resolve the dependency first, then
 filter, because code search alone cannot tell them apart:
 
   cs def DiscountEngine "$(cs provides com.acme:pricing-lib)"
 
+When a consumer breaks and nothing in its own repo changed, the trigger is in
+another repo and its history is not reachable from here. cs history spans the
+fleet and sorts by date, which puts the two changes side by side:
+
+  cs history '"reservationId"'      # every repo that added or removed it, in order
+
 Start cheap. cs uses and cs def answer most questions in well under a second;
 cs impls and cs refs start language servers and are far slower.
+
+Every answer prints the KIND of evidence behind it. Read that before acting on
+a negative result: `cs uses` finding nothing is weak evidence of no callers,
+because it cannot see a path assembled by concatenation. `cs why` explains.
 TABLE
 }
 
@@ -235,6 +482,7 @@ TABLE
 # literal that is the real call site.
 cmd_uses() {
   [[ $# -ge 1 ]] || die "cs uses <string>"
+  answer heuristic "$(text_engine)" "literal, prose filtered"
   local hits repos
   hits=$(grep_fleet -F "$1" | normalize | python3 "$lib_dir/filter_code.py" --root "$view")
   if [[ -z "$hits" ]]; then
@@ -245,18 +493,21 @@ cmd_uses() {
       warn "mentioned only in comments/docs:"
       printf '%s\n' "$prose"
     fi
+    report_answer 0 0
     return 1
   fi
-  printf '%s\n' "$hits"
+  emit_capped "$hits"
   repos=$(printf '%s\n' "$hits" | cut -d/ -f1 | sort -u)
   info ""
-  info "${C_BOLD}$(printf '%s\n' "$repos" | wc -l | tr -d ' ') repo(s) use it:${C_OFF} $(printf '%s ' $repos)"
+  info "${C_BOLD}$(printf '%s\n' "$repos" | grep -c '') repo(s) use it:${C_OFF} $(printf '%s ' $repos)"
+  report_answer "$(n_hits_in "$hits")" "$(n_repos_in "$hits")"
 }
 
 cmd_def() {
   [[ $# -ge 1 ]] || die "cs def <symbol> [repo]"
   local only="${2:-}"
   local ct; ct=$(ctags_bin) || die "universal-ctags not installed"
+  answer structural "ctags" "fleet-wide symbol index, rebuilt per query"
   local tags="${TMPDIR:-/tmp}/cs-tags.$$"
   # Rebuilding is cheap (measured 0.07s over the whole fixture fleet), so the
   # index is never stale.
@@ -273,11 +524,18 @@ cmd_def() {
   rm -f "$tags"
   if [[ ! -s "$tags.out" ]]; then
     rm -f "$tags.out"
+    report_answer 0 0
     hint "cs text '$1'           (ctags misses symbols built dynamically)" \
          "cs refs $1 <repo> <file>  (for a precise, LSP-backed answer)"
     return 1
   fi
-  cat "$tags.out"; rm -f "$tags.out"
+  local out; out=$(cat "$tags.out"); rm -f "$tags.out"
+  emit_capped "$out"
+  # Two repos defining the same name is the failure mode this cannot resolve:
+  # ctags matches spelling, so it cannot tell you which one your caller means.
+  local nr; nr=$(n_repos_in "$out")
+  [[ $nr -gt 1 ]] && warn "defined in $nr repos — same name, possibly unrelated types. Resolve with: cs def $1 \"\$(cs provides <coordinate>)\""
+  report_answer "$(n_hits_in "$out")" "$nr"
 }
 
 # Which repo publishes a coordinate, and which repos depend on which. Answers
@@ -286,36 +544,68 @@ cmd_def() {
 # on, and that lives in build manifests, not in code.
 cmd_provides() {
   [[ $# -ge 1 ]] || die "cs provides <coordinate>"
-  python3 "$lib_dir/deps.py" "$view" provides "$1"
+  answer declared "build manifests" "publish declarations"
+  local out; out=$(python3 "$lib_dir/deps.py" "$view" provides "$1")
+  printf '%s\n' "$out"
+  report_answer
 }
 
 cmd_deps() {
+  answer declared "build manifests" "dependency declarations"
   python3 "$lib_dir/deps.py" "$view" deps "${1:-}"
+  report_answer
 }
 
 cmd_publishes() {
+  answer declared "build manifests" "publish declarations"
   python3 "$lib_dir/deps.py" "$view" publishes
+  report_answer
 }
 
+# The facade's own hazard: this falls back ast-grep -> semgrep, so an engine can
+# break while every scored query still passes. The fallback is therefore
+# announced rather than silent, and --engine= makes it fail instead.
 cmd_calls() {
   [[ $# -ge 1 ]] || die "cs calls <pattern> [lang]"
-  local pattern="$1" lang="${2:-}"
-  if have ast-grep; then
-    local args=(--follow -p "$pattern")
-    [[ -n "$lang" ]] && args+=(-l "$lang")
-    (cd "$view" && ast-grep "${args[@]}" 2>/dev/null) | normalize
-  elif have semgrep; then
-    # semgrep does not follow symlinks, so it is pointed at the real paths.
-    local args=(-e "$pattern" --quiet --no-git-ignore)
-    [[ -n "$lang" ]] && args+=(-l "$lang")
-    local d
-    while IFS= read -r d; do
-      [[ -n "$d" ]] || continue
-      (cd "$(dirname "$d")" && semgrep "${args[@]}" "$(basename "$d")" 2>/dev/null)
-    done < <(real_dirs) | normalize
+  local pattern="$1" lang="${2:-}" out engine="${force_engine:-}"
+  if [[ -z "$engine" ]]; then
+    if have ast-grep; then engine=ast-grep
+    elif have semgrep; then engine=semgrep; CS_DEGRADED="ast-grep absent, fell back to semgrep (different pattern dialect, different results)"
+    else die "neither ast-grep nor semgrep installed"
+    fi
   else
-    die "neither ast-grep nor semgrep installed"
+    have "$engine" || die "--engine=$engine requested but not installed"
   fi
+  answer structural "$engine" "${lang:-all languages}"
+
+  case "$engine" in
+    ast-grep)
+      local args=(--follow -p "$pattern")
+      [[ -n "$lang" ]] && args+=(-l "$lang")
+      out=$( (cd "$view" && run_timed ast-grep "${args[@]}" 2>/dev/null) | normalize ) ;;
+    semgrep)
+      # semgrep does not follow symlinks, so it is pointed at the real paths.
+      local args=(-e "$pattern" --quiet --no-git-ignore)
+      [[ -n "$lang" ]] && args+=(-l "$lang")
+      local d
+      out=$(while IFS= read -r d; do
+              [[ -n "$d" ]] || continue
+              (cd "$(dirname "$d")" && run_timed semgrep "${args[@]}" "$(basename "$d")" 2>/dev/null)
+            done < <(real_dirs) | normalize) ;;
+    *) die "unknown structural engine: $engine" ;;
+  esac
+
+  if [[ -z "$out" ]]; then
+    report_answer 0 0
+    # A structural engine returns nothing both when there is no match and when
+    # it cannot parse the language at all. Those are very different, and the
+    # caller cannot tell them apart from an empty result.
+    hint "cs text '$pattern'     (a structural engine returns nothing for a language it cannot parse — same as no match)" \
+         "cs calls '$pattern' <lang>   (naming the language makes an unsupported one an error rather than silence)"
+    return 1
+  fi
+  emit_capped "$out"
+  report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
 }
 
 # The LSP-backed answers are the only ones that resolve an interface to its
@@ -325,6 +615,7 @@ cmd_impls() {
   have uvx || die "serena needs uv installed"
   local repo_dir="$view/$2" file="${3:-}"
   [[ -d "$repo_dir" ]] || die "no such repo: $2"
+  answer resolved "serena (LSP)" "scoped to $2"
 
   # Serena identifies a symbol by name_path plus the file holding it, so the
   # symbol is looked up first rather than assuming a bare name is enough.
@@ -355,8 +646,9 @@ if pick:
     return 1
   fi
 
-  python3 "$lib_dir/serena_call.py" "$repo_dir" find_implementations \
+  run_timed python3 "$lib_dir/serena_call.py" "$repo_dir" find_implementations \
     "{\"name_path\":\"$name_path\",\"relative_path\":\"$rel\"}"
+  report_answer
 }
 
 cmd_refs() {
@@ -364,25 +656,144 @@ cmd_refs() {
   have uvx || die "serena needs uv installed"
   local repo_dir="$view/$2"
   [[ -d "$repo_dir" ]] || die "no such repo: $2"
-  python3 "$lib_dir/serena_call.py" "$repo_dir" find_referencing_symbols \
+  answer resolved "serena (LSP)" "scoped to $2"
+  run_timed python3 "$lib_dir/serena_call.py" "$repo_dir" find_referencing_symbols \
     "{\"name_path\":\"$1\",\"relative_path\":\"$3\"}"
+  report_answer
+}
+
+# ---- history ---------------------------------------------------------------
+# The question no search engine answers: not "where is this string" but "when
+# did it get there, and what else changed with it". `git log -S` (the pickaxe)
+# finds commits that changed the NUMBER of occurrences of a string, which is
+# how you find the commit that introduced or removed a seam rather than the
+# commits that merely touched the file.
+#
+# This is the cross-repo case done properly. When a consumer breaks because a
+# producer changed, the producer's commit is in a different repo and is not
+# reachable from the consumer's history at all -- so the search has to span the
+# fleet, ordered by date, to put the two changes next to each other.
+cmd_history() {
+  [[ $# -ge 1 ]] || die "cs history <string> [repo]"
+  local want="$1" only="${2:-}" rows=""
+
+  # -S is the pickaxe: commits where the NUMBER of occurrences changed, which
+  # isolates introduction and removal from the noise of commits that merely
+  # touched the file. Its blind spot is a change in place -- rewriting the line
+  # around the string leaves the count identical, so -S says nothing happened.
+  # That is exactly the shape of a serializer or format change, so an empty -S
+  # result escalates to -G (any diff hunk matching) rather than reporting none.
+  _history_scan() {  # _history_scan <git-flag>
+    local flag="$1" d name log out=""
+    while IFS= read -r d; do
+      [[ -n "$d" && -d "$d/.git" ]] || continue
+      name=$(basename "$d")
+      [[ -n "$only" && "$name" != "$only" ]] && continue
+      log=$(run_timed git -C "$d" log --all --no-merges "$flag$want" \
+              --pretty=format:'%cs%x09%h%x09%an%x09%s' -- . 2>/dev/null) || continue
+      [[ -n "$log" ]] || continue
+      out+=$(printf '%s\n' "$log" | sed "s|^|$name\t|")$'\n'
+    done < <(real_dirs)
+    printf '%s' "$out"
+  }
+
+  if [[ $touched_mode -eq 1 ]]; then
+    answer historical "git log -G" "any diff hunk mentioning it"
+    rows=$(_history_scan -G)
+  else
+    answer historical "git log -S" "occurrence count changed"
+    rows=$(_history_scan -S)
+    if [[ -z "$rows" ]]; then
+      rows=$(_history_scan -G)
+      [[ -n "$rows" ]] && {
+        answer historical "git log -G" "no commit changed the count; showing commits that touched it"
+        CS_DEGRADED="'$want' was never added or removed as a whole — every hit below modified a line already containing it"
+      }
+    fi
+  fi
+
+  if [[ -z "$rows" ]]; then
+    info "no commit in the view added, removed, or modified a line containing '$want'"
+    report_answer 0 0
+    hint "cs seam '$want'        (confirm any repo contains it at all)" \
+         "cs history '<shorter substring>'   (a reformat can hide the original spelling)"
+    return 1
+  fi
+  # Sorted by date across every repo, because the point is the interleaving:
+  # a producer's change landing days before a consumer's incident is the signal.
+  printf '%s' "$rows" | sort -t$'\t' -k2,2 \
+    | awk -F'\t' '{ printf "%s  %-28s %-9s %-18s %s\n", $2, $1, $3, substr($4,1,18), $5 }'
+  report_answer "$(printf '%s' "$rows" | grep -c '')" \
+                "$(printf '%s' "$rows" | cut -f1 | sort -u | grep -c '')"
+}
+
+# What is actually being searched, and whether each repo came from the ticket or
+# the fleet. An agent that cannot see the view cannot judge a negative result.
+cmd_repos() {
+  local d name target kind
+  printf '%-32s %-8s %s\n' "REPO" "LAYER" "PATH"
+  for d in "$view"/*; do
+    [[ -e "$d" ]] || continue
+    name=$(basename "$d")
+    if [[ -L "$d" ]]; then target=$(readlink "$d"); else target="$d"; fi
+    if [[ -n "$ticket_root" && "$target" == "$ticket_root"/* ]]; then kind="ticket"; else kind="fleet"; fi
+    printf '%-32s %-8s %s\n' "$name" "$kind" "$target"
+  done
+}
+
+cmd_why() {
+  if [[ $# -ge 1 ]]; then
+    blind_spots "$1" || die "unknown answer kind: $1 (resolved, declared, structural, historical, heuristic, textual)"
+    return 0
+  fi
+  cat <<'TABLE'
+Every cs answer is labelled with the kind of evidence behind it. The kind is
+what decides how much a NEGATIVE result is worth -- "cs uses found nothing" is
+weak evidence of no callers; "cs refs found nothing" is strong.
+
+KIND        WEIGHT  PRODUCED BY                    A NEGATIVE MEANS
+----------- ------- ------------------------------ ----------------------------
+resolved    highest serena (LSP)                   strong: no reference, in that repo
+declared    high    build manifests                strong: not declared
+structural  medium  ast-grep / semgrep / ctags     medium: no such shape
+historical  high    git log -S                     strong, for tracked files
+heuristic   low     text match, prose filtered     weak
+textual     lowest  ripgrep / grep                 weak
+
+Run `cs why <kind>` for what that kind specifically cannot see.
+TABLE
 }
 
 fleet_only=0
+show_why=0
+quiet=0
+touched_mode=0
+force_engine=""
+CS_MAX_RESULTS="${CS_MAX_RESULTS:-200}"
 args=()
 for a in "$@"; do
   case "$a" in
     --fleet) fleet_only=1 ;;
     --ticket=*) ticket_root="${TICKETS_ROOT:-}/${a#--ticket=}" ;;
+    --why) show_why=1 ;;
+    --quiet|-q) quiet=1 ;;
+    --all) CS_MAX_RESULTS=0 ;;
+    --touched) touched_mode=1 ;;
+    --engine=*) force_engine="${a#--engine=}" ;;
     *) args+=("$a") ;;
   esac
 done
+# --engine names a text backend as well as a structural one; the text side is
+# read from the environment so grep_fleet stays free of the flag plumbing.
+case "$force_engine" in
+  rg|ripgrep|grep|posix) export CS_TEXT_ENGINE="$force_engine"; force_engine="" ;;
+esac
 set -- "${args[@]:-}"
 
 [[ $# -ge 1 && -n "${1:-}" ]] || usage 1
 sub="$1"; shift
 build_view
-case "$sub" in engines|which|-h|--help|help) ;; *) announce_view ;; esac
+case "$sub" in engines|which|why|repos|-h|--help|help) ;; *) announce_view ;; esac
 case "$sub" in
   text)    cmd_text "$@" ;;
   seam)    cmd_seam "$@" ;;
@@ -394,7 +805,10 @@ case "$sub" in
   calls)   cmd_calls "$@" ;;
   impls)   cmd_impls "$@" ;;
   refs)    cmd_refs "$@" ;;
+  history) cmd_history "$@" ;;
+  repos)   cmd_repos ;;
   which)   cmd_which ;;
+  why)     cmd_why "$@" ;;
   engines) cmd_engines ;;
   -h|--help|help) usage 0 ;;
   *) err "unknown subcommand: $sub"; usage 1 ;;

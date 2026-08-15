@@ -73,6 +73,153 @@ else
   warn "reserve-implementation SKIPPED (uv not installed; cs refs unavailable)"
 fi
 
+# ---- engine parity ---------------------------------------------------------
+# The answer must not depend on which text engine happens to be installed. This
+# is not hypothetical: ripgrep defaults to skipping dotted paths and honouring
+# .gitignore, while POSIX grep does neither, so before those flags were pinned a
+# config key living in .github/ was found on a machine without ripgrep and
+# missed on a machine with it. A search tool that answers differently per host
+# is worse than a slow one, because nothing tells you which answer you got.
+info ""
+info "${C_BOLD}engine parity${C_OFF}"
+if [[ -x "$(command -v rg 2>/dev/null || true)" ]]; then
+  # A hidden path carrying a real seam, which is the case that used to diverge.
+  probe_repo="$FLEET_ROOT/inventory-api-dotnet"
+  mkdir -p "$probe_repo/.github/workflows"
+  printf 'env:\n  RESERVE_FLAG: inventory.reserve.enabled\n' \
+    > "$probe_repo/.github/workflows/parity-probe.yml"
+
+  parity_bad=()
+  for q in '/api/v1/inventory/reserve' 'orders.reserved.v1' 'reservationId' \
+           'inventory.reserve.enabled' 'DiscountEngine'; do
+    a=$(CS_TEXT_ENGINE=ripgrep "$here/cs" seam "$q" --quiet --all 2>/dev/null | sort)
+    b=$(CS_TEXT_ENGINE=grep    "$here/cs" seam "$q" --quiet --all 2>/dev/null | sort)
+    [[ "$a" == "$b" ]] || parity_bad+=("$q")
+  done
+  if [[ ${#parity_bad[@]} -eq 0 ]]; then
+    ok "ripgrep and grep return identical results"; pass=$((pass + 1))
+  else
+    err "backends disagree on: ${parity_bad[*]}"; fail=$((fail + 1))
+    failed_ids+=("engine-parity")
+  fi
+
+  hidden=$("$here/cs" seam 'inventory.reserve.enabled' --quiet --all 2>/dev/null | grep -c '\.github/')
+  if [[ "$hidden" -ge 1 ]]; then
+    ok "a seam inside a dotted path (.github/) is found"; pass=$((pass + 1))
+  else
+    err "the .github/ seam was missed — ripgrep is skipping hidden paths again"
+    fail=$((fail + 1)); failed_ids+=("hidden-path-visibility")
+  fi
+  rm -rf "$probe_repo/.github"
+else
+  warn "engine parity SKIPPED (no ripgrep binary here; only the grep backend exists)"
+fi
+
+# ---- answer provenance -----------------------------------------------------
+# Every answer must say what kind of evidence produced it, because that is what
+# decides how much a negative result is worth. A subcommand that forgets to
+# label itself silently downgrades the caller's ability to judge the result.
+info ""
+info "${C_BOLD}answer provenance${C_OFF}"
+prov_missing=()
+prov_check() {  # prov_check <expected-kind> <args...>
+  local want="$1"; shift
+  local line
+  line=$("$here/cs" "$@" 2>&1 >/dev/null | grep '^answer:' | head -1)
+  [[ "$line" == *"$want"* ]] || prov_missing+=("$* (wanted $want, got '${line:-nothing}')")
+}
+prov_check textual    text 'reservationId'
+prov_check textual    seam 'reservationId'
+prov_check heuristic  uses 'reservationId'
+prov_check structural def Reserve
+prov_check declared   provides com.acme:pricing-lib
+prov_check historical history 'reservationId'
+command -v ast-grep >/dev/null 2>&1 && prov_check structural calls '$X.IsEnabled($K)'
+
+if [[ ${#prov_missing[@]} -eq 0 ]]; then
+  ok "every subcommand labels the kind of answer it gives"; pass=$((pass + 1))
+else
+  err "unlabelled answers:"; printf '    %s\n' "${prov_missing[@]}" >&2
+  fail=$((fail + 1)); failed_ids+=("answer-provenance")
+fi
+
+# Each kind must have its blind spots written down; a label nobody can expand is
+# decoration rather than information.
+why_missing=()
+for kind in resolved declared structural historical heuristic textual; do
+  "$here/cs" why "$kind" >/dev/null 2>&1 || why_missing+=("$kind")
+done
+if [[ ${#why_missing[@]} -eq 0 ]]; then
+  ok "every answer kind documents what it cannot see"; pass=$((pass + 1))
+else
+  err "no blind-spot text for: ${why_missing[*]}"; fail=$((fail + 1))
+  failed_ids+=("answer-why")
+fi
+
+# The worst failure this tool can have is a timeout that looks like "no
+# results", because the caller then concludes nothing uses the thing they were
+# about to change. Engines run in subshells, so the timeout has to survive a
+# process boundary to be reported at all -- which is why this is tested rather
+# than assumed. The LSP path is used because it is reliably slower than 1s.
+if command -v uvx >/dev/null 2>&1 && ("$here/cs" engines 2>/dev/null | grep -q '^timeout: *[0-9]'); then
+  to=$(CS_TIMEOUT=1 "$here/cs" refs IInventoryStore inventory-api-dotnet \
+        src/Domain/IInventoryStore.cs 2>&1 >/dev/null | grep -c 'PARTIAL')
+  if [[ "$to" -ge 1 ]]; then
+    ok "a timed-out engine reports PARTIAL, not empty"; pass=$((pass + 1))
+  else
+    err "a timeout was indistinguishable from 'no results'"; fail=$((fail + 1))
+    failed_ids+=("timeout-visibility")
+  fi
+else
+  warn "timeout visibility SKIPPED (needs uv and a timeout(1); brew install coreutils)"
+fi
+
+# A negative result must not be silent about being weak evidence, and a capped
+# result must say it was capped rather than looking like the whole answer.
+capped=$(CS_MAX_RESULTS=2 "$here/cs" seam 'reserve' 2>&1 >/dev/null | grep -c 'showing 2 of')
+if [[ "$capped" -ge 1 ]]; then
+  ok "a truncated result says so"; pass=$((pass + 1))
+else
+  err "truncation was silent"; fail=$((fail + 1)); failed_ids+=("truncation-notice")
+fi
+
+# ---- history ---------------------------------------------------------------
+# `git log -S` reports commits where the number of occurrences changed, so a
+# change made in place is invisible to it. That is the shape of a formatting or
+# serializer change -- exactly the cross-repo trigger this fleet exists to make
+# findable -- so an empty -S result has to escalate to -G rather than report
+# "nothing happened".
+info ""
+info "${C_BOLD}history${C_OFF}"
+hist_repo="$FLEET_ROOT/pricing-lib-java"
+hist_file="$hist_repo/src/main/java/com/acme/pricing/DiscountEngine.java"
+if [[ -f "$hist_file" ]]; then
+  printf '\n// marker: PARITYSENTINEL added\n' >> "$hist_file"
+  git -C "$hist_repo" commit -aqm 'add sentinel' 2>/dev/null
+  perl -pi -e 's/PARITYSENTINEL added/PARITYSENTINEL reworded in place/' "$hist_file"
+  git -C "$hist_repo" commit -aqm 'reword sentinel in place' 2>/dev/null
+
+  h=$("$here/cs" history 'PARITYSENTINEL' 2>&1)
+  if printf '%s' "$h" | grep -q 'add sentinel'; then
+    ok "history finds the commit that introduced a string"; pass=$((pass + 1))
+  else
+    err "history missed the introducing commit"; fail=$((fail + 1))
+    failed_ids+=("history-introduce")
+  fi
+
+  h2=$("$here/cs" history 'PARITYSENTINEL reworded in place' 2>&1)
+  if printf '%s' "$h2" | grep -q 'reword sentinel in place'; then
+    ok "history escalates to -G for a change made in place"; pass=$((pass + 1))
+  else
+    err "a modification in place was reported as no history at all"
+    fail=$((fail + 1)); failed_ids+=("history-escalation")
+  fi
+
+  git -C "$hist_repo" reset --hard -q HEAD~2 2>/dev/null
+else
+  warn "history checks SKIPPED (fixture layout changed)"
+fi
+
 # ---- two-level view --------------------------------------------------------
 # The opinionated setup is a fleet directory plus per-ticket workspaces, so the
 # layering itself is tested: a ticket must see its own branch state AND the
