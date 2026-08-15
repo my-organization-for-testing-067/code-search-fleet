@@ -156,6 +156,11 @@ cs def DiscountEngine "$(cs provides com.acme:pricing-lib)"
 - **`cs def` uses ctags**, which indexes declarations, not semantics. It will
   not find a symbol assembled at runtime, and it does not distinguish
   overloads. `cs refs` is the precise-but-slow alternative.
+- **`cs def` reuses its index for 60 seconds.** The key is the commit each repo
+  is on, so a fleet refresh or a branch change invalidates it — but *uncommitted*
+  edits do not. The answer line says how old the index is; pass `--refresh` after
+  editing a file you are about to look up. Measured 5.9s cold and 0.74s reused
+  on a 456k-line fleet, which is why it is cached at all.
 - **`grep` may not be the `grep` you tested with.** In an agent shell, `grep`
   and `rg` can be shell functions proxying a bundled ripgrep; a *script* gets
   the real system binary instead. BSD `grep -R` follows a symlink named on the

@@ -94,6 +94,7 @@ contain — the failure that makes renaming a shared route look safe.
 ```sh
 scripts/verify-search      # end-to-end: does the facade still answer everything?
 scripts/verify-engines     # per-engine: is each engine still doing its job?
+scripts/bench-scale        # what it costs on a generated 456k-line fleet
 ```
 
 Both matter. `verify-search` alone is not enough because **the facade hides

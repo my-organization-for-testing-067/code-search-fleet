@@ -528,14 +528,16 @@ cmd_uses() {
 # The fleet's identity for caching: which repos are in the view and what commit
 # each sits on. Reading refs is milliseconds; it is the one cheap thing that
 # changes whenever the fleet is refreshed or a ticket branch moves.
+# Keyed on the REAL repo paths, never on $view: in a ticket workspace the view
+# is a fresh temp directory of symlinks on every invocation, so including it
+# would change the key every run and the cache would never hit at all -- which
+# is exactly the case where the fleet is large and the saving matters.
 view_fingerprint() {
   local d
-  { printf '%s\n' "$view"
-    for d in $(real_dirs); do
-      printf '%s %s\n' "$(basename "$d")" \
-        "$(git -C "$d" rev-parse HEAD 2>/dev/null || echo nogit)"
+  { for d in $(real_dirs); do
+      printf '%s %s\n' "$d" "$(git -C "$d" rev-parse HEAD 2>/dev/null || echo nogit)"
     done
-  } | (md5 -q 2>/dev/null || md5sum 2>/dev/null | cut -d' ' -f1)
+  } | sort | (md5 -q 2>/dev/null || md5sum 2>/dev/null | cut -d' ' -f1)
 }
 
 cmd_def() {

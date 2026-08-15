@@ -1,6 +1,6 @@
 # engine	version	kind	outcome	note
-# verified 2026-08-15T15:58:51Z
-grep	2.6.0-FreeBSD	capability	PASS	literal text across repos
+# verified 2026-08-15T17:26:44Z
+ripgrep	15.2.0	capability	PASS	literal text across repos
 ctags	6.2.1	capability	PASS	fleet-wide symbol index
 ast-grep	0.45.1	capability	PASS	literal in argument position
 semgrep	1.173.0	capability	PASS	structural fallback for ast-grep
