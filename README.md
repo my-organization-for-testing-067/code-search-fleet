@@ -28,7 +28,7 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 12 checks against a throwaway fixture fleet
+scripts/verify-search              # 20 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only
@@ -50,6 +50,31 @@ around what is missing rather than failing silently.
 | What references this symbol (bridges DI) | `cs refs <symbol> <repo> <file>` |
 | Which repo publishes this package | `cs provides <coordinate>` |
 | Which repos depend on which | `cs deps [repo]` |
+| When a seam appeared, or last changed | `cs history <string> [repo]` |
+| What is actually being searched | `cs repos` |
+| How much to trust an answer | `cs why [kind]` |
+
+## Every answer says what kind of answer it is
+
+A perfect score on a fixture is not the goal; some questions are undecidable
+statically at any budget. So each result is labelled with the evidence behind
+it — `resolved`, `declared`, `historical`, `structural`, `heuristic`, or
+`textual`:
+
+```
+answer: heuristic via ripgrep (literal, prose filtered) · 2 hit(s) · 2 repo(s)
+  --why for what a heuristic answer cannot see
+```
+
+This matters most for **negative** results, which is where a search tool does
+real damage: "nothing uses this" from a `textual` match is close to worthless
+evidence, while the same answer from `cs refs` is strong. `cs why <kind>` prints
+what that kind cannot see.
+
+`cs` is also loud about the three ways a result can be less than it looks: an
+engine that hit its timeout says `PARTIAL` rather than returning empty, a capped
+result says `showing N of M` and prints the per-repo distribution, and a
+fallback to a different engine says `degraded:`.
 
 ## Two levels
 
@@ -73,7 +98,15 @@ scripts/verify-engines     # per-engine: is each engine still doing its job?
 
 Both matter. `verify-search` alone is not enough because **the facade hides
 engine regressions**: `cs calls` falls back from ast-grep to semgrep, so
-ast-grep could break entirely and the end-to-end run would still pass.
+ast-grep could break entirely and the end-to-end run would still pass. (The
+fallback now announces itself, but a passing score still would not.)
+
+`verify-search` also asserts that **the two text backends agree**. Ripgrep
+defaults to skipping dotted paths and honouring `.gitignore` while POSIX grep
+does neither, so before those flags were pinned a config key in `.github/` was
+found on a machine without ripgrep and missed on one with it. An answer that
+depends on which engine happens to be installed is worse than a slow one,
+because nothing tells you which answer you got.
 
 `verify-engines` also probes **known limitations**, not just capabilities, and
 reports `IMPROVED` when one disappears — an upgrade can remove the reason a
@@ -115,6 +148,8 @@ replayed tip matches the canonical tree, so history cannot drift from source.
   at runtime — is undecidable statically at any budget.
 - 9/9 on this fixture means the test set is exhausted, not that search is
   solved. The real measure is a query set drawn from your own tickets.
+- Result caps and timeouts mean an answer can be partial. `cs` says so when it
+  is, which is the mitigation — not a guarantee that it is not.
 
 ## Use with an AI agent
 

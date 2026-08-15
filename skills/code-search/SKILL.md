@@ -38,6 +38,8 @@ Run `cs which` for this table at any time.
 | What references this symbol (bridges DI) | `cs refs <symbol> <repo> <file>` |
 | Which repo publishes this package | `cs provides <coordinate>` |
 | Which repos depend on which | `cs deps [repo]` |
+| When a seam appeared, or last changed | `cs history <string> [repo]` |
+| What is actually being searched right now | `cs repos` |
 
 **Start cheap.** `cs uses`, `cs def`, and `cs seam` answer in well under a
 second. `cs impls` and `cs refs` start language servers and take minutes on a
@@ -46,6 +48,58 @@ look.
 
 When a subcommand finds nothing it prints what to try instead, so a wrong first
 choice self-corrects.
+
+## Read the answer kind before you trust the answer
+
+Every result ends with a line naming the kind of evidence behind it:
+
+```
+answer: heuristic via ripgrep (literal, prose filtered) · 2 hit(s) · 2 repo(s)
+```
+
+The kind matters most for **negative** results, which is where a search tool
+does real damage — concluding "nothing uses this" is what makes a breaking
+change look safe.
+
+| Kind | From | A negative result means |
+|---|---|---|
+| `resolved` | serena (LSP) | strong: no reference — within that one repo |
+| `declared` | build manifests | strong: not declared |
+| `historical` | `git log -S`/`-G` | strong, for tracked files |
+| `structural` | ast-grep / semgrep / ctags | medium: no such syntax shape |
+| `heuristic` | text match, prose filtered | **weak** |
+| `textual` | ripgrep / grep | **weakest** — an occurrence is not a use |
+
+`cs why <kind>` prints exactly what that kind cannot see; `--why` on any query
+gives it inline.
+
+Three warnings `cs` emits that you must pass on rather than swallow:
+
+- **`PARTIAL`** — an engine hit its timeout, so the result is a subset, not an
+  answer. Raise `CS_TIMEOUT` and rerun before concluding anything from it.
+- **`showing N of M`** — capped at 200 results. The per-repo distribution of all
+  M is printed; use it to narrow, or pass `--all`.
+- **`degraded:`** — an engine was missing and `cs` fell back to another with a
+  different pattern dialect. The results are not equivalent.
+
+## Finding a cause in another repo
+
+When something breaks and nothing in its own repo changed, the trigger is in a
+repo whose history is not reachable from where you are standing. `cs history`
+spans the fleet and sorts by date, which puts the two changes side by side:
+
+```sh
+cs history 'reservationId'
+# 2026-02-17  checkout-service-kotlin   7041e2d  PROJ-388: return the reservation id
+# 2026-03-30  inventory-api-dotnet      a41c9e2  Bump serialization settings
+```
+
+It uses git's pickaxe (`-S`), which reports commits that changed the *number* of
+occurrences — that is what separates the commit which introduced a seam from the
+hundreds that merely touched the file. A change made **in place** leaves the
+count identical and is invisible to `-S`, which is exactly the shape of a
+formatting or serializer change; `cs` escalates to `-G` automatically and says
+that it did. `--touched` forces `-G` from the start.
 
 ## Two levels: fleet and ticket workspace
 
@@ -112,7 +166,11 @@ cs def DiscountEngine "$(cs provides com.acme:pricing-lib)"
   command interactively.
 - **A clean result is not proof of absence.** For "is this dead", check with
   `cs uses` *and* `cs seam` before concluding, since a caller may construct the
-  string rather than write it literally.
+  string rather than write it literally. The answer kind tells you how much the
+  empty result is worth; a `textual` or `heuristic` negative is close to nothing.
+- **A structural engine returns nothing for a language it cannot parse**, which
+  looks identical to "no matches". Name the language (`cs calls '<pat>' csharp`)
+  to turn that silence into an error.
 
 ## Verifying it works
 
@@ -155,6 +213,12 @@ notice.
 ## Reporting results
 
 Give file paths as `repo/path:line`, which is the format `cs` already emits and
-which stays clickable. When an answer rests on a string match across a repo
-boundary, say that — the reader needs to know it is a textual link and not a
-resolved reference.
+which stays clickable.
+
+**Carry the answer kind into what you tell the user.** `cs` prints it precisely
+so it does not have to be guessed at: an answer that rests on a string match
+across a repo boundary is a textual link, not a resolved reference, and saying
+"the only caller is X" on `textual` evidence overstates what was actually
+checked. Say which it was, and say when a result was `PARTIAL`, capped, or
+`degraded` — a confident summary of an incomplete search is the failure this
+whole setup exists to prevent.
