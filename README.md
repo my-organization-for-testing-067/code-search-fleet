@@ -92,6 +92,21 @@ gamed — a tool answering "everything is related to everything" scores perfectl
 `fixtures/GROUND-TRUTH.md` explains each; `fixtures/BASELINE.md` records how
 every engine scores alone.
 
+## Layering in your own incidents
+
+The fixture repos here exist to test search. If you are testing a *workflow* on
+top of them — a postmortem process, a review checklist — seed the defects in
+your own repo and layer them in:
+
+```sh
+scripts/build-fixtures /tmp/fleet --incidents-dir ~/my-toolbox/fixtures/incidents
+```
+
+Each incident directory supplies `incident.env`, `before/`, and commit messages;
+`build-fixtures` regresses the touched files, commits that as the introducing
+change, adds unrelated commits, then restores them as the fix — and asserts the
+replayed tip matches the canonical tree, so history cannot drift from source.
+
 ## Honest limits
 
 - Cross-repo, **cross-language** relations are strings. `cs uses` finds them;

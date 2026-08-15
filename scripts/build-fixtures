@@ -11,14 +11,29 @@
 # postmortem real archaeology to do -- `git log -L` lands on a genuine
 # introducing commit rather than on an import.
 #
-# Usage: build-fixtures [target-dir]     (default: ./fixture-fleet)
+# Usage: build-fixtures [target-dir] [--incidents-dir DIR]
+#        (target defaults to ./fixture-fleet; incidents are optional)
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 src="$repo_root/fixtures/repos"
-incidents_dir="$repo_root/fixtures/incidents"
-target="${1:-$PWD/fixture-fleet}"
+# Incidents are optional and live outside this repo: the fixture repos here are
+# for testing search, while seeded incidents belong to whoever is testing a
+# workflow on top of them (postmortem, review, triage). Pass --incidents-dir to
+# layer a set in.
+incidents_dir="${INCIDENTS_DIR:-$repo_root/fixtures/incidents}"
+target=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --incidents-dir) incidents_dir="${2:-}"; shift 2 ;;
+    --incidents-dir=*) incidents_dir="${1#*=}"; shift ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) die "unknown option: $1" ;;
+    *) target="$1"; shift ;;
+  esac
+done
+target="${target:-$PWD/fixture-fleet}"
 
 BASE_DATE="2026-01-12T09:03:00"
 BASE_AUTHOR="Priya Raman <priya.raman@acme.example>"
