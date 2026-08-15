@@ -82,12 +82,19 @@ fi
 info ""
 info "${C_BOLD}two-level view${C_OFF}"
 tickets_tmp=$(mktemp -d)
-if TICKETS_ROOT="$tickets_tmp" "$here/new-ticket" VERIFY-1 \
-     inventory-api-dotnet checkout-service-kotlin >/dev/null 2>&1; then
+# The workspace is built with plain git worktrees rather than by calling a
+# ticket script, so this repo does not depend on whatever workflow tooling
+# happens to sit alongside it.
+mkdir -p "$tickets_tmp/VERIFY-1"
+worktrees_ok=1
+for r in inventory-api-dotnet checkout-service-kotlin; do
+  git -C "$FLEET_ROOT/$r" worktree add --quiet \
+      "$tickets_tmp/VERIFY-1/$r" -b verify/layering >/dev/null 2>&1 || worktrees_ok=0
+done
+
+if [[ $worktrees_ok -eq 1 ]]; then
   wt="$tickets_tmp/VERIFY-1/inventory-api-dotnet"
-  sed -i '' 's|\[HttpPost("reserve")\]|[HttpPost("reserve-probe")]|' \
-      "$wt/src/Controllers/ReservationController.cs" 2>/dev/null \
-    || sed -i 's|\[HttpPost("reserve")\]|[HttpPost("reserve-probe")]|' \
+  perl -pi -e 's/\[HttpPost\("reserve"\)\]/[HttpPost("reserve-probe")]/' \
       "$wt/src/Controllers/ReservationController.cs"
 
   layered=$(cd "$tickets_tmp/VERIFY-1" && TICKETS_ROOT="$tickets_tmp" \
@@ -117,9 +124,13 @@ if TICKETS_ROOT="$tickets_tmp" "$here/new-ticket" VERIFY-1 \
     failed_ids+=("layered-fleet-isolation")
   fi
 
-  TICKETS_ROOT="$tickets_tmp" "$here/close-ticket" VERIFY-1 --force >/dev/null 2>&1 || true
+  for r in inventory-api-dotnet checkout-service-kotlin; do
+    git -C "$FLEET_ROOT/$r" worktree remove --force \
+        "$tickets_tmp/VERIFY-1/$r" >/dev/null 2>&1 || true
+    git -C "$FLEET_ROOT/$r" branch -D verify/layering >/dev/null 2>&1 || true
+  done
 else
-  warn "could not create a ticket workspace; layering untested"
+  warn "could not create worktrees; layering untested"
 fi
 rm -rf "$tickets_tmp"
 
