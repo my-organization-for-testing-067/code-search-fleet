@@ -2,6 +2,10 @@
 export const FLAG_INVENTORY_RESERVE = "inventory.reserve.enabled";
 export const FLAG_CHECKOUT_EXPRESS = "checkout.express.enabled";
 
+// Decoy: a retired flag whose key is a superstring of the live one. Substring
+// matching reports it as the same flag; nothing reads it any more.
+export const FLAG_INVENTORY_RESERVE_LEGACY = "inventory.reserve.enabled.legacy";
+
 export interface FlagState {
   key: string;
   enabled: boolean;

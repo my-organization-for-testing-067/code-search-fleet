@@ -13,9 +13,30 @@ clean, small, and its seams were planted on purpose — every tool will score we
 on it. That question needs real queries against a real repo; see the
 "Evaluating the tooling" section of `docs/repo-fleet.md`.
 
-The one exception is seam 6 in `GROUND-TRUTH.md`, a DI indirection that static
-tools genuinely cannot resolve. It is there so a tool overselling its call-graph
-completeness is caught.
+The exception is accuracy. The fixture carries **decoys** — a prose-only
+mention of an endpoint, a consumer of a topic version nobody produces, a
+same-named but unrelated class, a dead endpoint, a retired flag key that is a
+superstring of a live one — so a tool cannot score well by being over-eager.
+Those cases transfer to real repos even though the code around them does not,
+because they are about how a tool decides two things are related, not about
+scale.
+
+Seam 6 is the other honest case: a DI indirection no static tool can resolve,
+there to catch a tool overselling call-graph completeness.
+
+## Scoring
+
+`expectations.json` holds machine-readable expected/forbidden file sets.
+
+```sh
+scripts/score-seams --list                              # the nine queries
+rg -n "orders\.reserved" | scripts/score-seams orders-reserved-v1 -
+```
+
+`BASELINE.md` records how naive grep scores, as the floor an indexed tool must
+beat. Note its stated limitation: the scorer checks which files an answer
+names, not whether the reasoning was sound, so some passes are hollow. Failures
+are the trustworthy signal.
 
 ## Usage
 

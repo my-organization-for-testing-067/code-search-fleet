@@ -3,6 +3,7 @@ namespace Acme.Inventory.Domain;
 public interface IInventoryStore
 {
     Task<ReservationResult> ReserveAsync(string sku, int quantity);
+    Task ReleaseAsync(string reservationId);
     Task<int> AvailableAsync(string sku);
 }
 

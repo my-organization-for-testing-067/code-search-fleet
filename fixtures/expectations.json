@@ -1,0 +1,100 @@
+{
+  "_comment": "Machine-readable ground truth. 'expect' = files a correct answer must include (recall). 'forbid' = files a correct answer must NOT include (precision); these are the decoys. Score an answer with scripts/score-seams.",
+  "queries": [
+    {
+      "id": "reserve-consumers",
+      "question": "Which code calls the inventory reserve endpoint (POST /api/v1/inventory/reserve)?",
+      "expect": [
+        "checkout-service-kotlin/src/main/kotlin/com/acme/checkout/InventoryClient.kt",
+        "web-monorepo-node/packages/admin-ui/src/restockTool.ts"
+      ],
+      "forbid": [
+        "fulfillment-worker-python/fulfillment/consumer.py"
+      ],
+      "tests": "Recall: two consumers, not one. Precision: the Python docstring mentions the path in prose but never calls it. Hard because the .NET side splits the path across [Route] and [HttpPost] attributes."
+    },
+    {
+      "id": "reserve-definition",
+      "question": "Where is the inventory reserve endpoint defined?",
+      "expect": [
+        "inventory-api-dotnet/src/Controllers/ReservationController.cs"
+      ],
+      "forbid": [],
+      "tests": "The full path literal appears nowhere in the .NET repo; it is assembled from two attributes."
+    },
+    {
+      "id": "release-consumers",
+      "question": "Which code calls the inventory release endpoint (POST /api/v1/inventory/release)? Is it dead?",
+      "expect": [],
+      "forbid": [
+        "checkout-service-kotlin/src/main/kotlin/com/acme/checkout/InventoryClient.kt",
+        "web-monorepo-node/packages/admin-ui/src/restockTool.ts"
+      ],
+      "tests": "Correct answer is 'no consumers, the endpoint is dead'. Naming any consumer is a hallucination."
+    },
+    {
+      "id": "orders-reserved-v1",
+      "question": "Who produces and who consumes the orders.reserved.v1 topic?",
+      "expect": [
+        "checkout-service-kotlin/src/main/kotlin/com/acme/checkout/EventPublisher.kt",
+        "fulfillment-worker-python/fulfillment/consumer.py"
+      ],
+      "forbid": [
+        "web-monorepo-node/packages/analytics/src/eventStream.ts"
+      ],
+      "tests": "The analytics consumer subscribes to v2, not v1. Linking it here invents a relationship."
+    },
+    {
+      "id": "orphaned-consumer",
+      "question": "Are there any event consumers with no matching producer?",
+      "expect": [
+        "web-monorepo-node/packages/analytics/src/eventStream.ts"
+      ],
+      "forbid": [],
+      "tests": "Requires comparing produced against consumed topic names across repos. orders.reserved.v2 is consumed but never produced -- a real bug shape left by a version bump."
+    },
+    {
+      "id": "reservation-event-shape",
+      "question": "Where is the ReservationEvent contract defined? Find every definition of its shape.",
+      "expect": [
+        "fulfillment-worker-python/fulfillment/contracts.py",
+        "web-monorepo-node/packages/schemas/src/reservation.ts",
+        "checkout-service-kotlin/src/main/kotlin/com/acme/checkout/EventPublisher.kt"
+      ],
+      "forbid": [],
+      "tests": "The third definition is an inline JSON string literal in Kotlin, not a named type. Missing it is the common failure."
+    },
+    {
+      "id": "discount-engine",
+      "question": "Where is the DiscountEngine used by checkout defined?",
+      "expect": [
+        "pricing-lib-java/src/main/java/com/acme/pricing/DiscountEngine.java"
+      ],
+      "forbid": [
+        "fulfillment-worker-python/fulfillment/discounts.py"
+      ],
+      "tests": "A same-named, unrelated DiscountEngine exists in the Python worker. Name-based matching conflates them."
+    },
+    {
+      "id": "reserve-flag",
+      "question": "Which code reads or writes the inventory.reserve.enabled feature flag?",
+      "expect": [
+        "inventory-api-dotnet/src/Controllers/ReservationController.cs",
+        "web-monorepo-node/packages/admin-ui/src/FeatureToggles.ts"
+      ],
+      "forbid": [],
+      "tests": "FeatureToggles.ts also declares inventory.reserve.enabled.legacy, a retired superstring. Reporting the flag as still having a legacy reader is wrong, though both live in the same file."
+    },
+    {
+      "id": "reserve-implementation",
+      "question": "What code actually runs when the reserve endpoint is called? Trace it to the storage layer.",
+      "expect": [
+        "inventory-api-dotnet/src/Controllers/ReservationController.cs",
+        "inventory-api-dotnet/src/Infrastructure/SqlInventoryStore.cs",
+        "inventory-api-dotnet/src/Program.cs"
+      ],
+      "forbid": [],
+      "tests": "Requires bridging the DI registration in Program.cs. Neither grep nor a tree-sitter call graph does this. The honest answer names the interface and says the implementation is resolved at runtime; watch for a tool that claims a complete static call graph."
+    }
+  ]
+}

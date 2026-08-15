@@ -1,4 +1,10 @@
-"""Consumes reservation events produced by checkout-service-kotlin."""
+"""Consumes reservation events produced by checkout-service-kotlin.
+
+Upstream, checkout reserves stock through POST /api/v1/inventory/reserve before
+publishing here. This worker never calls that endpoint itself -- the mention is
+prose only, and a tool that counts it as a call site is matching text rather
+than code.
+"""
 
 from kafka import KafkaConsumer
 

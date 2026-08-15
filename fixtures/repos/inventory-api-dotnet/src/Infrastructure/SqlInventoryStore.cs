@@ -23,6 +23,8 @@ public class SqlInventoryStore : IInventoryStore
         return new ReservationResult(true, null, id);
     }
 
+    public Task ReleaseAsync(string reservationId) => _ledger.ReleaseAsync(reservationId);
+
     public Task<int> AvailableAsync(string sku) => _ledger.CountAsync(sku);
 }
 
@@ -30,4 +32,5 @@ public interface IStockLedger
 {
     Task<int> CountAsync(string sku);
     Task<string> HoldAsync(string sku, int quantity);
+    Task ReleaseAsync(string reservationId);
 }

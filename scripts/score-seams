@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Score a search tool's answer against fixtures/expectations.json.
+
+A search tool is only useful if it is both complete and not over-eager, so
+answers are scored on recall (did it find the real relations) and precision
+(did it avoid the decoys). Decoys are the point: without them, "everything is
+related to everything" scores perfectly.
+
+Usage:
+  scripts/score-seams --list
+  scripts/score-seams <query-id> <file-with-paths>
+  <search command> | scripts/score-seams <query-id> -
+  scripts/score-seams <query-id> - --empty     # assert "no results" answers
+
+The answer is any text containing file paths -- ripgrep output, an agent's
+prose, a JSON blob. Paths are matched by suffix, so line numbers and absolute
+prefixes are fine.
+"""
+
+import argparse
+import json
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+EXPECTATIONS = ROOT / "fixtures" / "expectations.json"
+
+GREEN, RED, YELLOW, BOLD, OFF = "\033[32m", "\033[31m", "\033[33m", "\033[1m", "\033[0m"
+if not sys.stdout.isatty():
+    GREEN = RED = YELLOW = BOLD = OFF = ""
+
+
+def load_queries():
+    with EXPECTATIONS.open() as fh:
+        return {q["id"]: q for q in json.load(fh)["queries"]}
+
+
+def mentions(answer_text, path):
+    """True if the answer references this fixture path.
+
+    Matched by suffix from the repo name onward, so "a/b/inventory-api-dotnet/
+    src/X.cs:12:" counts as a mention of "inventory-api-dotnet/src/X.cs".
+    """
+    normalized = answer_text.replace("\\", "/")
+    if path in normalized:
+        return True
+    # Fall back to basename, but only when it is distinctive enough to be safe.
+    base = path.rsplit("/", 1)[-1]
+    return len(base) > 12 and base in normalized
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("query_id", nargs="?")
+    parser.add_argument("answer", nargs="?")
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument("--empty", action="store_true",
+                        help="score an explicit 'no results' answer")
+    parser.add_argument("-h", "--help", action="store_true")
+    args = parser.parse_args()
+
+    if args.help or (not args.list and not args.query_id):
+        print(__doc__)
+        return 0
+
+    queries = load_queries()
+
+    if args.list:
+        for qid, q in queries.items():
+            expect_n, forbid_n = len(q["expect"]), len(q["forbid"])
+            print("{}{}{}  (expect {}, decoys {})".format(BOLD, qid, OFF, expect_n, forbid_n))
+            print("    {}".format(q["question"]))
+        return 0
+
+    if args.query_id not in queries:
+        print("unknown query id: {}".format(args.query_id), file=sys.stderr)
+        print("run --list to see them", file=sys.stderr)
+        return 2
+
+    query = queries[args.query_id]
+
+    if args.empty:
+        answer_text = ""
+    elif args.answer in (None, "-"):
+        answer_text = sys.stdin.read()
+    else:
+        answer_text = pathlib.Path(args.answer).read_text()
+
+    found = [p for p in query["expect"] if mentions(answer_text, p)]
+    missed = [p for p in query["expect"] if p not in found]
+    tripped = [p for p in query["forbid"] if mentions(answer_text, p)]
+
+    print("{}{}{}".format(BOLD, query["question"], OFF))
+    print()
+
+    if query["expect"]:
+        print("  recall    {}/{} expected".format(len(found), len(query["expect"])))
+        for path in found:
+            print("    {}found{}    {}".format(GREEN, OFF, path))
+        for path in missed:
+            print("    {}MISSED{}   {}".format(RED, OFF, path))
+    else:
+        # An empty 'expect' means the correct answer is "nothing matches".
+        print("  {}expected answer: no results{}".format(YELLOW, OFF))
+
+    if query["forbid"]:
+        print("  precision {}/{} decoys avoided".format(
+            len(query["forbid"]) - len(tripped), len(query["forbid"])))
+        for path in tripped:
+            print("    {}FALSE POSITIVE{}  {}".format(RED, OFF, path))
+
+    print()
+    print("  {}what this tests:{} {}".format(BOLD, OFF, query["tests"]))
+    print()
+
+    if missed or tripped:
+        problems = []
+        if missed:
+            problems.append("{} missed".format(len(missed)))
+        if tripped:
+            problems.append("{} false positive(s)".format(len(tripped)))
+        print("  {}FAIL{} - {}".format(RED, OFF, ", ".join(problems)))
+        return 1
+
+    print("  {}PASS{}".format(GREEN, OFF))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
