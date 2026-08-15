@@ -1,0 +1,54 @@
+name: verify
+
+# Two triggers, for two different failures.
+#
+# On push: did a change to cs break something.
+# On schedule: did an ENGINE change underneath us. Search engines update
+# independently of this repo, and a regression in one is invisible from the
+# outside -- the facade routes around it and still returns results, just worse
+# ones. The weekly run is the only thing that notices.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"   # Mondays, 06:17 UTC
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install engines
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ripgrep universal-ctags
+          npm install -g @ast-grep/cli
+          pipx install semgrep || pip install --quiet semgrep
+
+      - name: Record engine versions
+        run: ./scripts/bootstrap --check || true
+
+      # Each engine is probed directly on the capability the routing depends on
+      # it for. Serena is absent here (it needs a toolchain per language), which
+      # the probe reports rather than failing on.
+      - name: Verify engines
+        run: ./scripts/verify-engines
+
+      # End-to-end: every scored query plus the fleet/ticket layering.
+      - name: Verify search
+        run: ./scripts/verify-search
+
+      - name: Show version drift
+        if: always()
+        run: |
+          echo "Baseline recorded in fixtures/verified-versions.tsv:"
+          cat fixtures/verified-versions.tsv
+          echo
+          echo "A version change is not a failure by itself -- it is a prompt to"
+          echo "read the probe results above and, if they are still correct, to"
+          echo "re-run ./scripts/verify-engines --update and commit the baseline."
