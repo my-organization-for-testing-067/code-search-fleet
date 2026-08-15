@@ -47,6 +47,29 @@ look.
 When a subcommand finds nothing it prints what to try instead, so a wrong first
 choice self-corrects.
 
+## Two levels: fleet and ticket workspace
+
+The setup is a **fleet** directory holding every repo on main, plus a
+**ticket workspace** holding worktrees of just the repos a ticket changes.
+Search must span both, and `cs` does this automatically: run it from inside a
+ticket workspace and it layers the ticket's repos (your branch state) over the
+rest of the fleet (main).
+
+```sh
+export FLEET_ROOT=~/code/fleet TICKETS_ROOT=~/tickets
+cd ~/tickets/PROJ-123 && cs uses "/api/v1/inventory/reserve"
+# searching: PROJ-123 (2 repo(s), your branch) + fleet (8 repo(s), main)
+```
+
+This matters more than it sounds. Searching **only** the ticket makes renaming a
+shared route look safe, because the caller that breaks lives in a repo the
+ticket does not contain. Searching **only** the fleet shows stale copies of the
+files you are editing. Both answers are wrong in ways that do not announce
+themselves.
+
+- `--fleet` ignores the ticket workspace entirely.
+- `--ticket=<id>` layers a named ticket instead of the one you are standing in.
+
 ## The distinctions that matter
 
 **`cs uses` vs `cs seam` vs `cs text`.** All three search strings, but:
@@ -79,6 +102,14 @@ cs def DiscountEngine "$(cs provides com.acme:pricing-lib)"
 - **`cs def` uses ctags**, which indexes declarations, not semantics. It will
   not find a symbol assembled at runtime, and it does not distinguish
   overloads. `cs refs` is the precise-but-slow alternative.
+- **`grep` may not be the `grep` you tested with.** In an agent shell, `grep`
+  and `rg` can be shell functions proxying a bundled ripgrep; a *script* gets
+  the real system binary instead. BSD `grep -R` follows a symlink named on the
+  command line but not one met while recursing, so a naive recursive search
+  over a symlinked view silently finds nothing. `cs` passes repo directories
+  explicitly to avoid depending on that behaviour at all — but the lesson
+  generalises: verify search changes by running the script, not by running the
+  command interactively.
 - **A clean result is not proof of absence.** For "is this dead", check with
   `cs uses` *and* `cs seam` before concluding, since a caller may construct the
   string rather than write it literally.

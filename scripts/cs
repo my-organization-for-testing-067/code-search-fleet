@@ -30,11 +30,83 @@
 #   cs refs   <symbol> <repo> <file>   references to a symbol (LSP)
 #   cs which                       decision table: which subcommand answers what
 #   cs engines                     which engines are available here
+#
+#   --fleet          ignore the ticket workspace, search the fleet only
+#   --ticket=<id>    search a named ticket workspace layered over the fleet
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/lib" && pwd)"
 root="${FLEET_ROOT:-$PWD}"
+
+# ---- layered view ----------------------------------------------------------
+# Work happens in a ticket workspace holding only the repos being changed, but
+# the questions that matter are fleet-wide: "who calls this endpoint" must see
+# the eight repos NOT in the ticket, or renaming a route looks safe when it is
+# not. Searching only the ticket misses callers; searching only the fleet shows
+# stale copies of what you are editing. Both answers are wrong.
+#
+# So a view is assembled: a directory of symlinks where ticket repos point at
+# the workspace (your branch state) and every other repo points at the fleet
+# (main). One root, correct contents. Engines need explicit flags to follow
+# symlinks, which is why each is passed one below.
+view="$root"
+view_tmp=""
+ticket_root="${TICKET_ROOT:-}"
+layer_note=""
+
+cleanup_view() { [[ -n "$view_tmp" && -d "$view_tmp" ]] && rm -rf "$view_tmp"; }
+trap cleanup_view EXIT
+
+detect_ticket() {
+  [[ -n "$ticket_root" ]] && return 0
+  [[ -n "${TICKETS_ROOT:-}" ]] || return 1
+  # Running from inside a ticket workspace implies working on that ticket.
+  case "$PWD/" in
+    "$TICKETS_ROOT"/*)
+      local rel="${PWD#"$TICKETS_ROOT"/}"
+      ticket_root="$TICKETS_ROOT/${rel%%/*}"
+      [[ -d "$ticket_root" ]] || ticket_root=""
+      ;;
+  esac
+  [[ -n "$ticket_root" ]]
+}
+
+build_view() {
+  [[ $fleet_only -eq 1 ]] && { layer_note="fleet only"; return; }
+  detect_ticket || return 0
+  [[ -d "$ticket_root" ]] || return 0
+
+  view_tmp=$(mktemp -d)
+  view="$view_tmp"
+  local n_ticket=0 n_fleet=0 d name
+  for d in "$ticket_root"/*/; do
+    [[ -d "$d" ]] || continue
+    name=$(basename "$d")
+    ln -s "${d%/}" "$view/$name" && n_ticket=$((n_ticket + 1))
+  done
+  for d in "$root"/*/; do
+    [[ -d "$d" ]] || continue
+    name=$(basename "$d")
+    [[ -e "$view/$name" ]] && continue
+    ln -s "${d%/}" "$view/$name" && n_fleet=$((n_fleet + 1))
+  done
+  layer_note="$(basename "$ticket_root") ($n_ticket repo(s), your branch) + fleet ($n_fleet repo(s), main)"
+}
+
+announce_view() {
+  [[ -n "$layer_note" ]] && info "${C_BOLD}searching:${C_OFF} $layer_note"
+}
+
+# Real repo directories, for engines that cannot follow symlinks.
+real_dirs() {
+  local d name
+  if [[ -n "$view_tmp" ]]; then
+    for d in "$view"/*; do [[ -e "$d" ]] && readlink "$d"; done
+  else
+    for d in "$root"/*/; do [[ -d "$d" ]] && echo "${d%/}"; done
+  fi
+}
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -48,13 +120,18 @@ grep_fleet() {
   local pattern="${!#}"
   local extra=("${@:1:$#-1}")
   if have_rg_binary; then
-    (cd "$root" && rg --no-heading --line-number --color=never "${extra[@]}" "$pattern" .)
+    (cd "$view" && rg --follow --no-heading --line-number --color=never "${extra[@]}" "$pattern" .)
   else
-    (cd "$root" && grep -rn --binary-files=without-match \
+    # BSD grep's -R follows a symlink named on the command line but NOT one it
+    # meets while recursing, so `grep -R pattern .` silently finds nothing in a
+    # view made of symlinks. Passing the repo directories explicitly with a
+    # trailing slash works on both BSD and GNU grep and does not depend on
+    # symlink-following semantics at all.
+    grep -Rn --binary-files=without-match \
         --exclude-dir=.git --exclude-dir=.origins --exclude-dir=node_modules \
         --exclude-dir=bin --exclude-dir=obj --exclude-dir=.serena \
         --exclude-dir=.tokensave --exclude-dir=.venv \
-        "${extra[@]}" -- "$pattern" .)
+        "${extra[@]}" -- "$pattern" "$view"/*/ 2>/dev/null
   fi
 }
 ctags_bin() {
@@ -71,9 +148,9 @@ ctags_bin() {
 }
 
 # Normalize "path:line:text" to "path:line: text" with the fleet prefix removed.
-normalize() { sed -e "s|^${root}/||" -e 's|^\./||'; }
+normalize() { sed -e "s|^${view}/||" -e "s|^${root}/||" -e 's|^\./||'; }
 
-usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 cmd_engines() {
   local n=0
@@ -159,11 +236,11 @@ TABLE
 cmd_uses() {
   [[ $# -ge 1 ]] || die "cs uses <string>"
   local hits repos
-  hits=$(grep_fleet -F "$1" | normalize | python3 "$lib_dir/filter_code.py" --root "$root")
+  hits=$(grep_fleet -F "$1" | normalize | python3 "$lib_dir/filter_code.py" --root "$view")
   if [[ -z "$hits" ]]; then
     info "no code uses '$1'"
     local prose
-    prose=$(grep_fleet -F "$1" | normalize | python3 "$lib_dir/filter_code.py" --invert --root "$root")
+    prose=$(grep_fleet -F "$1" | normalize | python3 "$lib_dir/filter_code.py" --invert --root "$view")
     if [[ -n "$prose" ]]; then
       warn "mentioned only in comments/docs:"
       printf '%s\n' "$prose"
@@ -183,7 +260,7 @@ cmd_def() {
   local tags="${TMPDIR:-/tmp}/cs-tags.$$"
   # Rebuilding is cheap (measured 0.07s over the whole fixture fleet), so the
   # index is never stale.
-  (cd "$root" && "$ct" -R --fields=+n -f "$tags" . 2>/dev/null)
+  "$ct" -R --links=yes --fields=+n -f "$tags" "$view"/*/ 2>/dev/null
   if [[ ! -s "$tags" ]]; then rm -f "$tags"; die "ctags produced no index under $root"; fi
   awk -F'\t' -v want="$1" '$1 == want {
       line = "?"; kind = "?";
@@ -192,7 +269,7 @@ cmd_def() {
         else if (length($i) <= 2) { kind = $i }
       }
       printf "%s:%s: [%s] %s\n", $2, line, kind, want
-  }' "$tags" | sort -u | { if [[ -n "$only" ]]; then grep "^$only/" || true; else cat; fi; } > "$tags.out"
+  }' "$tags" | normalize | sort -u | { if [[ -n "$only" ]]; then grep "^$only/" || true; else cat; fi; } > "$tags.out"
   rm -f "$tags"
   if [[ ! -s "$tags.out" ]]; then
     rm -f "$tags.out"
@@ -209,28 +286,33 @@ cmd_def() {
 # on, and that lives in build manifests, not in code.
 cmd_provides() {
   [[ $# -ge 1 ]] || die "cs provides <coordinate>"
-  python3 "$lib_dir/deps.py" "$root" provides "$1"
+  python3 "$lib_dir/deps.py" "$view" provides "$1"
 }
 
 cmd_deps() {
-  python3 "$lib_dir/deps.py" "$root" deps "${1:-}"
+  python3 "$lib_dir/deps.py" "$view" deps "${1:-}"
 }
 
 cmd_publishes() {
-  python3 "$lib_dir/deps.py" "$root" publishes
+  python3 "$lib_dir/deps.py" "$view" publishes
 }
 
 cmd_calls() {
   [[ $# -ge 1 ]] || die "cs calls <pattern> [lang]"
   local pattern="$1" lang="${2:-}"
   if have ast-grep; then
-    local args=(-p "$pattern")
+    local args=(--follow -p "$pattern")
     [[ -n "$lang" ]] && args+=(-l "$lang")
-    (cd "$root" && ast-grep "${args[@]}" 2>/dev/null) | normalize
+    (cd "$view" && ast-grep "${args[@]}" 2>/dev/null) | normalize
   elif have semgrep; then
+    # semgrep does not follow symlinks, so it is pointed at the real paths.
     local args=(-e "$pattern" --quiet --no-git-ignore)
     [[ -n "$lang" ]] && args+=(-l "$lang")
-    (cd "$root" && semgrep "${args[@]}" 2>/dev/null) | normalize
+    local d
+    while IFS= read -r d; do
+      [[ -n "$d" ]] || continue
+      (cd "$(dirname "$d")" && semgrep "${args[@]}" "$(basename "$d")" 2>/dev/null)
+    done < <(real_dirs) | normalize
   else
     die "neither ast-grep nor semgrep installed"
   fi
@@ -241,7 +323,7 @@ cmd_calls() {
 cmd_impls() {
   [[ $# -ge 2 ]] || die "cs impls <symbol> <repo> [file]"
   have uvx || die "serena needs uv installed"
-  local repo_dir="$root/$2" file="${3:-}"
+  local repo_dir="$view/$2" file="${3:-}"
   [[ -d "$repo_dir" ]] || die "no such repo: $2"
 
   # Serena identifies a symbol by name_path plus the file holding it, so the
@@ -280,14 +362,27 @@ if pick:
 cmd_refs() {
   [[ $# -ge 3 ]] || die "cs refs <symbol> <repo> <file-relative-to-repo>"
   have uvx || die "serena needs uv installed"
-  local repo_dir="$root/$2"
+  local repo_dir="$view/$2"
   [[ -d "$repo_dir" ]] || die "no such repo: $2"
   python3 "$lib_dir/serena_call.py" "$repo_dir" find_referencing_symbols \
     "{\"name_path\":\"$1\",\"relative_path\":\"$3\"}"
 }
 
-[[ $# -ge 1 ]] || usage 1
+fleet_only=0
+args=()
+for a in "$@"; do
+  case "$a" in
+    --fleet) fleet_only=1 ;;
+    --ticket=*) ticket_root="${TICKETS_ROOT:-}/${a#--ticket=}" ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- "${args[@]:-}"
+
+[[ $# -ge 1 && -n "${1:-}" ]] || usage 1
 sub="$1"; shift
+build_view
+case "$sub" in engines|which|-h|--help|help) ;; *) announce_view ;; esac
 case "$sub" in
   text)    cmd_text "$@" ;;
   seam)    cmd_seam "$@" ;;

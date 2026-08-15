@@ -73,6 +73,56 @@ else
   warn "reserve-implementation SKIPPED (uv not installed; cs refs unavailable)"
 fi
 
+# ---- two-level view --------------------------------------------------------
+# The opinionated setup is a fleet directory plus per-ticket workspaces, so the
+# layering itself is tested: a ticket must see its own branch state AND the
+# fleet repos it does not contain. Getting this wrong is dangerous rather than
+# merely wrong -- searching only the ticket makes renaming a shared route look
+# safe, because the caller lives in a repo the ticket does not include.
+info ""
+info "${C_BOLD}two-level view${C_OFF}"
+tickets_tmp=$(mktemp -d)
+if TICKETS_ROOT="$tickets_tmp" "$here/new-ticket" VERIFY-1 \
+     inventory-api-dotnet checkout-service-kotlin >/dev/null 2>&1; then
+  wt="$tickets_tmp/VERIFY-1/inventory-api-dotnet"
+  sed -i '' 's|\[HttpPost("reserve")\]|[HttpPost("reserve-probe")]|' \
+      "$wt/src/Controllers/ReservationController.cs" 2>/dev/null \
+    || sed -i 's|\[HttpPost("reserve")\]|[HttpPost("reserve-probe")]|' \
+      "$wt/src/Controllers/ReservationController.cs"
+
+  layered=$(cd "$tickets_tmp/VERIFY-1" && TICKETS_ROOT="$tickets_tmp" \
+            "$here/cs" uses '/api/v1/inventory/reserve' 2>/dev/null)
+  if printf '%s' "$layered" | grep -q 'web-monorepo-node'; then
+    ok "ticket sees a caller in a repo it does not contain"; pass=$((pass + 1))
+  else
+    err "ticket did NOT see the out-of-ticket caller"; fail=$((fail + 1))
+    failed_ids+=("layered-out-of-ticket-caller")
+  fi
+
+  branch_state=$(cd "$tickets_tmp/VERIFY-1" && TICKETS_ROOT="$tickets_tmp" \
+                 "$here/cs" uses 'reserve-probe' 2>/dev/null)
+  if printf '%s' "$branch_state" | grep -q 'inventory-api-dotnet'; then
+    ok "ticket working state shadows the fleet copy"; pass=$((pass + 1))
+  else
+    err "ticket edits were NOT visible"; fail=$((fail + 1))
+    failed_ids+=("layered-branch-precedence")
+  fi
+
+  fleet_state=$(cd "$tickets_tmp/VERIFY-1" && TICKETS_ROOT="$tickets_tmp" \
+                "$here/cs" --fleet uses 'reserve-probe' 2>/dev/null)
+  if [[ -z "$fleet_state" ]]; then
+    ok "--fleet excludes ticket edits"; pass=$((pass + 1))
+  else
+    err "--fleet leaked ticket state"; fail=$((fail + 1))
+    failed_ids+=("layered-fleet-isolation")
+  fi
+
+  TICKETS_ROOT="$tickets_tmp" "$here/close-ticket" VERIFY-1 --force >/dev/null 2>&1 || true
+else
+  warn "could not create a ticket workspace; layering untested"
+fi
+rm -rf "$tickets_tmp"
+
 info ""
 info "${C_BOLD}$pass passed, $fail failed${C_OFF}"
 for f in "${failed_ids[@]:-}"; do
