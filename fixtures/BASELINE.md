@@ -71,6 +71,91 @@ avoiding *file reads* while an agent explores a large codebase, and that cannot
 be validated or refuted at this scale. What this does show is that the raw
 output is verbose, and verbosity does not shrink on bigger repos.
 
+## Round 2: Serena and ast-grep (2026-08-15)
+
+Both installed and measured. **Scope note:** for these two I ran the decisive
+subset, not all nine — the queries where round 1 exposed a real gap.
+
+### Serena (LSP-backed) — wins the structural questions outright
+
+| Test | Result |
+|---|---|
+| `find_implementations` on the C# `IInventoryStore` | **Returns `SqlInventoryStore`.** tokensave returns nothing; its C# graph has zero `implements` edges. |
+| Q9 `reserve-implementation` | **PASS, 3/3, non-hollow.** `find_referencing_symbols` returns the controller field, the constructor, *and* the DI registration line `AddScoped<IInventoryStore, SqlInventoryStore>()`, each with surrounding source. This is the query grep and tokensave both effectively failed. |
+| Q7 `discount-engine` | Same false positive as the others — returns both `DiscountEngine`s. But it labels each with repo, language, and kind, so a reader can disambiguate; the others give an undifferentiated list. |
+
+**Multi-repo works.** Pointing Serena at the fleet root and listing all five
+language servers in `.serena/project.yml` indexed every repo in one project:
+`typescript=5, python=4, java=4, csharp=7, kotlin=9`. Cross-repo `find_symbol`
+then returns hits from every repo with correct per-repo attribution. So "search
+many repos, several sharing a language" is supported — the fleet root *is* the
+project.
+
+**Setup cost is the real tradeoff, and it is substantial:**
+
+- Requires a working toolchain per language. This machine had **no .NET SDK and
+  no JVM**; both had to be installed before C#, Java, or Kotlin could be
+  analyzed at all. tokensave and ast-grep need nothing.
+- Fleet-root auto-configuration is **interactive** (it prompts per language) and
+  fails outright in a non-interactive shell with `EOF when reading a line`. The
+  `project.yml` has to be written by hand for automation — which `new-ticket`
+  would have to do.
+- The C# server warned `has unresolved dependencies` without a package restore.
+  Results were still correct here, but on a real repo expect to need a
+  successful build first.
+- Serena's own docs cite ~5 minutes to index a 500K-LOC repo. Ten large repos in
+  one fleet project is a materially different proposition from this fixture.
+
+### ast-grep (structural, index-free) — covers the string-literal gap
+
+| Test | Result |
+|---|---|
+| Q8 `IsEnabled("inventory.reserve.enabled")` in C# | **Found**, via `$X.IsEnabled($KEY)`. This is the exact query tokensave cannot answer, because the key is a literal rather than a symbol. |
+| C# route attributes | **Found** all three (`[Route(...)]`, both `[HttpPost(...)]`) via a `kind: attribute` rule — the split-attribute construction grep cannot reassemble. |
+
+Its structural advantage is that it matches *syntax*, so a string literal in
+argument position is reachable. Two caveats: patterns need per-language
+fiddling (the C# attribute case failed as a plain pattern and needed a YAML
+rule, because a bare attribute is not a parseable compilation unit), and it has
+no notion of types or references — it cannot answer "who implements this".
+
+Because it holds no index, one invocation spans every repo in the fleet at
+once. For fleet-wide questions that is a structural advantage over both
+Serena and tokensave, which are project-scoped.
+
+## Recommendation after both rounds
+
+Layer them; no single tool covers the space.
+
+| Question | Tool |
+|---|---|
+| Cross-repo seams: routes, topics, config keys, versions | ripgrep, fleet-wide |
+| Same, but needing syntax awareness (literal in argument position, attributes, call shapes) | ast-grep, fleet-wide, no index |
+| Symbol truth within a repo: implementations, references, rename safety | Serena |
+| Everything else | agentic exploration |
+
+**tokensave is the weakest of the three for this stack.** Its one clean win
+(finding the endpoint definition by signature metadata) is matched by
+ast-grep's attribute rule, while its `implements` gap in C#, Kotlin, Python,
+and TypeScript removes the main reason to run a graph at all here.
+
+## On Docker
+
+Docker helps exactly one of these three, and at a cost:
+
+- **Serena** — genuine benefit. A container bundles the language servers and
+  the .NET/JVM toolchains, which is the bulk of the setup pain above, and keeps
+  five language servers off the host. Serena supports containerized use.
+- **tokensave and ast-grep** — no benefit. Both are single static binaries with
+  no runtime dependencies; a container adds indirection and nothing else.
+
+The catch is that on macOS, bind-mounted source is significantly slower than
+native filesystem access, and LSP indexing is I/O-heavy — so Docker's cost
+lands hardest on exactly the largest repos, which is where Serena is slowest
+already. Worth benchmarking on one real repo both ways before committing.
+Containers also complicate the worktree model, since each ticket workspace
+would need mounting too.
+
 ## Still unmeasured
 
 The question this baseline was built to inform — does indexing pay for itself
