@@ -10,6 +10,7 @@
 # Usage:
 #   fleet-init --status                          what is configured and cloned
 #   fleet-init --config [--fleet-root DIR] [--tickets-root DIR] [--branch-prefix P]
+#                                                write config + scaffold a hook
 #   fleet-init --clone <owner/repo|url> [...]    clone into the fleet
 #   fleet-init --clone-from <file>               one repo per line (# comments ok)
 #   fleet-init --cron                            print the daily refresh line
@@ -18,12 +19,13 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
-# Written to the neutral path. The legacy ~/.config/ai-toolbox/fleet.env is
-# still read by common.sh if it exists, so an earlier setup keeps working.
-CONFIG_DIR="${HOME}/.config/repo-fleet"
+# FLEET_CONFIG_DIR is set by common.sh, so overriding it in the environment
+# redirects config, hooks, and this script together -- which is what makes the
+# whole thing testable without touching a real home directory.
+CONFIG_DIR="$FLEET_CONFIG_DIR"
 CONFIG_FILE="$CONFIG_DIR/fleet.env"
 
-do_config=0; do_clone=0; do_cron=0; do_status=0; force=0
+do_config=0; do_clone=0; do_cron=0; do_status=0; force=0; sample=""
 clone_args=(); clone_file=""
 new_fleet_root=""; new_tickets_root=""; new_prefix=""
 
@@ -48,14 +50,11 @@ done
 # ---- status ----------------------------------------------------------------
 if [[ $do_status -eq 1 ]]; then
   info "${C_BOLD}config${C_OFF}"
-  local_found=0
-  for f in "$CONFIG_FILE" "${HOME}/.config/ai-toolbox/fleet.env"; do
-    [[ -f "$f" ]] && { info "  $f"; local_found=1; }
-  done
-  [[ $local_found -eq 0 ]] && warn "  none — run: fleet-init --config"
-  printf '  %-14s %s\n' "FLEET_ROOT" "$FLEET_ROOT" >&2
-  printf '  %-14s %s\n' "TICKETS_ROOT" "$TICKETS_ROOT" >&2
-  printf '  %-14s %s\n' "BRANCH_PREFIX" "$BRANCH_PREFIX" >&2
+  if [[ -f "$CONFIG_FILE" ]]; then info "  $CONFIG_FILE"
+  else warn "  none — run: fleet-init --config"; fi
+  printf '  %-16s %s\n' "FLEET_ROOT" "$FLEET_ROOT" >&2
+  printf '  %-16s %s\n' "TICKETS_ROOT" "$TICKETS_ROOT" >&2
+  printf '  %-16s %s\n' "branch for X" "$(branch_for X)" >&2
   info ""
   info "${C_BOLD}fleet${C_OFF}  $FLEET_ROOT"
   if [[ -d "$FLEET_ROOT" ]]; then
@@ -70,6 +69,27 @@ if [[ $do_status -eq 1 ]]; then
   else
     warn "  does not exist yet"
   fi
+  info ""
+  info "${C_BOLD}hooks${C_OFF}"
+  hk=0
+  for h in "$CONFIG_DIR"/hooks/*; do
+    [[ -f "$h" ]] || continue
+    case "$h" in *.sample) continue ;; esac
+    printf '  %-34s %s\n' "$(basename "$h") (global)" \
+      "$([[ -x "$h" ]] && echo enabled || echo 'NOT EXECUTABLE')" >&2
+    hk=$((hk + 1))
+  done
+  while IFS= read -r r; do
+    [[ -n "$r" ]] || continue
+    for h in "$FLEET_ROOT/$r"/.fleet/*; do
+      [[ -f "$h" ]] || continue
+      printf '  %-34s %s\n' "$(basename "$h") ($r)" \
+        "$([[ -x "$h" ]] && echo enabled || echo 'NOT EXECUTABLE')" >&2
+      hk=$((hk + 1))
+    done
+  done < <(fleet_repos 2>/dev/null)
+  [[ $hk -eq 0 ]] && info "  none — see $CONFIG_DIR/hooks/post-create.sample"
+
   info ""
   info "${C_BOLD}tickets${C_OFF}  $TICKETS_ROOT"
   if [[ -d "$TICKETS_ROOT" ]]; then
@@ -107,13 +127,55 @@ if [[ $do_config -eq 1 ]]; then
 export FLEET_ROOT="$fr"
 export TICKETS_ROOT="$tr"
 export BRANCH_PREFIX="$bp"
+
+# Uncomment for a naming convention that is not a prefix. {ticket} is
+# substituted, and this wins over BRANCH_PREFIX when set.
+# export BRANCH_TEMPLATE="users/$(id -un)/{ticket}"
 EOF
   ok "wrote $CONFIG_FILE"
   sed 's/^/  /' "$CONFIG_FILE" >&2
-  mkdir -p "$fr" "$tr"
+  mkdir -p "$fr" "$tr" "$CONFIG_DIR/hooks"
+
+  # Scaffolded disabled, as a .sample. An extension point nobody can find is not
+  # an extension point, and a hook that runs the moment you configure the fleet
+  # is a surprise.
+  sample="$CONFIG_DIR/hooks/post-create.sample"
+  if [[ ! -f "$sample" ]]; then
+    cat > "$sample" <<'HOOK'
+#!/usr/bin/env bash
+# Runs once per repo, just after its worktree is created, with the worktree as
+# the working directory. Rename to `post-create` and chmod +x to enable.
+#
+# This one is machine-wide: it runs for every repo. For setup that belongs to a
+# single repo, commit `.fleet/post-create` inside that repo instead -- then it
+# travels with the repo and the team owns it.
+#
+# Available: FLEET_TICKET FLEET_REPO FLEET_WORKTREE FLEET_BRANCH
+#            FLEET_ROOT TICKETS_ROOT
+set -euo pipefail
+
+echo "setting up $FLEET_REPO for $FLEET_TICKET"
+
+# Local config that is gitignored and therefore absent from a fresh worktree.
+if [[ -f "$FLEET_ROOT/$FLEET_REPO/.env.local" ]]; then
+  cp "$FLEET_ROOT/$FLEET_REPO/.env.local" .
+fi
+
+# Dependencies, by whatever the repo turns out to be.
+if   [[ -f package.json ]];            then npm ci --silent
+elif [[ -f pyproject.toml ]];          then uv sync --quiet
+elif compgen -G '*.sln' >/dev/null;    then dotnet restore --verbosity quiet
+elif [[ -f build.gradle.kts ]];        then ./gradlew --quiet classes || true
+fi
+HOOK
+    ok "scaffolded $sample"
+  fi
+
   info ""
   info "Created $fr and $tr."
   info "Next: fleet-init --clone <owner/repo> ..."
+  info "To run setup steps per repo, enable the hook:"
+  info "  cp $sample ${sample%.sample} && chmod +x ${sample%.sample}"
 fi
 
 # ---- clone -----------------------------------------------------------------

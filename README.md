@@ -23,6 +23,10 @@ No single search engine answers every question about a codebase:
 
 Committing to one engine means accepting its blind spot permanently.
 
+**New here? Read [GETTING-STARTED.md](GETTING-STARTED.md)** — install, first-time
+setup, a worked example of a ticket from start to finish, and how to customise
+branch naming and per-repo setup for your company.
+
 ## Quick start
 
 ```sh

@@ -13,7 +13,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 [[ $# -ge 2 ]] || { sed -n '2,11p' "$0"; exit 1; }
 
 ticket="$1"; shift
-branch="${BRANCH_PREFIX}${ticket}"
+branch=$(branch_for "$ticket")
 workspace="$TICKETS_ROOT/$ticket"
 
 # Validate every repo before creating anything, so a typo cannot leave a
@@ -55,9 +55,13 @@ for repo in "$@"; do
     continue
   fi
 
-  # No index step. Search is index-free by design -- see the search model in
-  # docs/repo-fleet.md -- so a fresh worktree is immediately searchable and
-  # there is nothing to warm up here.
+  # No index step. Search is index-free by design, so a fresh worktree is
+  # immediately searchable and there is nothing to warm up here.
+  #
+  # What a repo DOES need before you can work in it -- restore, install, a local
+  # .env -- differs per company and per repo, so it is a hook rather than
+  # anything this script tries to guess. See run_hooks in lib/common.sh.
+  run_hooks post-create "$repo" "$dest" "$ticket" "$branch"
 done
 
 info ""

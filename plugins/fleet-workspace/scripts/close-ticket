@@ -24,7 +24,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-branch="${BRANCH_PREFIX}${ticket}"
+branch=$(branch_for "$ticket")
 workspace="$TICKETS_ROOT/$ticket"
 [[ -d "$workspace" ]] || die "no workspace at $workspace"
 

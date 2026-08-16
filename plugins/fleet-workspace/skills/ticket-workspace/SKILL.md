@@ -59,6 +59,30 @@ per line.
 user has not said, ask. A fleet pointed at the wrong directory silently produces
 empty search results, which is worse than an error.
 
+### Company-specific setup is a hook, not a code change
+
+A fresh worktree has no `node_modules`, no restored packages, no local `.env`.
+What a repo needs before work can start differs per company, so `new-ticket`
+runs an optional executable per repo — `~/.config/repo-fleet/hooks/post-create`
+(every repo) and `<repo>/.fleet/post-create` (that repo). Both get
+`FLEET_TICKET`, `FLEET_REPO`, `FLEET_WORKTREE`, `FLEET_BRANCH`, `FLEET_ROOT`,
+`TICKETS_ROOT`, with the worktree as the working directory.
+
+If the user asks for setup steps to run automatically when a workspace is
+created, **write a hook** — do not modify the scripts. `fleet-init --config`
+scaffolds `hooks/post-create.sample` to copy. `fleet-init --status` lists the
+hooks it can see, and flags any that exist but are not executable, which is the
+usual reason one silently does nothing.
+
+Branch naming is configurable the same way, in `~/.config/repo-fleet/fleet.env`:
+`BRANCH_PREFIX` (default `feature/`), or `BRANCH_TEMPLATE` such as
+`users/zvi/{ticket}` when the convention is not a prefix.
+
+A hook that fails **warns and continues** — the workspace is still created, and
+the exit code is reported. If a user says setup "didn't run", check in this
+order: is the hook executable, did it exit non-zero, is it in the worktree or
+only the fleet clone.
+
 ## Daily: refresh the fleet
 
 ```sh
