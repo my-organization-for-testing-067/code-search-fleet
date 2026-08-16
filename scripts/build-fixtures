@@ -52,15 +52,58 @@ commit_as() {
 
 # Append a line to a changelog and commit it, so the introducing commit is not
 # adjacent to the fix in `git log`.
+#
+# A noise commit can also carry a real code change, when the incident sets
+# NOISE_n_PRE to a directory of pre-change files. Those files are laid down at
+# the import commit; here the canonical version comes back, so the commit is an
+# actual diff. That exists for the cross-repo trigger in PROJ-388: a commit
+# whose subject claims a serializer change but whose diff is one changelog line
+# cannot be investigated, and the investigation is the whole exercise.
 noise_commit() {
-  local dir="$1" author="$2" date="$3" text="$4"
-  mkdir -p "$dir/docs"
-  printf -- '- %s\n' "$text" >> "$dir/docs/CHANGELOG.md"
-  git -C "$dir" add -A
+  local work="$1" author="$2" date="$3" text="$4" pre_dir="${5:-}" canonical="${6:-}"
+  if [[ -n "$pre_dir" ]]; then
+    while IFS= read -r rel; do
+      rel="${rel#./}"
+      mkdir -p "$(dirname "$work/$rel")"
+      cp "$canonical/$rel" "$work/$rel"
+    done < <(cd "$pre_dir" && find . -type f)
+  fi
+  mkdir -p "$work/docs"
+  printf -- '- %s\n' "$text" >> "$work/docs/CHANGELOG.md"
+  git -C "$work" add -A
   local tmp; tmp=$(mktemp)
   printf '%s\n' "$text" > "$tmp"
-  commit_as "$dir" "$author" "$date" "$tmp"
+  commit_as "$work" "$author" "$date" "$tmp"
   rm -f "$tmp"
+}
+
+# Directories of pre-change files a repo's incidents want present at the import
+# commit. Collected before the import because the incident env is not sourced
+# until after it. Two kinds:
+#
+#   NOISE_n_PRE      the state before a noise commit that carries a real change
+#   PRE_INTRODUCED   the state before the introducing commit -- i.e. before the
+#                    feature the defect rode in on existed at all
+#
+# PRE_INTRODUCED is what makes `git log -L` honest. Without it the import
+# carries the canonical (fixed) tree, so the introducing commit reads as a
+# revert of code nobody had written yet, and archaeology lands on a commit that
+# appears to delete a working implementation for no reason.
+import_state_dirs_for() {
+  local repo="$1" inc n pre
+  while IFS= read -r inc; do
+    [[ -n "$inc" ]] || continue
+    (
+      # shellcheck disable=SC1091
+      source "${inc}incident.env"
+      [[ -n "${PRE_INTRODUCED:-}" ]] && printf '%s\n' "${inc}${PRE_INTRODUCED}"
+      for n in 1 2; do
+        pre="NOISE_${n}_PRE"
+        [[ -n "${!pre:-}" ]] && printf '%s\n' "${inc}${!pre}"
+      done
+      true
+    )
+  done < <(incidents_for "$repo")
 }
 
 incidents_for() {
@@ -85,8 +128,13 @@ for dir in "$src"/*/; do
   tmp=$(mktemp -d)
   git -C "$tmp" init --quiet --initial-branch=main
 
-  # 1. The project as it was imported.
+  # 1. The project as it was imported: the canonical tree, with any files an
+  #    incident declares a pre-change state for rolled back to it.
   cp -R "$dir." "$tmp/"
+  while IFS= read -r pre; do
+    [[ -n "$pre" ]] || continue
+    cp -R "$pre/." "$tmp/"
+  done < <(import_state_dirs_for "$name")
   git -C "$tmp" add -A
   msg=$(mktemp); printf 'Import %s\n' "$name" > "$msg"
   commit_as "$tmp" "$BASE_AUTHOR" "$BASE_DATE" "$msg"
@@ -104,8 +152,10 @@ for dir in "$src"/*/; do
     commit_as "$tmp" "$INTRODUCED_AUTHOR" "$INTRODUCED_DATE" "${inc}introduced.msg"
 
     # 3. Unrelated work lands on top, so archaeology is not a one-step walk.
-    noise_commit "$tmp" "$BASE_AUTHOR" "$NOISE_DATE_1" "$NOISE_1"
-    noise_commit "$tmp" "$BASE_AUTHOR" "$NOISE_DATE_2" "$NOISE_2"
+    noise_commit "$tmp" "$BASE_AUTHOR" "$NOISE_DATE_1" "$NOISE_1" \
+                 "${NOISE_1_PRE:+${inc}${NOISE_1_PRE}}" "$dir"
+    noise_commit "$tmp" "$BASE_AUTHOR" "$NOISE_DATE_2" "$NOISE_2" \
+                 "${NOISE_2_PRE:+${inc}${NOISE_2_PRE}}" "$dir"
 
     # 4. The fix restores exactly the files this incident touched.
     (cd "${inc}before" && find . -type f) | while IFS= read -r rel; do
@@ -121,7 +171,8 @@ for dir in "$src"/*/; do
     commit_as "$tmp" "$FIX_AUTHOR" "$FIX_DATE" "${inc}fix.msg"
 
     unset REPO TICKET INTRODUCED_DATE INTRODUCED_AUTHOR FIX_DATE FIX_AUTHOR \
-          NOISE_1 NOISE_2 NOISE_DATE_1 NOISE_DATE_2
+          NOISE_1 NOISE_2 NOISE_DATE_1 NOISE_DATE_2 NOISE_1_PRE NOISE_2_PRE \
+          PRE_INTRODUCED
   done < <(incidents_for "$name")
 
   # Guard: the tip must match the canonical tree, or the fixture lies.

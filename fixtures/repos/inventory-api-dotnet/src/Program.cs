@@ -3,7 +3,9 @@ using Acme.Inventory.Infrastructure;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddControllers();
+builder.Services
+    .AddControllers()
+    .AddJsonOptions(options => options.JsonSerializerOptions.WriteIndented = true);
 
 // The only place the concrete implementations are named. A static call graph
 // cannot connect ReservationController._store to SqlInventoryStore through this.
