@@ -283,10 +283,15 @@ fixture fleet, and the verification suite — so `verify-search` runs from the
 installed copy and answers "is this working *here*" rather than "did it work
 where it was built".
 
-**Cost: ~150 tokens always-on**, and the skill body only loads when a search
-question actually comes up (`claude plugin details code-search` reports it).
-That is the argument against exposing this over MCP instead: MCP tool schemas
-sit in context for the whole session whether or not you search.
+**Cost: ~200 tokens always-on**, and the ~6.6k skill body only loads when a
+search question actually comes up. `claude plugin details code-search` reports
+both numbers for the version you actually have installed — prefer it to this
+line, which is a snapshot: the always-on figure was ~150 before `cs owns` and
+`cs versions` needed announcing in the description.
+
+That split is the argument against exposing this over MCP instead: MCP tool
+schemas sit in context for the whole session whether or not you search, so the
+6.6k would be permanent rather than on demand.
 
 From a plain clone instead, symlink the skill:
 
