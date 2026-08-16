@@ -271,6 +271,25 @@ absent, no ticket was layered and every hit came from the fleet.
 
 ## The distinctions that matter
 
+**Substring matches, and the warning they used to delete.** All three text
+subcommands match substrings by default, so `AccessionUpdateIn` also matches
+`AccessionUpdateInput` in an unrelated repo. That is usually harmless noise —
+except for `cs seam`'s orphan warning ("only one repo mentions this — a producer
+with no consumer, or dead"), where an extra hit does not add noise, it *deletes
+the warning*, flipping the reading from "this looks dead" to "two repos use it".
+`cs` now computes that warning on whole-identifier matches and tells you when
+hits matched inside a longer name:
+
+```
+! only one repo mentions this as a whole identifier (lims) -- a producer with no consumer, or dead
+! 1 repo(s) matched only INSIDE a longer identifier: cx-graph — not whole-word
+```
+
+Pass `--word` to search whole identifiers only. It is **not** the default,
+because it would drop `reserve` inside `reserveItem` — a real use — and a silent
+false negative is the failure this tool is organised against. Report the
+distinction rather than assuming either reading.
+
 **`cs uses` vs `cs seam` vs `cs text`.** All three search strings, but:
 `cs text` returns everything including comments; `cs seam` groups by repo and
 warns when only one repo mentions a string (the shape of a dead endpoint or an

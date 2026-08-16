@@ -28,7 +28,7 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 74 checks against a throwaway fixture fleet
+scripts/verify-search              # 79 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only

@@ -884,6 +884,85 @@ fi
 
 rm -f "$dangle_repo/CLAUDE.local.md" "$dangle_repo/src/import"
 
+# ---- whole-identifier matching ---------------------------------------------
+# `cs seam`'s orphan warning is this tool's dead-code detector, and a SUBSTRING
+# match in an unrelated repo silently removed it: a queue handler named
+# AccessionUpdateIn stopped looking dead because a different repo declared a
+# GraphQL type called AccessionUpdateInput.
+#
+# The consequence is inverted from a normal false positive. Extra hits do not
+# add noise — they DELETE a warning — and the reading flips from "this looks
+# dead" to "two repos use it, leave it alone". Names of that shape (FooIn /
+# FooInput, Handler / HandlerFactory) are ordinary, so any identifier that is a
+# prefix of a longer one anywhere in the fleet lost its warning.
+info ""
+info "${C_BOLD}whole-identifier matching${C_OFF}"
+printf 'class AccessionUpdateIn { }\n' \
+  > "$FLEET_ROOT/inventory-api-dotnet/src/AccessionUpdateIn.cs"
+mkdir -p "$FLEET_ROOT/web-monorepo-node/schemas"
+printf 'input AccessionUpdateInput {\n  id: ID!\n}\n' \
+  > "$FLEET_ROOT/web-monorepo-node/schemas/data.graphql"
+
+seam_out=$("$here/cs" seam 'AccessionUpdateIn' 2>&1)
+if printf '%s' "$seam_out" | grep -q 'producer with no consumer, or dead'; then
+  ok "the orphan warning survives a substring match in another repo"
+  pass=$((pass + 1))
+else
+  err "a substring match in an unrelated repo suppressed the orphan warning"
+  fail=$((fail + 1)); failed_ids+=("seam-orphan-substring")
+fi
+
+# Naming the repo is what lets a reader discount it, in the same spirit as the
+# `prose filtered except:` warning the ticket cites as the correct shape.
+if printf '%s' "$seam_out" | grep -q 'INSIDE a longer identifier' \
+   && printf '%s' "$seam_out" | grep -q 'web-monorepo-node'; then
+  ok "the substring-only repo is named, not merely discounted"; pass=$((pass + 1))
+else
+  err "the substring match was not reported as one"
+  fail=$((fail + 1)); failed_ids+=("seam-substring-unreported")
+fi
+
+# cs uses answers "who uses this name", so a hit inside a longer identifier is
+# not one — and it must say so rather than counting it silently.
+uses_out=$("$here/cs" uses 'AccessionUpdateIn' 2>&1)
+if printf '%s' "$uses_out" | grep -q 'INSIDE a longer identifier'; then
+  ok "cs uses reports hits that matched inside a longer identifier"; pass=$((pass + 1))
+else
+  err "cs uses counted a substring hit without saying so"
+  fail=$((fail + 1)); failed_ids+=("uses-substring-unreported")
+fi
+
+# --word is opt-in, not the default, and both backends must agree on it. It is
+# NOT the default because -w drops `reserve` inside `reserveItem` — a real use,
+# silently lost — which trades one false-negative class for another.
+word_bad=()
+word_engines=(grep)
+have_rg_binary_here && word_engines=(ripgrep grep)
+for eng in "${word_engines[@]}"; do
+  wn=$(CS_TEXT_ENGINE=$eng "$here/cs" uses 'AccessionUpdateIn' --word --quiet 2>/dev/null | grep -c '[^[:space:]]')
+  sn=$(CS_TEXT_ENGINE=$eng "$here/cs" uses 'AccessionUpdateIn' --quiet 2>/dev/null | grep -c '[^[:space:]]')
+  [[ "$wn" -eq 1 && "$sn" -eq 2 ]] || word_bad+=("$eng:word=$wn/substring=$sn")
+done
+if [[ ${#word_bad[@]} -eq 0 ]]; then
+  ok "--word matches whole identifiers only (${word_engines[*]})"; pass=$((pass + 1))
+else
+  err "--word disagreed across backends: ${word_bad[*]}"
+  fail=$((fail + 1)); failed_ids+=("word-flag-parity")
+fi
+
+# The default must NOT have become -w: a name assembled from parts is a real
+# use and the documented blind spot of a heuristic answer.
+if [[ "$("$here/cs" uses 'AccessionUpdateIn' --quiet 2>/dev/null | grep -c '[^[:space:]]')" -eq 2 ]]; then
+  ok "substring hits are still returned by default, not silently dropped"
+  pass=$((pass + 1))
+else
+  err "the default became word-boundary, which loses genuine partial matches"
+  fail=$((fail + 1)); failed_ids+=("word-not-default")
+fi
+
+rm -f "$FLEET_ROOT/inventory-api-dotnet/src/AccessionUpdateIn.cs"
+rm -rf "$FLEET_ROOT/web-monorepo-node/schemas"
+
 # ---- what counts as a repository -------------------------------------------
 # A fleet root grows housekeeping — a README, an update script, a log, a folder
 # of scratch notes — and `cs repos` listed all of it, reporting 40 repos on a
