@@ -1,0 +1,17 @@
+{
+  "name": "fleet-workspace",
+  "description": "Work on a ticket that spans several repositories: clone a fleet of repos once, then create a per-ticket workspace of git worktrees holding only the repos that ticket changes. Pairs with the code-search plugin, which layers a ticket's branch state over the rest of the fleet when searching.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Zvi Rahamim"
+  },
+  "homepage": "https://github.com/my-organization-for-testing-067/code-search-fleet",
+  "keywords": [
+    "git",
+    "worktree",
+    "monorepo",
+    "multi-repo",
+    "workflow",
+    "ticket"
+  ]
+}

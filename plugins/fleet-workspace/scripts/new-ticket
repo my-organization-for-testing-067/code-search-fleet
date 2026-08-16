@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Scaffold a ticket workspace: git worktrees off the fleet clones for just the
+# repos a ticket touches. See docs/repo-fleet.md.
+#
+# Worktrees (not fresh clones) mean no re-clone of a large repo per ticket, and
+# the fleet stays the single copy of each repo on disk.
+#
+# Usage: new-ticket <ticket-id> <repo> [repo...]
+#        new-ticket PROJ-123 inventory-api checkout-service
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+[[ $# -ge 2 ]] || { sed -n '2,11p' "$0"; exit 1; }
+
+ticket="$1"; shift
+branch="${BRANCH_PREFIX}${ticket}"
+workspace="$TICKETS_ROOT/$ticket"
+
+# Validate every repo before creating anything, so a typo cannot leave a
+# half-built workspace behind.
+for repo in "$@"; do
+  [[ -d "$FLEET_ROOT/$repo/.git" ]] || die "not a fleet repo: $repo (looked in $FLEET_ROOT)"
+done
+
+mkdir -p "$workspace"
+info "${C_BOLD}$ticket${C_OFF} → $workspace (branch $branch)"
+
+created=() failed=()
+for repo in "$@"; do
+  src="$FLEET_ROOT/$repo"
+  dest="$workspace/$repo"
+
+  if [[ -e "$dest" ]]; then
+    warn "$repo — already in workspace, leaving as is"
+    continue
+  fi
+
+  # Reuse the branch if it already exists (resuming a ticket), otherwise create
+  # it off the current default branch.
+  if git -C "$src" show-ref --verify --quiet "refs/heads/$branch"; then
+    args=("$dest" "$branch")
+    note="existing branch"
+  else
+    base=$(default_branch "$src" || echo main)
+    args=("$dest" -b "$branch" "origin/$base")
+    note="new branch off origin/$base"
+  fi
+
+  if git -C "$src" worktree add --quiet "${args[@]}" 2>/dev/null; then
+    ok "$repo — $note"
+    created+=("$repo")
+  else
+    err "$repo — worktree add failed"
+    failed+=("$repo")
+    continue
+  fi
+
+  # No index step. Search is index-free by design -- see the search model in
+  # docs/repo-fleet.md -- so a fresh worktree is immediately searchable and
+  # there is nothing to warm up here.
+done
+
+info ""
+info "${C_BOLD}${#created[@]} repo(s) ready${C_OFF}  cd $workspace"
+[[ ${#failed[@]} -eq 0 ]]

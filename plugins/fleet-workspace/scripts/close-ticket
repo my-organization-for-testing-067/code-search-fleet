@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Tear down a ticket workspace: remove its worktrees and the workspace dir.
+# See docs/repo-fleet.md.
+#
+# Refuses to remove a worktree with uncommitted changes or with commits not
+# reachable from the repo's default branch, so unmerged work is never silently
+# discarded. --force overrides; --keep-branches leaves the local branches.
+#
+# Usage: close-ticket <ticket-id> [--force] [--keep-branches]
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+[[ $# -ge 1 ]] || { sed -n '2,12p' "$0"; exit 1; }
+
+ticket="$1"; shift
+force=0
+keep_branches=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force) force=1 ;;
+    --keep-branches) keep_branches=1 ;;
+    *) die "unknown option: $1" ;;
+  esac
+  shift
+done
+
+branch="${BRANCH_PREFIX}${ticket}"
+workspace="$TICKETS_ROOT/$ticket"
+[[ -d "$workspace" ]] || die "no workspace at $workspace"
+
+removed=() blocked=()
+
+for dest in "$workspace"/*/; do
+  [[ -d "$dest" ]] || continue
+  repo=$(basename "$dest")
+  src="$FLEET_ROOT/$repo"
+  dest="${dest%/}"
+
+  if [[ ! -d "$src/.git" ]]; then
+    blocked+=("$repo: no matching fleet repo, remove $dest by hand")
+    continue
+  fi
+
+  if [[ $force -eq 0 ]]; then
+    if [[ -n "$(git -C "$dest" status --porcelain 2>/dev/null)" ]]; then
+      blocked+=("$repo: uncommitted changes")
+      continue
+    fi
+    base=$(default_branch "$src" || echo main)
+    if unmerged=$(git -C "$dest" rev-list --count "origin/$base..HEAD" 2>/dev/null) \
+       && [[ "$unmerged" -gt 0 ]]; then
+      blocked+=("$repo: $unmerged commit(s) not in origin/$base")
+      continue
+    fi
+  fi
+
+  rm_args=(worktree remove "$dest")
+  [[ $force -eq 1 ]] && rm_args+=(--force)
+  if git -C "$src" "${rm_args[@]}" 2>/dev/null; then
+    ok "$repo — worktree removed"
+    removed+=("$repo")
+  else
+    blocked+=("$repo: worktree remove failed")
+    continue
+  fi
+
+  if [[ $keep_branches -eq 0 ]]; then
+    git -C "$src" branch -D "$branch" >/dev/null 2>&1 \
+      && info "    branch $branch deleted" || true
+  fi
+done
+
+if [[ ${#blocked[@]} -eq 0 ]]; then
+  rmdir "$workspace" 2>/dev/null && ok "workspace removed" \
+    || warn "workspace kept: $workspace is not empty"
+fi
+
+info ""
+info "${C_BOLD}${#removed[@]} removed, ${#blocked[@]} blocked${C_OFF}"
+for b in "${blocked[@]:-}"; do [[ -n "$b" ]] && warn "$b"; done
+[[ ${#blocked[@]} -eq 0 ]] || info "(re-run with --force to discard)"
+
+[[ ${#blocked[@]} -eq 0 ]]
