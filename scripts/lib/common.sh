@@ -2,11 +2,34 @@
 # Shared config and helpers for the fleet/ticket scripts.
 # See docs/repo-fleet.md for the setup this assumes.
 
-# Config precedence: environment > ~/.config/ai-toolbox/fleet.env > defaults.
-if [[ -f "${HOME}/.config/ai-toolbox/fleet.env" ]]; then
-  # shellcheck disable=SC1091
-  source "${HOME}/.config/ai-toolbox/fleet.env"
-fi
+# Config precedence: environment > config file > defaults.
+#
+# The directory is `repo-fleet`, matching what `fleet-init --config` writes.
+# This read `~/.config/ai-toolbox/fleet.env` until 2026-08-16 -- the path the
+# tooling used before it moved out of ai-toolbox into the repo-fleet plugin.
+# Nothing failed when it diverged: cs simply never saw the config, fell back to
+# ~/code/fleet, and answered "nothing found" against a directory that did not
+# exist. A configured fleet and a search tool that cannot see it is the worst
+# combination available, because every answer is a confident negative.
+#
+# The config file uses `export`, so sourcing it OVERWRITES whatever the caller
+# set in the environment -- the opposite of the precedence documented here and
+# in the file's own header. The environment is captured first and reinstated
+# afterwards, which is what makes `FLEET_ROOT=… cs …` and verify-search's own
+# fixture root work. (repo-fleet's copy of this file was fixed months ago; this
+# one was not, and the bug was masked by the wrong directory name above.)
+FLEET_CONFIG_DIR="${FLEET_CONFIG_DIR:-${HOME}/.config/repo-fleet}"
+_env_FLEET_ROOT="${FLEET_ROOT:-}"
+_env_TICKETS_ROOT="${TICKETS_ROOT:-}"
+_env_BRANCH_PREFIX="${BRANCH_PREFIX:-}"
+
+# shellcheck disable=SC1091
+[[ -f "$FLEET_CONFIG_DIR/fleet.env" ]] && source "$FLEET_CONFIG_DIR/fleet.env"
+
+[[ -n "$_env_FLEET_ROOT" ]]    && FLEET_ROOT="$_env_FLEET_ROOT"
+[[ -n "$_env_TICKETS_ROOT" ]]  && TICKETS_ROOT="$_env_TICKETS_ROOT"
+[[ -n "$_env_BRANCH_PREFIX" ]] && BRANCH_PREFIX="$_env_BRANCH_PREFIX"
+unset _env_FLEET_ROOT _env_TICKETS_ROOT _env_BRANCH_PREFIX
 
 FLEET_ROOT="${FLEET_ROOT:-${HOME}/code/fleet}"
 TICKETS_ROOT="${TICKETS_ROOT:-${HOME}/tickets}"

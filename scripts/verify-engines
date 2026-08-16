@@ -18,6 +18,12 @@
 # Usage: verify-engines [--update] [--quiet]
 #   --update   record current versions and probe outcomes as the new baseline
 set -uo pipefail
+
+# Captured before common.sh fills it in from the config file or a default. Only
+# an explicit environment value means "probe against this fleet"; see the same
+# note in verify-search.
+_explicit_fleet_root="${FLEET_ROOT:-}"
+
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,7 +44,13 @@ done
 have() { command -v "$1" >/dev/null 2>&1; }
 
 owned=0
-if [[ -z "${FLEET_ROOT:-}" || ! -d "${FLEET_ROOT:-/nonexistent}" ]]; then
+if [[ -n "$_explicit_fleet_root" ]] && ! compgen -G "$_explicit_fleet_root/*/.git" >/dev/null; then
+  warn "FLEET_ROOT is set but holds no repositories: $_explicit_fleet_root"
+  warn "using a throwaway fixture fleet instead"
+  _explicit_fleet_root=""
+fi
+FLEET_ROOT="$_explicit_fleet_root"
+if [[ -z "$FLEET_ROOT" || ! -d "$FLEET_ROOT" ]]; then
   FLEET_ROOT="$(mktemp -d)/fleet"; export FLEET_ROOT; owned=1
   "$here/build-fixtures" "$FLEET_ROOT" >/dev/null 2>&1 || die "could not build fixtures"
 fi

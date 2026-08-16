@@ -58,6 +58,21 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/lib" && pwd)"
 root="${FLEET_ROOT:-$PWD}"
 
+# Refuse to answer rather than answer "nothing found" from an empty or missing
+# fleet. A negative result is the answer that makes a breaking change look safe,
+# so it is the one that must never be manufactured by a configuration mistake.
+# Before this guard, a fleet root that did not exist produced a `cd` error on
+# stderr and then a perfectly formatted "no code uses X · 0 hit(s) · 0 repo(s)".
+if [[ ! -d "$root" ]]; then
+  die "fleet root does not exist: $root
+  set FLEET_ROOT, or run: fleet-init --config --fleet-root <dir> --tickets-root <dir>"
+fi
+if ! compgen -G "$root/*/.git" >/dev/null; then
+  die "no repositories in the fleet root: $root
+  clone some first: fleet-init --clone <owner/repo> ...
+  (searching an empty fleet would report 'nothing found' for every query)"
+fi
+
 # ---- layered view ----------------------------------------------------------
 # Work happens in a ticket workspace holding only the repos being changed, but
 # the questions that matter are fleet-wide: "who calls this endpoint" must see

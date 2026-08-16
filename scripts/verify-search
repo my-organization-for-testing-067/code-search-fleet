@@ -6,10 +6,20 @@
 # that has quietly lost an engine still returns results, just worse ones, which
 # is exactly the failure that goes unnoticed.
 #
-# Builds its own throwaway fixture fleet unless FLEET_ROOT already points at one.
+# Builds its own throwaway fixture fleet unless you deliberately point
+# FLEET_ROOT at one in the environment.
 #
 # Usage: verify-search [--keep]
 set -uo pipefail
+
+# Captured BEFORE common.sh, which fills FLEET_ROOT in from ~/.config/repo-fleet
+# or a built-in default. Only an explicit environment value means "score against
+# this fleet instead of the fixture" -- a configured root is just where the user
+# happens to work, and scoring the suite against it silently reports failures
+# that are not real. Reading $FLEET_ROOT after sourcing cannot tell the two
+# apart, which is what happened the day cs started honouring the config file.
+_explicit_fleet_root="${FLEET_ROOT:-}"
+
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,7 +27,15 @@ keep=0
 [[ "${1:-}" == "--keep" ]] && keep=1
 
 owned_fleet=0
-if [[ -z "${FLEET_ROOT:-}" || ! -d "${FLEET_ROOT:-/nonexistent}" ]]; then
+# An explicit root still has to hold repos; an empty directory would score every
+# query as "nothing found" and report a broken search stack.
+if [[ -n "$_explicit_fleet_root" ]] && ! compgen -G "$_explicit_fleet_root/*/.git" >/dev/null; then
+  warn "FLEET_ROOT is set but holds no repositories: $_explicit_fleet_root"
+  warn "using a throwaway fixture fleet instead"
+  _explicit_fleet_root=""
+fi
+FLEET_ROOT="$_explicit_fleet_root"
+if [[ -z "$FLEET_ROOT" || ! -d "$FLEET_ROOT" ]]; then
   FLEET_ROOT="$(mktemp -d)/fleet"
   export FLEET_ROOT
   owned_fleet=1
