@@ -23,10 +23,6 @@ No single search engine answers every question about a codebase:
 
 Committing to one engine means accepting its blind spot permanently.
 
-**New here? Read [GETTING-STARTED.md](GETTING-STARTED.md)** — install, first-time
-setup, a worked example of a ticket from start to finish, and how to customise
-branch naming and per-repo setup for your company.
-
 ## Quick start
 
 ```sh
@@ -170,11 +166,22 @@ blind spots, verification.
 
 ### As a Claude Code plugin
 
-This repo is its own marketplace, so installing it is two commands:
+This repo is its own marketplace:
 
 ```sh
 claude plugin marketplace add my-organization-for-testing-067/code-search-fleet
 claude plugin install code-search@code-search-fleet
+```
+
+Or get it together with the workspace tooling it is designed to sit beside, from
+one catalog — see
+[repo-fleet](https://github.com/my-organization-for-testing-067/repo-fleet),
+which owns the fleet and ticket-workspace side and lists this plugin too:
+
+```sh
+claude plugin marketplace add my-organization-for-testing-067/repo-fleet
+claude plugin install code-search@repo-fleet
+claude plugin install fleet-workspace@repo-fleet
 ```
 
 Then set the one thing it cannot guess:
