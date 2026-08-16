@@ -5,7 +5,7 @@ description: Search across many repositories at once — find who calls an endpo
 
 # Searching a fleet of repositories
 
-Use `scripts/cs`. It is one interface over five engines, because **no single
+Use the `cs` command. It is one interface over five engines, because **no single
 engine answers every question** — measured, not assumed: across nine scored
 queries the best individual engine got 5/9, and `cs` gets 9/9.
 
@@ -13,12 +13,31 @@ Do not reach for raw `grep` first. It cannot see a route assembled from two C#
 attributes, it counts a docstring mentioning an endpoint as a caller, and it
 cannot resolve an interface to its implementation.
 
+## Finding the command
+
+The working directory is the user's project, not this tool, so `cs` is never on
+a relative path. Resolve it once at the start of the session and reuse it:
+
+```sh
+CS="${CLAUDE_PLUGIN_ROOT:-$PWD}/scripts/cs"    # installed as a plugin, or a clone
+"$CS" engines
+```
+
+`CLAUDE_PLUGIN_ROOT` is set when this is installed as a plugin. From a plain
+clone, use the checkout's own path. Every example below writes `cs` for
+readability; run `"$CS"`.
+
 ## Setup
 
 ```sh
-scripts/bootstrap           # installs the engines; --check to only report
-export FLEET_ROOT=~/code/fleet   # the directory holding all the repos
+"$CS" engines                        # what is installed here
+"${CLAUDE_PLUGIN_ROOT:-.}/scripts/bootstrap"   # install missing engines
+export FLEET_ROOT=~/code/fleet       # the directory holding all the repos
 ```
+
+**`FLEET_ROOT` is required** and there is no useful default — without it `cs`
+searches the current directory, which is not a fleet. If it is unset, ask the
+user for the directory holding their repos rather than guessing.
 
 Every engine is optional. `cs engines` reports what is present, and `cs` routes
 around whatever is missing rather than failing silently.
@@ -179,24 +198,26 @@ cs def DiscountEngine "$(cs provides com.acme:pricing-lib)"
 
 ## Verifying it works
 
-The repo ships a fixture fleet with known-correct answers, including decoys
-designed to catch over-eager tools:
+It ships a fixture fleet with known-correct answers, including decoys designed
+to catch over-eager tools. `ROOT` below is `${CLAUDE_PLUGIN_ROOT:-.}`:
 
 ```sh
-scripts/build-fixtures /tmp/fixture-fleet
+ROOT="${CLAUDE_PLUGIN_ROOT:-.}"
+"$ROOT/scripts/build-fixtures" /tmp/fixture-fleet
 export FLEET_ROOT=/tmp/fixture-fleet
-cs uses "/api/v1/inventory/reserve" | scripts/score-seams reserve-consumers -
+"$CS" uses "/api/v1/inventory/reserve" | "$ROOT/scripts/score-seams" reserve-consumers -
 ```
 
-`scripts/score-seams --list` shows all nine queries. `fixtures/BASELINE.md`
-records how each engine scores alone, and `fixtures/GROUND-TRUTH.md` explains
-what each query is testing.
+`score-seams --list` shows all nine queries. `fixtures/BASELINE.md` records how
+each engine scores alone, and `fixtures/GROUND-TRUTH.md` explains what each
+query is testing.
 
-**Two layers, and you need both:**
+**Three layers:**
 
 ```sh
-scripts/verify-search     # end-to-end: does the facade still answer all nine?
-scripts/verify-engines    # per-engine: is each engine still doing its job?
+"$ROOT/scripts/verify-search"    # end-to-end: does the facade still answer all nine?
+"$ROOT/scripts/verify-engines"   # per-engine: is each engine still doing its job?
+"$ROOT/scripts/bench-scale"      # what it costs on a generated 456k-line fleet
 ```
 
 `verify-engines` exists because **the facade hides engine regressions**:

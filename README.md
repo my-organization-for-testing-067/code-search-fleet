@@ -162,8 +162,39 @@ replayed tip matches the canonical tree, so history cannot drift from source.
 ## Use with an AI agent
 
 `skills/code-search/SKILL.md` is a self-contained entry point — setup, routing,
-blind spots, verification. For Claude Code:
+blind spots, verification.
+
+### As a Claude Code plugin
+
+This repo is its own marketplace, so installing it is two commands:
+
+```sh
+claude plugin marketplace add my-organization-for-testing-067/code-search-fleet
+claude plugin install code-search@code-search-fleet
+```
+
+Then set the one thing it cannot guess:
+
+```sh
+export FLEET_ROOT=~/code/fleet     # the directory holding your repos
+```
+
+The whole repo ships with the plugin — the `cs` CLI, all five engines' glue, the
+fixture fleet, and the verification suite — so `verify-search` runs from the
+installed copy and answers "is this working *here*" rather than "did it work
+where it was built".
+
+**Cost: ~150 tokens always-on**, and the skill body only loads when a search
+question actually comes up (`claude plugin details code-search` reports it).
+That is the argument against exposing this over MCP instead: MCP tool schemas
+sit in context for the whole session whether or not you search.
+
+From a plain clone instead, symlink the skill:
 
 ```sh
 ln -s "$PWD/skills/code-search" ~/.claude/skills/code-search
 ```
+
+Either way the skill resolves the CLI through `${CLAUDE_PLUGIN_ROOT}`, falling
+back to the checkout — the working directory is the user's project, so `cs` is
+never on a relative path.
