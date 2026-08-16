@@ -42,8 +42,18 @@ for dest in "$workspace"/*/; do
   fi
 
   if [[ $force -eq 0 ]]; then
-    if [[ -n "$(git -C "$dest" status --porcelain 2>/dev/null)" ]]; then
-      blocked+=("$repo: uncommitted changes")
+    dirty=$(git -C "$dest" status --porcelain 2>/dev/null)
+    if [[ -n "$dirty" ]]; then
+      # Distinguish edits from leftover files. A post-create hook that writes
+      # anything not gitignored -- a .env, a build artefact -- leaves every
+      # worktree permanently untidy, so "uncommitted changes" would block this
+      # ticket and every future one with no clue why.
+      if [[ -z "$(printf '%s\n' "$dirty" | grep -v '^??')" ]]; then
+        n=$(printf '%s\n' "$dirty" | grep -c '^??')
+        blocked+=("$repo: $n untracked file(s), no tracked edits — if a post-create hook wrote them, gitignore them; otherwise --force")
+      else
+        blocked+=("$repo: uncommitted changes to tracked files")
+      fi
       continue
     fi
     base=$(default_branch "$src" || echo main)

@@ -152,6 +152,10 @@ EOF
 #
 # Available: FLEET_TICKET FLEET_REPO FLEET_WORKTREE FLEET_BRANCH
 #            FLEET_ROOT TICKETS_ROOT
+#
+# IMPORTANT: anything this writes into the worktree must be gitignored by the
+# repo. A file that shows up in `git status` makes the worktree permanently
+# dirty, and close-ticket will then refuse to tear it down.
 set -euo pipefail
 
 echo "setting up $FLEET_REPO for $FLEET_TICKET"

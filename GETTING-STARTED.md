@@ -174,6 +174,12 @@ elif compgen -G '*.sln*' >/dev/null; then dotnet restore --verbosity quiet
 fi
 ```
 
+**Whatever a hook writes into the worktree must be gitignored by that repo.**
+`node_modules` and `.env.local` normally are. Anything that is not shows up in
+`git status`, which makes the worktree permanently dirty — and `close-ticket`
+then refuses to tear it down. It will tell you when the only changes are
+untracked files, which is the signal that a hook is the cause.
+
 **A failing hook warns; it does not abort.** A workspace that exists but is not
 fully provisioned beats no workspace, and you see the exit code:
 

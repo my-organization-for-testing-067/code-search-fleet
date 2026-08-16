@@ -78,6 +78,11 @@ Branch naming is configurable the same way, in `~/.config/repo-fleet/fleet.env`:
 `BRANCH_PREFIX` (default `feature/`), or `BRANCH_TEMPLATE` such as
 `users/zvi/{ticket}` when the convention is not a prefix.
 
+Anything a hook writes into the worktree **must be gitignored by that repo**, or
+the worktree is permanently dirty and `close-ticket` will refuse to remove it.
+When the only changes are untracked files, `close-ticket` says so — that is the
+signal a hook wrote something it should not have.
+
 A hook that fails **warns and continues** — the workspace is still created, and
 the exit code is reported. If a user says setup "didn't run", check in this
 order: is the hook executable, did it exit non-zero, is it in the worktree or
