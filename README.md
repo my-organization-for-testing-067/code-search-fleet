@@ -399,3 +399,13 @@ ln -s "$PWD/skills/code-search" ~/.claude/skills/code-search
 Either way the skill resolves the CLI through `${CLAUDE_PLUGIN_ROOT}`, falling
 back to the checkout — the working directory is the user's project, so `cs` is
 never on a relative path.
+
+## License
+
+[Apache-2.0](LICENSE). Chosen over MIT for the explicit patent grant, which is
+what makes a corporate legal review a formality rather than a conversation —
+this is tooling meant to be installed on work machines and pointed at a
+company's source, so "may we use this" needs an answer that is already written
+down. Without a LICENSE file the default is all rights reserved, which blocks
+not just use but vendoring, internal mirroring, and redistribution through an
+internal plugin marketplace.
