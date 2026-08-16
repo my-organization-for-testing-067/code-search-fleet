@@ -39,8 +39,12 @@ export FLEET_ROOT=~/code/fleet       # the directory holding all the repos
 searches the current directory, which is not a fleet. If it is unset, ask the
 user for the directory holding their repos rather than guessing.
 
-Every engine is optional. `cs engines` reports what is present, and `cs` routes
-around whatever is missing rather than failing silently.
+Every *engine* is optional. `cs engines` reports what is present, and `cs` routes
+around whatever is missing rather than failing silently. **`python3` is the
+exception** — `uses`, `provides`, `deps`, `publishes`, `impls` and `refs` run
+through it, and refuse without it rather than returning zero hits that would
+read exactly like a real "nothing uses this". If `cs` reports python3 missing,
+tell the user; `cs seam` still works without it, but counts comments as hits.
 
 ## Which subcommand
 
@@ -64,6 +68,17 @@ Run `cs which` for this table at any time.
 second. `cs impls` and `cs refs` start language servers and take minutes on a
 large repo — reach for them when you need symbol-level truth, not for a first
 look.
+
+Every subcommand emits the same line format, including the two LSP-backed ones:
+
+```
+$ cs refs IInventoryStore inventory-api-dotnet src/Domain/IInventoryStore.cs
+inventory-api-dotnet/src/Controllers/ReservationController.cs:9: [Class] private readonly IInventoryStore _store;
+inventory-api-dotnet/src/Program.cs:11: [File] builder.Services.AddScoped<IInventoryStore, SqlInventoryStore>();
+```
+
+That second hit is the DI registration — the step neither grep nor a call graph
+bridges, and the reason `cs refs` is worth its cost.
 
 When a subcommand finds nothing it prints what to try instead, so a wrong first
 choice self-corrects.
@@ -92,7 +107,7 @@ change look safe.
 `cs why <kind>` prints exactly what that kind cannot see; `--why` on any query
 gives it inline.
 
-Three warnings `cs` emits that you must pass on rather than swallow:
+Four warnings `cs` emits that you must pass on rather than swallow:
 
 - **`PARTIAL`** — an engine hit its timeout, so the result is a subset, not an
   answer. Raise `CS_TIMEOUT` and rerun before concluding anything from it.
@@ -100,6 +115,23 @@ Three warnings `cs` emits that you must pass on rather than swallow:
   M is printed; use it to narrow, or pass `--all`.
 - **`degraded:`** — an engine was missing and `cs` fell back to another with a
   different pattern dialect. The results are not equivalent.
+- **`prose filtered except: <extensions>`** — `cs uses` met files in a language
+  its comment filter does not know, and passed them through unfiltered. Hits in
+  those files may be comments. Treat them as `cs seam` hits, not `cs uses` hits.
+
+## When cs refuses, it is protecting you from a false negative
+
+`cs` exits non-zero with an explanation rather than returning an empty result
+when it cannot answer honestly: no such fleet root, no repos in it, python3
+missing, or `--ticket=<id>` naming a workspace that does not exist. **Do not
+work around a refusal by falling back to raw `grep`** — the refusal means the
+conditions for a trustworthy negative are not met, and grep's negative is
+weaker still. Fix the cause, or tell the user what is missing.
+
+Note the difference between exit codes: a refusal prints an error and explains
+what is wrong, while a *successful* query that simply found nothing prints
+`0 hit(s)` with an answer-kind label and a "nothing found — try:" hint. Both
+exit non-zero. Read which one you got before reporting "nothing uses this".
 
 ## Finding a cause in another repo
 
@@ -141,7 +173,15 @@ files you are editing. Both answers are wrong in ways that do not announce
 themselves.
 
 - `--fleet` ignores the ticket workspace entirely.
-- `--ticket=<id>` layers a named ticket instead of the one you are standing in.
+- `--ticket=<id>` layers a named ticket instead of the one you are standing in,
+  and **fails** if no such workspace exists rather than falling back to the
+  fleet. That fallback would be the same mistake inverted — you asked for branch
+  state and would have been handed main. If you get that error, check the id
+  against `ls $TICKETS_ROOT` (the message lists what is there) instead of
+  dropping the flag.
+
+Always read the `searching:` line before trusting a layered answer. If it is
+absent, no ticket was layered and every hit came from the fleet.
 
 ## The distinctions that matter
 
@@ -195,6 +235,17 @@ cs def DiscountEngine "$(cs provides com.acme:pricing-lib)"
 - **A structural engine returns nothing for a language it cannot parse**, which
   looks identical to "no matches". Name the language (`cs calls '<pat>' csharp`)
   to turn that silence into an error.
+- **`cs uses` filters comments by file extension**, so its coverage is a table
+  rather than a parser: 106 extensions plus 13 well-known filenames. A file in
+  a language outside the table is passed through unfiltered and *named* in the
+  answer line (`prose filtered except: .erl`). When you see that, the hits in
+  those files are `cs seam` quality, not `cs uses` quality.
+- **Some directories are never searched.** `node_modules`, `target`, `dist`,
+  `vendor`, `bin`, `obj` and similar are excluded fleet-wide, and an excluded
+  directory looks exactly like one with no hits. `cs engines` prints the
+  effective list. Some layouts keep hand-written source in `bin` or real
+  dependencies in `vendor` — if a file you know exists is not being found, check
+  the list and rerun with `CS_EXCLUDE_REMOVE="bin vendor"`.
 
 ## Verifying it works
 
@@ -225,6 +276,13 @@ query is testing.
 entirely and the end-to-end run would still score 9/9. Each engine is therefore
 probed directly on the one capability the routing depends on it for.
 
+`verify-search` also has a **refusals** section, which tests that `cs` refuses
+rather than that it answers. Those are different properties, and only the second
+protects what this tool claims: a missing python3, a typo'd `--ticket`, or two
+`cs def` calls issued in parallel all used to yield a confident empty answer
+while every scored query still passed. If you are diagnosing a suspicious
+negative result, run `verify-search` — it reproduces each of those directly.
+
 Run both after upgrading any tool. `verify-engines` compares against
 `fixtures/verified-versions.tsv` and flags version changes as a prompt to look,
 not as a failure. `--update` records a new baseline once you have reviewed the
@@ -245,6 +303,13 @@ which stays clickable.
 so it does not have to be guessed at: an answer that rests on a string match
 across a repo boundary is a textual link, not a resolved reference, and saying
 "the only caller is X" on `textual` evidence overstates what was actually
-checked. Say which it was, and say when a result was `PARTIAL`, capped, or
-`degraded` — a confident summary of an incomplete search is the failure this
-whole setup exists to prevent.
+checked. Say which it was, and say when a result was `PARTIAL`, capped,
+`degraded`, or `prose filtered except:` — a confident summary of an incomplete
+search is the failure this whole setup exists to prevent.
+
+**Read stdout and stderr as different things.** stdout is the result stream and
+nothing else — every hit, one per line, and never a diagnostic. Provenance,
+warnings, the `searching:` line, the per-repo distribution of a capped result,
+and the comment-only mentions excluded from a zero-hit `cs uses` all go to
+stderr. If you pipe `cs` anywhere, you get results only; if you are judging how
+much an answer is worth, you need the stderr side too.

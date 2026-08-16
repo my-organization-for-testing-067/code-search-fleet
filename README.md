@@ -28,14 +28,24 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 20 checks against a throwaway fixture fleet
+scripts/verify-search              # 29 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only
 ```
 
-Every engine is optional; `cs engines` reports what is present and `cs` routes
+Every *engine* is optional; `cs engines` reports what is present and `cs` routes
 around what is missing rather than failing silently.
+
+**`python3` is the one hard requirement** — `uses`, `provides`, `deps`,
+`publishes`, `impls` and `refs` all run through it. It is separate from the
+engines because it does not degrade: those commands refuse rather than answer
+without it. Nothing installs it for you (a system python is the OS's business),
+but `bootstrap` and `cs engines` both report it.
+
+`timeout(1)` is worth having too. Without it a hung language server hangs `cs`
+with no upper bound, and a search that never returns is the one outcome worse
+than a wrong one, because nothing reports it. `brew install coreutils` on macOS.
 
 ## Commands
 
@@ -71,10 +81,56 @@ real damage: "nothing uses this" from a `textual` match is close to worthless
 evidence, while the same answer from `cs refs` is strong. `cs why <kind>` prints
 what that kind cannot see.
 
-`cs` is also loud about the three ways a result can be less than it looks: an
+`cs` is also loud about the four ways a result can be less than it looks: an
 engine that hit its timeout says `PARTIAL` rather than returning empty, a capped
-result says `showing N of M` and prints the per-repo distribution, and a
-fallback to a different engine says `degraded:`.
+result says `showing N of M` and prints the per-repo distribution, a fallback to
+a different engine says `degraded:`, and a `cs uses` that met a language its
+prose filter does not know names it rather than claiming a filter that did not
+run:
+
+```
+answer: heuristic via ripgrep (literal, prose filtered except: .erl) · 6 hit(s)
+```
+
+### And it refuses rather than answering empty
+
+The worst thing this tool can produce is not a wrong answer but a confident
+*negative* — a well-formatted, correctly-labelled, entirely empty result caused
+by a malfunction rather than by an absence. "No code uses this" is what makes
+deleting a live endpoint look safe.
+
+So the conditions that would manufacture one are fatal, not silent: a fleet root
+that does not exist or holds no repos, a missing `python3`, a `--ticket=<id>`
+naming a workspace that is not there. `verify-search` has a whole section
+asserting each of these refuses, because none of them failed a scored query —
+they were found by probing the failure paths, not by reading the code.
+
+## Tuning it for your repos
+
+| Variable | Does |
+|---|---|
+| `FLEET_ROOT` | the directory holding your repos — **required**, no useful default |
+| `TICKETS_ROOT` | where per-ticket workspaces live |
+| `CS_MAX_RESULTS` | result cap, default 200 (`0` or `--all` for none) |
+| `CS_TIMEOUT` | per-engine wall-clock limit in seconds, default 120 |
+| `CS_TAGS_TTL` | how long `cs def` reuses its symbol index, default 60s |
+| `CS_TEXT_ENGINE` | force `rg` or `grep`, so the two can be compared rather than trusted |
+| `CS_EXCLUDE_EXTRA` | directories to skip, added to the built-in list |
+| `CS_EXCLUDE_REMOVE` | directories to **stop** skipping |
+
+`CS_EXCLUDE_REMOVE` matters more than it looks. The built-in exclusion list is a
+guess about other people's repos, and some entries are wrong for some of them:
+`bin` and `build` are generated in most layouts and hand-written source in
+others, and a Go fleet keeps real dependencies in `vendor`. An excluded
+directory produces a silent false negative — the hit simply is not there — so
+removing an entry has to be as easy as adding one:
+
+```sh
+CS_EXCLUDE_REMOVE="bin vendor" cs uses "/api/v1/orders"
+```
+
+`cs engines` prints the effective list, because a directory excluded by mistake
+looks exactly like a directory with no hits.
 
 ## Two levels
 
@@ -88,6 +144,12 @@ searching: PROJ-123 (2 repo(s), your branch) + fleet (8 repo(s), main)
 
 Searching only the ticket would miss callers in repos the ticket does not
 contain — the failure that makes renaming a shared route look safe.
+
+`--ticket=<id>` searches a named workspace instead of the one you are standing
+in, and **fails** if that workspace does not exist. Falling back to the fleet
+would be the same mistake inverted: you asked for your branch state and would
+have been handed main, with no `searching:` line to reveal the substitution.
+`--fleet` is how you ask for the fleet on purpose.
 
 ## Verifying
 
@@ -113,6 +175,23 @@ because nothing tells you which answer you got.
 reports `IMPROVED` when one disappears — an upgrade can remove the reason a
 tool was rejected, and nothing else would notice.
 
+And `verify-search` tests that `cs` **refuses**, not only that it answers. Those
+are different properties, and only the second protects the claim the tool makes.
+Every check in that section reproduces a defect that passed all nine scored
+queries: a missing `python3` reporting zero hits, six concurrent `cs def` runs
+racing on one index file and half returning nothing, a typo'd `--ticket`
+answering from main, a language the prose filter could not parse being reported
+as filtered anyway.
+
+Two of those are worth naming as a lesson about the tests themselves. A check
+that quietly downgrades is worse than no check: piping a long-running producer
+into `grep -q` under `set -o pipefail` reports failure by SIGPIPE, so merely
+*appending a line* to `cs engines` output turned the timeout-visibility check
+into a `SKIP` while the run still said `0 failed`. And a check with no positive
+control passes for the wrong reason — asserting only that a comment token is
+absent succeeds just as well when the command is broken and finds nothing at
+all, which is why every language probe now asserts both halves.
+
 ## The fixture
 
 `fixtures/` holds five small repos (C#, Kotlin, Python, TypeScript, Java) with
@@ -125,6 +204,13 @@ The decoys are the point. Positive cases alone measure recall and are trivially
 gamed — a tool answering "everything is related to everything" scores perfectly.
 `fixtures/GROUND-TRUTH.md` explains each; `fixtures/BASELINE.md` records how
 every engine scores alone.
+
+`fixtures/prose-probes/` is a second, deliberately unglamorous fixture: one file
+per language, each carrying one token that appears only in comments and one that
+appears only in code. It exists because the five repos above share a blind spot —
+they are written in languages the prose filter supported from the start, so a
+filter that silently did nothing for C++, Go, Ruby or PHP passed every query.
+Twelve languages are covered; adding one is dropping in a `probe.<ext>`.
 
 They also **build and test for real**, each with a GitHub Actions workflow:
 `dotnet test`, `gradle test`, `pytest`, and a TypeScript typecheck. That makes

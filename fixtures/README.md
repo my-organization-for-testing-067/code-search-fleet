@@ -24,6 +24,24 @@ scale.
 Seam 6 is the other honest case: a DI indirection no static tool can resolve,
 there to catch a tool overselling call-graph completeness.
 
+## The blind spot these five repos share
+
+They are written in C#, Kotlin, Python, TypeScript and Java — every one of which
+`cs`'s comment filter supported from the day it was written. So a filter that
+did nothing at all for C++, Go, Ruby or PHP still passed all nine queries, while
+`cs uses` quietly returned comment matches as call sites for anyone whose fleet
+was not this fleet.
+
+`prose-probes/` closes that gap, and is deliberately *not* a modelled system:
+one file per language, each carrying one token that appears only in comments and
+one that appears only in code. `verify-search` copies them into a throwaway repo
+at test time, so this fleet stays the five repos it has always been. See
+`prose-probes/README.md`.
+
+The general point is worth keeping in mind when adding fixtures here: a set
+built to model one organisation's stack cannot detect a per-language failure,
+and a facade that degrades per language looks perfect on it.
+
 ## Scoring
 
 `expectations.json` holds machine-readable expected/forbidden file sets.
