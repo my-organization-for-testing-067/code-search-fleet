@@ -409,19 +409,45 @@ fi
 info ""
 info "${C_BOLD}refusals — a malfunction must not look like a negative result${C_OFF}"
 
+# Asserts the REFUSAL exit code (1), not merely "non-zero". A zero-hit answer
+# is also non-zero -- it is 2 -- and before the codes were split, every check in
+# this section passed just as happily for a query that ran and found nothing as
+# for one that refused to run. The message text was the only thing separating
+# them, which is exactly the weakness the codes exist to fix, so testing on the
+# text alone left the whole section unable to detect the bug it is named after.
 refuses() {  # refuses <name> <expected-message-fragment> <command...>
   local name="$1" want="$2"; shift 2
   local out rc
   out=$("$@" 2>&1); rc=$?
-  if [[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi -- "$want"; then
+  if [[ $rc -eq 1 ]] && printf '%s' "$out" | grep -qi -- "$want"; then
     ok "$name"; pass=$((pass + 1))
   elif [[ $rc -eq 0 ]]; then
     err "$name — exited 0 and answered instead of refusing"; fail=$((fail + 1))
     failed_ids+=("$name")
+  elif [[ $rc -eq 2 ]]; then
+    err "$name — exited 2 (a query that ran and found nothing), not 1 (a refusal)"
+    fail=$((fail + 1)); failed_ids+=("$name")
   else
-    err "$name — failed, but not with the reason a caller can act on"; fail=$((fail + 1))
+    err "$name — exited $rc, but not with the reason a caller can act on"; fail=$((fail + 1))
     failed_ids+=("$name")
   fi
+}
+
+# The other side of the same contract: a query that ran honestly and found
+# nothing must be distinguishable from one that never ran.
+finds_nothing() {  # finds_nothing <name> <command...>
+  local name="$1"; shift
+  local rc
+  "$@" >/dev/null 2>&1; rc=$?
+  case "$rc" in
+    2) ok "$name"; pass=$((pass + 1)) ;;
+    0) err "$name — exited 0; it found something, so the probe is wrong"
+       fail=$((fail + 1)); failed_ids+=("$name") ;;
+    1) err "$name — exited 1 (a refusal), so a caller cannot tell 'no hits' from 'did not run'"
+       fail=$((fail + 1)); failed_ids+=("$name") ;;
+    *) err "$name — exited $rc, which is neither code"
+       fail=$((fail + 1)); failed_ids+=("$name") ;;
+  esac
 }
 
 # python3 is a hard dependency of `uses`, `provides`, `deps` and `publishes`,
@@ -449,6 +475,82 @@ refuses "--ticket refusal names the root it searched" "TICKETS_ROOT is" \
 # An empty fleet root answers "nothing found" for every question ever asked.
 refuses "an empty fleet root refuses" "no repositories" \
   env FLEET_ROOT="$(mktemp -d)" "$here/cs" uses 'orders.reserved.v1'
+
+# ---- the refusal must be DETECTABLE, not merely explained -------------------
+# The distinction between "this search did not happen" and "this search happened
+# and the answer is no" is the tool's central promise, and it lived only in
+# prose on stderr. `if cs uses "$route"; then echo in use; else echo unused; fi`
+# -- the obvious thing for a caller to write -- reported "unused" for a typo'd
+# FLEET_ROOT, which is the exact false negative the whole design is organised
+# against. So the two outcomes get two codes, and both sides are asserted here:
+# every refuses() call above now pins exit 1, and these pin exit 2.
+refuses "a nonexistent fleet root refuses (exit 1)" "does not exist" \
+  env FLEET_ROOT="/nonexistent/$$/fleet" "$here/cs" uses 'orders.reserved.v1'
+# Built per run rather than written as a literal: a literal probe string is
+# itself a string in this repo, so pointing FLEET_ROOT at a fleet that happens
+# to contain this checkout would find it and invert every check below.
+absent="cs-absent-probe-$$-${RANDOM:-0}"
+finds_nothing "a genuine zero-hit cs uses exits 2"     "$here/cs" uses "$absent"
+finds_nothing "a genuine zero-hit cs seam exits 2"     "$here/cs" seam "$absent"
+finds_nothing "a genuine zero-hit cs text exits 2"     "$here/cs" text "$absent"
+finds_nothing "a genuine zero-hit cs def exits 2"      "$here/cs" def "CsAbsentSymbol$$"
+finds_nothing "a genuine zero-hit cs history exits 2"  "$here/cs" history "$absent"
+finds_nothing "a genuine zero-hit cs provides exits 2" "$here/cs" provides "com.acme:$absent"
+
+# The codes have to be written down where a caller looks, or they are a private
+# convention. Both `cs --help` (the file header) and `cs why` must state them.
+#
+# Captured rather than piped into `grep -q`, for the third time in this file:
+# under `set -o pipefail` the producer is killed by SIGPIPE the moment grep
+# matches, so the pipeline reports failure on success and the check inverts.
+codes_doc=0
+_help_out=$("$here/cs" --help 2>&1 || true)
+_why_out=$("$here/cs" why 2>&1 || true)
+printf '%s' "$_help_out" | grep -qi 'exit codes' && codes_doc=$((codes_doc + 1))
+printf '%s' "$_why_out"  | grep -qi 'exit codes' && codes_doc=$((codes_doc + 1))
+if [[ $codes_doc -eq 2 ]]; then
+  ok "cs --help and cs why both document the exit codes"; pass=$((pass + 1))
+else
+  err "the exit codes are undocumented in cs --help and/or cs why"
+  fail=$((fail + 1)); failed_ids+=("exit-codes-documented")
+fi
+
+# ---- the analyser, not just the driver -------------------------------------
+# `cs refs` / `cs impls` preflighted uvx, python3 and the repo directory -- the
+# DRIVER and its plumbing, none of which say whether the language can be
+# analysed. On a machine with uv but no .NET SDK all three passed, the language
+# server loaded nothing, and the empty result was printed as
+#
+#     answer: resolved via serena (LSP) · 0 hit(s)
+#
+# the STRONGEST negative in the taxonomy, asserted about a repo with two known
+# references. That is this tool's own worst failure mode, reproduced inside it.
+#
+# uvx is shimmed present and the toolchains shimmed unrunnable, so the check
+# exercises the toolchain gate on every machine rather than only on one that
+# happens to be missing an SDK.
+notc=$(mktemp -d)
+printf '#!/bin/sh\nexit 0\n'   > "$notc/uvx"     # driver present…
+for b in dotnet java node; do printf '#!/bin/sh\nexit 127\n' > "$notc/$b"; done  # …analyser not
+chmod +x "$notc"/*
+refuses "cs refs without the language toolchain refuses" "dotnet" \
+  env PATH="$notc:$PATH" "$here/cs" refs IInventoryStore inventory-api-dotnet \
+      src/Domain/IInventoryStore.cs
+refuses "cs impls without the language toolchain refuses" "dotnet" \
+  env PATH="$notc:$PATH" "$here/cs" impls IInventoryStore inventory-api-dotnet
+
+# Refusing is half of it. The other half is that the `resolved` label must not
+# reach the caller on a run that could not have produced one -- it was assigned
+# before the call and survived every outcome.
+notc_out=$(env PATH="$notc:$PATH" "$here/cs" refs IInventoryStore \
+           inventory-api-dotnet src/Domain/IInventoryStore.cs 2>&1)
+if printf '%s' "$notc_out" | grep -q 'answer:.*resolved'; then
+  err "cs refs printed a 'resolved' answer for a language it could not analyse"
+  fail=$((fail + 1)); failed_ids+=("resolved-label-on-unanalysed")
+else
+  ok "no 'resolved' label is printed when the toolchain is missing"; pass=$((pass + 1))
+fi
+rm -rf "$notc"
 
 # stdout is the scoreable result stream and nothing else. A zero-hit `cs uses`
 # still prints the comment-only mentions it excluded, which is useful context

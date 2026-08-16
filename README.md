@@ -28,7 +28,7 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 34 checks against a throwaway fixture fleet
+scripts/verify-search              # 45 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only
@@ -103,9 +103,67 @@ deleting a live endpoint look safe.
 
 So the conditions that would manufacture one are fatal, not silent: a fleet root
 that does not exist or holds no repos, a missing `python3`, a `--ticket=<id>`
-naming a workspace that is not there. `verify-search` has a whole section
-asserting each of these refuses, because none of them failed a scored query —
-they were found by probing the failure paths, not by reading the code.
+naming a workspace that is not there, or — for `cs impls` / `cs refs` — a repo
+whose **language toolchain** is not installed. That last one was the tool's own
+worst failure mode reproduced inside it: the preflight checked `uvx` and
+`python3`, the *driver*, and said nothing about whether the language could be
+analysed, so on a machine with no .NET SDK a C# repo produced
+
+```
+answer: resolved via serena (LSP) · 0 hit(s)
+```
+
+— the strongest negative in the taxonomy, asserted about a repo where nothing
+had been read. `cs` now refuses, and never labels `resolved` an empty result the
+language server did not affirmatively produce: an error, a timeout, or an empty
+response refuse rather than answer.
+
+`verify-search` has a whole section asserting each of these refuses, because none
+of them failed a scored query — they were found by probing the failure paths,
+not by reading the code.
+
+### And a refusal is detectable, not merely explained
+
+| Exit | Meaning |
+|---|---|
+| `0` | the query ran and found at least one hit |
+| `1` | **refusal** — the query did not run, so nothing was ruled out |
+| `2` | the query ran honestly and found nothing |
+
+`1` and `2` are opposite facts and both used to be `1`, which left the tool's
+central promise available only as prose on stderr. The obvious thing for a
+caller to write —
+
+```sh
+if cs uses "$route" >/dev/null 2>&1; then echo "in use"; else echo "unused"; fi
+```
+
+— reported `unused` for a typo'd `FLEET_ROOT`. Asking the caller to read *which*
+failure they got is a reasonable instruction for a human and a useless one for a
+script.
+
+### And `cs engines` reports answer kinds, not just binaries
+
+The contract is expressed in answer kinds; the install is a list of binaries;
+nothing connected the two, so `ast-grep MISSING` / `semgrep MISSING` next to
+five rows saying `ok` read as a healthy setup rather than as *the entire
+`structural` tier is gone and `cs calls` will refuse*. `cs engines` now derives a
+per-kind view from the same probes:
+
+```
+ANSWER KIND  STATUS
+structural   UNAVAILABLE — needs ast-grep or semgrep, neither installed → cs calls and cs def both refuse
+               backs: cs calls, cs def
+resolved     DEGRADED — dotnet ok, java MISSING (Java/Kotlin), node ok → cs impls / cs refs refuse for the missing languages
+               backs: cs impls, cs refs
+textual      ok — ripgrep
+               backs: cs text, cs seam
+```
+
+`degraded` is deliberately a third state: no ripgrep still yields `textual`
+through the POSIX grep fallback, which is a slower route to the same kind, not a
+missing kind. `cs why <kind>` reports the same availability alongside that
+kind's blind spots.
 
 ## Tuning it for your repos
 
@@ -322,7 +380,7 @@ needs `FLEET_ROOT` set — which makes it the right first thing to run, before t
 fleet exists. Simply asking the agent to "verify code-search" also works, and
 avoids the path entirely: the skill resolves it from `CLAUDE_PLUGIN_ROOT`.
 
-**Cost: ~200 tokens always-on**, and the ~6.6k skill body only loads when a
+**Cost: ~200 tokens always-on**, and the ~7.6k skill body only loads when a
 search question actually comes up. `claude plugin details code-search` reports
 both numbers for the version you actually have installed — prefer it to this
 line, which is a snapshot: the always-on figure was ~150 before `cs owns` and
@@ -330,7 +388,7 @@ line, which is a snapshot: the always-on figure was ~150 before `cs owns` and
 
 That split is the argument against exposing this over MCP instead: MCP tool
 schemas sit in context for the whole session whether or not you search, so the
-6.6k would be permanent rather than on demand.
+7.6k would be permanent rather than on demand.
 
 From a plain clone instead, symlink the skill:
 

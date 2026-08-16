@@ -111,9 +111,21 @@ if [[ $minimal -eq 0 ]]; then
   info ""
   if have uvx; then
     ok "uv present — Serena runs on demand via uvx (no install step)"
-    for tc in dotnet java; do
-      have "$tc" && ok "  $tc toolchain present" \
-                 || warn "  $tc missing — Serena cannot analyse that language"
+    # Probed by RUNNING each one, not by `command -v`. macOS ships a /usr/bin/java
+    # stub that exists and then reports "unable to locate a Java Runtime", so
+    # presence on PATH is not the same fact as a usable toolchain -- and the
+    # difference used to surface only as an empty `cs refs` result.
+    for tc in dotnet java node; do
+      case "$tc" in
+        java) runs=$(java -version >/dev/null 2>&1 && echo 1 || echo 0) ;;
+        *)    runs=$("$tc" --version >/dev/null 2>&1 && echo 1 || echo 0) ;;
+      esac
+      if have "$tc" && [[ "$runs" == 1 ]]; then
+        ok "  $tc toolchain present"
+      else
+        warn "  $tc missing or not runnable — Serena cannot analyse that language;"
+        info "      cs impls / cs refs now REFUSE there rather than reporting 'resolved · 0 hit(s)'"
+      fi
     done
   else
     warn "uv missing — cs impls / cs refs unavailable (install: brew install uv)"

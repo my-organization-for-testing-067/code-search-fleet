@@ -46,6 +46,11 @@ info()  { printf '%s\n' "$*" >&2; }
 ok()    { printf '%s✓%s %s\n' "$C_GREEN" "$C_OFF" "$*" >&2; }
 warn()  { printf '%s!%s %s\n' "$C_YELLOW" "$C_OFF" "$*" >&2; }
 err()   { printf '%s✗%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; }
+# Exit 1 is `cs`'s REFUSAL code, and every refusal path in cs routes through
+# here. It is deliberately distinct from 2, which cs returns for a query that
+# ran honestly and found nothing -- see the exit-code table in scripts/cs. Both
+# used to be 1, which made the difference between "this search did not happen"
+# and "this search happened and the answer is no" undetectable to a caller.
 die()   { err "$*"; exit 1; }
 
 # List fleet repos (directory name only), one per line.

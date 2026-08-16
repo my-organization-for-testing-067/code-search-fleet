@@ -156,6 +156,40 @@ probe_serena() {
   fi
 }
 
+# Serena is a DRIVER for a language server, and a language server needs its
+# language's toolchain. `probe_serena` above only exercises C#, so on a machine
+# with a .NET SDK and no JVM it reports PASS while `cs impls` on every Kotlin
+# and Java repo in the fleet is unable to run -- a gap that was visible only
+# after a query came back empty, and only to someone who knew why.
+#
+# Probed by RUNNING each toolchain, not by `command -v`: "on PATH but fails to
+# run" is a real state and is indistinguishable from a working one until a
+# query returns nothing. MISSING rather than FAIL, because an absent SDK is a
+# fact about the machine, not a regression in an engine.
+probe_toolchains() {
+  local tc ver langs
+  for tc in dotnet java node; do
+    case "$tc" in
+      dotnet) langs="C#" ;;
+      java)   langs="Java/Kotlin" ;;
+      node)   langs="TypeScript/JavaScript" ;;
+    esac
+    if ! command -v "$tc" >/dev/null 2>&1; then
+      record "$tc" "-" capability MISSING "Serena cannot analyse $langs — cs impls/refs refuse there"
+      continue
+    fi
+    case "$tc" in
+      java) ver=$(java -version 2>&1 | head -1 | awk -F'"' '{print $2}') ;;
+      *)    ver=$("$tc" --version 2>/dev/null | head -1) ;;
+    esac
+    if [[ -n "$ver" ]]; then
+      record "$tc" "$ver" capability PASS "Serena can analyse $langs"
+    else
+      record "$tc" "?" capability MISSING "on PATH but did not run — Serena cannot analyse $langs"
+    fi
+  done
+}
+
 # tokensave is probed on a limitation rather than a capability: its C# graph has
 # no `implements` edges, which is why it lost the routing. If a release fixes
 # that, this reports IMPROVED and the decision should be revisited -- upgrades
@@ -182,6 +216,7 @@ probe_ast_grep
 probe_semgrep
 probe_tokensave
 probe_serena
+probe_toolchains
 
 # ---- report -----------------------------------------------------------------
 printf '\n%-12s %-14s %-16s %-10s %s\n' ENGINE VERSION KIND OUTCOME NOTE

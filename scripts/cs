@@ -59,6 +59,18 @@
 #                    repo keeps hand-written source there (`cs engines` prints
 #                    the effective list)
 #
+# Exit codes:
+#   0  the query ran and found at least one hit
+#   1  REFUSAL -- the query did not run (no fleet root, a missing required
+#      dependency, an unknown workspace, unparseable arguments). Nothing was
+#      searched, so nothing was ruled out.
+#   2  the query ran honestly and found nothing.
+#
+# 1 and 2 are opposite facts and used to be the same number, which left the
+# distinction available only as prose on stderr -- so `if cs uses "$x"; then …`
+# reported "unused" for a typo'd FLEET_ROOT, the exact false negative the whole
+# design is organised against. Branch on the code, not on the message.
+#
 # Requires: python3 (uses, provides, deps, publishes, versions, owns, impls,
 # refs). Everything else is optional -- `cs engines` reports what is present,
 # and cs routes around what is not.
@@ -67,6 +79,19 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/lib" && pwd)"
 root="${FLEET_ROOT:-$PWD}"
+
+# ---- exit codes ------------------------------------------------------------
+# Three outcomes, three codes. A refusal ("this search did not happen") and a
+# zero-hit answer ("this search happened and the answer is no") are opposite
+# facts, and both used to exit 1 -- so the tool's central promise existed only
+# as prose on stderr, which a script discards and an agent skips under context
+# pressure. `die()` in common.sh already exits REFUSED; the zero-hit sites
+# return NO_HITS.
+#
+# 1 stays the refusal so that anything already checking "did this fail" keeps
+# working; 2 is the newly distinguishable case.
+CS_EXIT_REFUSED=1
+CS_EXIT_NO_HITS=2
 
 # Refuse to answer rather than answer "nothing found" from an empty or missing
 # fleet. A negative result is the answer that makes a breaking change look safe,
@@ -143,6 +168,10 @@ cleanup_view() {
   # A half-built symbol index, if ctags was interrupted. Named per-process, so
   # this only ever removes our own.
   rm -f "${TMPDIR:-/tmp}"/cs-tags-*."$$".building 2>/dev/null
+  # Same reasoning for the language server's raw response and its diagnostics:
+  # the paths that refuse on a malformed answer exit through die(), which does
+  # not come back to a rm.
+  rm -f "${TMPDIR:-/tmp}"/cs-serena."$$".* "${TMPDIR:-/tmp}"/cs-serena-err."$$".* 2>/dev/null
   return 0
 }
 # INT and TERM as well as EXIT: bash does not run an EXIT trap for an
@@ -408,6 +437,126 @@ ctags_bin() {
   return 1
 }
 
+# ---- language toolchains ---------------------------------------------------
+# Serena is a DRIVER for a language server, and a language server needs its
+# language's toolchain: a .NET SDK to load a C# project, a JVM for Java or
+# Kotlin, node for TypeScript. The preflight in `cs refs` / `cs impls` used to
+# check uvx, python3 and the repo directory -- the driver and its plumbing, none
+# of which say anything about whether the language can be analysed. All three
+# passed on a machine with no SDK, the server loaded nothing, and the empty
+# result was printed as
+#
+#     answer: resolved via serena (LSP) · 0 hit(s)
+#
+# which is the STRONGEST negative this tool can emit ("no reference, within that
+# one repo"), asserted about a repo where nothing had been read. That is the
+# failure mode the project exists to prevent, reproduced inside the tool.
+#
+# `bootstrap` already probed dotnet and java and said "Serena cannot analyse
+# that language" -- but bootstrap is optional and its knowledge never reached
+# the query path. This is that knowledge, moved to where the query is.
+#
+# Probed by RUNNING the binary, not by `command -v` alone, for the same reason
+# require_python3 does: "on PATH but fails to run" is a real state, and it is
+# indistinguishable from a working toolchain until a query comes back empty.
+have_toolchain() {
+  command -v "$1" >/dev/null 2>&1 || return 1
+  case "$1" in
+    java) java -version >/dev/null 2>&1 ;;   # JDK 8 has no --version
+    *)    "$1" --version >/dev/null 2>&1 ;;
+  esac
+}
+
+# The mapping is deliberately short. A toolchain named here and absent produces
+# a REFUSAL, so a wrong entry blocks a query that would have worked -- which is
+# its own kind of damage. These three are the runtimes the server itself cannot
+# start without; a language not listed is not preflighted, and `cs why resolved`
+# says so rather than implying the check was made.
+language_toolchain() {  # <language> -> the binary its language server needs
+  case "$1" in
+    csharp)                echo dotnet ;;
+    java|kotlin)           echo java ;;
+    typescript|javascript) echo node ;;
+    *) return 1 ;;
+  esac
+}
+toolchain_languages() {  # <toolchain> -> the languages it unblocks, for messages
+  case "$1" in
+    dotnet) echo "C#" ;;
+    java)   echo "Java/Kotlin" ;;
+    node)   echo "TypeScript/JavaScript" ;;
+  esac
+}
+toolchain_install() {
+  case "$1" in
+    dotnet) echo "brew install --cask dotnet-sdk   (or https://dot.net)" ;;
+    java)   echo "brew install openjdk             (any JDK)" ;;
+    node)   echo "brew install node" ;;
+  esac
+}
+CS_TOOLCHAINS="dotnet java node"
+
+# The dominant source language of a repo, or nothing if it cannot be told.
+#
+# Extension counts, walked in rank order rather than taking the single commonest
+# extension: a repo's most numerous file type is often .json or .yml, which
+# names no language at all. The first ranked extension that IS a language wins.
+repo_language() {
+  local dir="$1" ranked n ext
+  ranked=$(find -L "$dir" -type d \( -name .git -o -name node_modules -o -name vendor \
+             -o -name target -o -name build -o -name dist -o -name obj -o -name bin \
+             -o -name .venv -o -name __pycache__ \) -prune -o -type f -print 2>/dev/null \
+           | sed -n 's/.*\.\([A-Za-z0-9_]\{1,\}\)$/\1/p' \
+           | tr 'A-Z' 'a-z' | sort | uniq -c | sort -rn)
+  [[ -n "$ranked" ]] || return 1
+  while read -r n ext; do
+    [[ -n "$ext" ]] || continue
+    case "$ext" in
+      cs)             echo csharp;     return 0 ;;
+      java)           echo java;       return 0 ;;
+      kt|kts)         echo kotlin;     return 0 ;;
+      ts|tsx)         echo typescript; return 0 ;;
+      js|jsx|mjs|cjs) echo javascript; return 0 ;;
+      py)             echo python;     return 0 ;;
+      go)             echo go;         return 0 ;;
+      rs)             echo rust;       return 0 ;;
+    esac
+  done <<EOF
+$ranked
+EOF
+  return 1
+}
+
+# require_serena_toolchain <subcommand> <symbol> <repo-name> <repo-dir>
+#
+# Refuses rather than answering, and refuses BEFORE `answer resolved` is set, so
+# there is no path on which the label reaches stdout for a query that could not
+# have run.
+require_serena_toolchain() {
+  local sub="$1" sym="$2" repo="$3" dir="$4" lang tc
+  if ! lang=$(repo_language "$dir"); then
+    warn "could not tell what language $repo is written in — if Serena cannot load it, an empty result here would look like a clean negative (cs why resolved)"
+    return 0
+  fi
+  if ! tc=$(language_toolchain "$lang"); then
+    # Not preflighted rather than known-good. Said out loud, because silence
+    # here would read as "checked and fine".
+    warn "$repo looks like $lang, which cs does not preflight — if Serena cannot analyse it, this returns empty rather than refusing (cs why resolved)"
+    return 0
+  fi
+  have_toolchain "$tc" && return 0
+  die "cs $sub cannot analyse $repo: it is $lang, and Serena needs $tc to load it
+  $tc is missing or not runnable, so the language server would start, fail to
+  load the project, and return nothing — which cs would have labelled
+  'resolved · 0 hit(s)', the strongest negative in the taxonomy, about a repo
+  where nothing was read. Refusing instead.
+  install it: $(toolchain_install "$tc")
+  check:      cs engines   (per-kind availability, including this)
+  weaker but available now:
+    cs def $sym $repo      (structural: ctags, matches spelling not identity)
+    cs uses '$sym'         (heuristic: text, comments filtered — cs why heuristic)"
+}
+
 # Normalize "path:line:text" to "path:line: text" with the fleet prefix removed.
 normalize() { sed -e "s|^${view}/||" -e "s|^${root}/||" -e 's|^\./||'; }
 
@@ -497,6 +646,123 @@ X
   esac
 }
 
+# ---- which answer kinds are reachable on this machine -----------------------
+# `cs engines` reported which BINARIES were present. The contract is expressed
+# in answer KINDS, and nothing connected the two, so translating
+#
+#     ast-grep     MISSING
+#     semgrep      MISSING
+#
+# into the fact that actually matters -- the whole `structural` tier is gone and
+# `cs calls` will refuse -- required already knowing the routing table. Five
+# rows saying `ok` next to two saying MISSING reads as a healthy install.
+#
+# It matters because the skill tells the agent to weigh every negative by its
+# kind, and marks heuristic weak and textual weakest. "Which kinds can I get
+# right now" therefore decides whether a negative from this machine is worth
+# anything at all -- and there is a realistic configuration (no ast-grep, no
+# semgrep, no language toolchain) where BOTH strong code-derived kinds are gone
+# and nothing says so.
+#
+# So the routing table is written down once, here, and `cs engines` and `cs why`
+# both read it instead of keeping their own hand-maintained lists.
+kind_subcommands() {
+  case "$1" in
+    resolved)   echo "cs impls, cs refs" ;;
+    declared)   echo "cs provides, cs deps, cs publishes, cs versions, cs owns" ;;
+    structural) echo "cs calls, cs def" ;;
+    historical) echo "cs history" ;;
+    heuristic)  echo "cs uses" ;;
+    textual)    echo "cs text, cs seam" ;;
+  esac
+}
+
+# Roll-call of the language toolchains Serena needs, e.g.
+# "dotnet ok, java MISSING (Java/Kotlin), node ok".
+toolchain_roll_call() {
+  local tc out=""
+  for tc in $CS_TOOLCHAINS; do
+    if have_toolchain "$tc"; then out="$out, $tc ok"
+    else out="$out, $tc MISSING ($(toolchain_languages "$tc"))"; fi
+  done
+  printf '%s\n' "${out#, }"
+}
+
+# kind_status <kind> -> "<state>|<detail>", state in ok|degraded|unavailable.
+#
+# `degraded` is a third state on purpose, and keeping it separate from
+# `unavailable` is the point: ripgrep absent still yields `textual` through the
+# POSIX grep fallback, which is a slower route to the same kind, not a missing
+# kind. Collapsing the two would either hide a real gap or invent one.
+kind_status() {
+  local n_missing=0 n_present=0 tc
+  case "$1" in
+    resolved)
+      if ! have uvx; then
+        echo "unavailable|needs uv — Serena runs via uvx and it is not installed → cs impls / cs refs refuse"
+        return
+      fi
+      for tc in $CS_TOOLCHAINS; do
+        if have_toolchain "$tc"; then n_present=$((n_present + 1)); else n_missing=$((n_missing + 1)); fi
+      done
+      if [[ $n_missing -eq 0 ]]; then
+        echo "ok|serena (LSP) via uvx; toolchains: $(toolchain_roll_call)"
+      elif [[ $n_present -eq 0 ]]; then
+        echo "unavailable|serena needs a toolchain per language and none are runnable: $(toolchain_roll_call) → cs impls / cs refs refuse for every preflighted language"
+      else
+        echo "degraded|$(toolchain_roll_call) → cs impls / cs refs refuse for the missing languages"
+      fi
+      ;;
+    declared)
+      if have_python3; then echo "ok|python3 reads the build manifests and CODEOWNERS"
+      else echo "unavailable|needs python3, which is not runnable → cs provides / deps / publishes / versions / owns refuse"; fi
+      ;;
+    structural)
+      # Two independent backers behind one kind: ast-grep-or-semgrep answers
+      # `cs calls`, ctags answers `cs def`. Losing one is not losing the tier,
+      # so the consequence is named per subcommand rather than per kind.
+      local have_calls=0 have_def=0
+      { have ast-grep || have semgrep; } && have_calls=1
+      ctags_bin >/dev/null 2>&1 && have_def=1
+      if [[ $have_calls -eq 1 && $have_def -eq 1 ]]; then
+        echo "ok|ast-grep/semgrep for cs calls, ctags for cs def"
+      elif [[ $have_calls -eq 0 && $have_def -eq 0 ]]; then
+        echo "unavailable|needs ast-grep or semgrep, and universal-ctags — none installed → cs calls and cs def both refuse"
+      elif [[ $have_calls -eq 0 ]]; then
+        echo "degraded|neither ast-grep nor semgrep installed → cs calls refuses; cs def still answers via ctags"
+      else
+        echo "degraded|universal-ctags not installed → cs def refuses; cs calls still answers"
+      fi
+      ;;
+    historical)
+      if have git; then echo "ok|git log -S / -G"
+      else echo "unavailable|needs git, which is not installed → cs history refuses"; fi
+      ;;
+    heuristic)
+      if have_python3; then echo "ok|$(text_engine) plus the python3 prose filter"
+      else echo "unavailable|the prose filter needs python3, which is not runnable → cs uses refuses"; fi
+      ;;
+    textual)
+      if have_rg_binary; then echo "ok|ripgrep"
+      else echo "degraded|no ripgrep binary — POSIX grep fallback, same results, slower"; fi
+      ;;
+  esac
+}
+
+# The kinds view, shared by `cs engines` and `cs why`. Two lines per kind: what
+# you can get, then what you lose if you cannot get it.
+print_kinds_table() {
+  local kind row state detail
+  printf '%-12s %s\n' "ANSWER KIND" "STATUS"
+  for kind in resolved declared structural historical heuristic textual; do
+    row=$(kind_status "$kind")
+    state="${row%%|*}"; detail="${row#*|}"
+    [[ "$state" == ok ]] || state=$(printf '%s' "$state" | tr 'a-z' 'A-Z')
+    printf '%-12s %s — %s\n' "$kind" "$state" "$detail"
+    printf '%-12s   backs: %s\n' "" "$(kind_subcommands "$kind")"
+  done
+}
+
 # Print the provenance line. Goes to stderr, so stdout stays exactly the
 # scoreable "repo/path:line: text" stream every caller and score-seams expect.
 report_answer() {
@@ -570,6 +836,22 @@ cmd_engines() {
   else printf '%-12s %s\n' "serena" "MISSING (needs uv)"; fi
   if have git; then printf '%-12s %s\n' "git" "ok (cs history)"; n=$((n+1))
   else printf '%-12s %s\n' "git" "MISSING (cs history unavailable)"; fi
+  # Serena is a driver, not an analyser: uvx present says nothing about whether
+  # a C# or Kotlin project can be LOADED. Reported here so the gap is visible
+  # before a query is run, rather than only after one returns empty.
+  local tc
+  for tc in $CS_TOOLCHAINS; do
+    if have_toolchain "$tc"; then
+      printf '%-12s %s\n' "$tc" "ok (Serena can analyse $(toolchain_languages "$tc"))"
+    else
+      printf '%-12s %s\n' "$tc" "MISSING — Serena cannot analyse $(toolchain_languages "$tc"); cs impls/refs refuse there"
+    fi
+  done
+
+  # Binaries are not the fact a caller needs. This is.
+  printf '\n'
+  print_kinds_table
+
   printf '\nfleet root:  %s\n' "$root"
   printf 'text engine: %s\n' "$(text_engine)"
   printf 'result cap:  %s\n' \
@@ -583,7 +865,12 @@ cmd_engines() {
   # directory excluded by mistake looks exactly like a directory with no hits.
   printf 'skipping:    %s\n' "$(printf '%s ' ${CS_EXCLUDE_DIRS[@]+"${CS_EXCLUDE_DIRS[@]}"})"
   printf '             (CS_EXCLUDE_EXTRA adds, CS_EXCLUDE_REMOVE subtracts)\n'
-  [[ $n -gt 0 ]]
+  # Exits 0 whatever it found. Under the exit-code contract, 1 means "the query
+  # did not run" -- and a diagnostic that ran, printed a full report, and then
+  # claimed to have refused is exactly the confusion the codes exist to remove.
+  # What is missing is in the report; the status says only that reporting worked.
+  [[ $n -gt 0 ]] || warn "no optional engine is installed — see the ANSWER KIND table above for what that costs"
+  return 0
 }
 
 hint() { info ""; info "${C_BOLD}nothing found — try:${C_OFF}"; while [[ $# -gt 0 ]]; do info "  $1"; shift; done; }
@@ -596,7 +883,7 @@ cmd_text() {
     report_answer 0 0
     hint "cs def $1              (it may be a symbol, not literal text)" \
          "cs calls '<pattern>'   (it may only appear as a call shape)"
-    return 1
+    return $CS_EXIT_NO_HITS
   fi
   emit_capped "$out"
   report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
@@ -613,7 +900,7 @@ cmd_seam() {
   if [[ -z "$hits" ]]; then
     info "no repo mentions '$1'"
     report_answer 0 0
-    return 1
+    return $CS_EXIT_NO_HITS
   fi
   repos=$(printf '%s\n' "$hits" | cut -d/ -f1 | sort -u)
   n=$(printf '%s\n' "$repos" | grep -c '')
@@ -704,7 +991,7 @@ cmd_uses() {
       printf '%s\n' "$prose" >&2
     fi
     report_answer 0 0
-    return 1
+    return $CS_EXIT_NO_HITS
   fi
   [[ -n "$unsupported" ]] && warn "comments were NOT filtered in: $unsupported — hits in those files may be prose (cs why heuristic)"
   emit_capped "$hits"
@@ -800,7 +1087,7 @@ cmd_def() {
     report_answer 0 0
     hint "cs text '$1'           (ctags misses symbols built dynamically)" \
          "cs refs $1 <repo> <file>  (for a precise, LSP-backed answer)"
-    return 1
+    return $CS_EXIT_NO_HITS
   fi
   emit_capped "$out"
   # Two repos defining the same name is the failure mode this cannot resolve:
@@ -825,7 +1112,7 @@ cmd_provides() {
     report_answer 0 0
     hint "cs publishes           (what every repo declares that it publishes)" \
          "cs seam '$1'           (the coordinate may be referenced but not declared here)"
-    return 1
+    return $CS_EXIT_NO_HITS
   fi
   printf '%s\n' "$out"
   report_answer
@@ -864,7 +1151,7 @@ cmd_versions() {
     hint "cs deps               (the coordinate may be spelled differently in the manifest)" \
          "cs provides '${1:-<coordinate>}'   (confirm a fleet repo publishes it at all)" \
          "cs versions           (with no argument: every coordinate the fleet declares)"
-    return 1
+    return $CS_EXIT_NO_HITS
   fi
   printf '%s\n' "$out"
   # DRIFT is the finding; say so rather than leaving it in the table. A version
@@ -899,12 +1186,22 @@ cmd_owns() {
   out=$(python3 "$lib_dir/owners.py" "$view" "$mode" ${arg:+"$arg"} 2>"$err_file"); rc=$?
   if [[ -s "$err_file" ]]; then cat "$err_file" >&2; fi
   rm -f "$err_file"
-  if [[ $rc -ne 0 || -z "$out" ]]; then
+  # The two halves used to share one branch and one exit code. owners.py failing
+  # is a REFUSAL -- the CODEOWNERS files were never read, so no rule was ruled
+  # out -- while owners.py succeeding with no rows is an honest "nothing names
+  # this". Collapsing them is the same mistake as collapsing a missing fleet
+  # root into "nothing found".
+  if [[ $rc -ne 0 ]]; then
+    die "cs owns: could not read CODEOWNERS across the fleet (owners.py exited $rc)
+  nothing was parsed, so this is not 'nobody owns it'
+  check: cs repos (is the view what you expect?)"
+  fi
+  if [[ -z "$out" ]]; then
     report_answer 0 0
     hint "cs owns               (which repos declare ownership at all)" \
          "cs owns <repo>        (every rule in one repo)" \
          "cs repos              (the exact repo names in view)"
-    return 1
+    return $CS_EXIT_NO_HITS
   fi
   printf '%s\n' "$out"
   # Stated every time, because a CODEOWNERS answer is the one most likely to be
@@ -954,10 +1251,50 @@ cmd_calls() {
     # caller cannot tell them apart from an empty result.
     hint "cs text '$pattern'     (a structural engine returns nothing for a language it cannot parse — same as no match)" \
          "cs calls '$pattern' <lang>   (naming the language makes an unsupported one an error rather than silence)"
-    return 1
+    return $CS_EXIT_NO_HITS
   fi
   emit_capped "$out"
   report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
+}
+
+# The second layer of the same guard as require_serena_toolchain, and the one
+# that does not depend on knowing the language: never label `resolved` a
+# zero-hit result the engine did not AFFIRMATIVELY produce.
+#
+# `answer resolved` used to be set before the call and survived every outcome --
+# a server that errored, a call that timed out, a project that failed to load.
+# All three arrived at the same `report_answer 0 0` as a genuine "no references
+# exist", and only the genuine case is a negative result at all. The others are
+# the absence of an answer, and the distinction is invisible from the empty
+# string a single `out=$(… | …)` pipeline leaves behind.
+#
+# Called only when the formatted output is empty, so a partial-but-non-empty
+# result still reaches the caller with its PARTIAL warning attached.
+serena_answered_or_die() {  # <rc> <raw-file> <stderr-file> <subcommand> <symbol> <repo>
+  local rc="$1" raw="$2" ef="$3" sub="$4" sym="$5" repo="$6" detail
+  detail=$(head -3 "$ef" 2>/dev/null | tr '\n' ' ')
+  # Checked before the exit status, because a timeout is the more specific
+  # diagnosis and run_timed reports it as a non-zero rc of its own.
+  if timed_out; then
+    die "cs $sub: the language server hit the ${CS_TIMEOUT:-120}s timeout on '$sym' in $repo — PARTIAL, not an answer
+  it did not finish, so there is nothing here to call a negative; a 'resolved'
+  label on an unfinished run would be the strongest claim on the weakest evidence
+  raise CS_TIMEOUT and rerun, or fall back to: cs def $sym $repo"
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    die "cs $sub: the language server did not answer for '$sym' in $repo (serena exited $rc)
+  ${detail:-no diagnostic was produced}
+  nothing was analysed, so this is NOT 'resolved · 0 hit(s)' — nothing was ruled out
+  check: cs engines   (is this language's toolchain installed and runnable?)
+  weaker but available now: cs def $sym $repo, cs uses '$sym'"
+  fi
+  if [[ ! -s "$raw" ]]; then
+    die "cs $sub: the language server exited cleanly but returned no content for '$sym' in $repo
+  an empty response is not an empty result set — the project may have failed to load
+  check: cs engines   (per-kind availability, including the language toolchains)
+  weaker but available now: cs def $sym $repo, cs uses '$sym'"
+  fi
+  return 0
 }
 
 # The LSP-backed answers are the only ones that resolve an interface to its
@@ -968,7 +1305,7 @@ cmd_impls() {
   require_python3 impls "driving the language server and formatting its answer"
   local repo_dir="$view/$2" file="${3:-}"
   [[ -d "$repo_dir" ]] || die "no such repo: $2"
-  answer resolved "serena (LSP)" "scoped to $2"
+  require_serena_toolchain impls "$1" "$2" "$repo_dir"
 
   # Serena identifies a symbol by name_path plus the file holding it, so the
   # symbol is looked up first rather than assuming a bare name is enough.
@@ -993,25 +1330,43 @@ if pick:
   name_path=$(printf '%s' "$resolved" | cut -f1)
   rel=$(printf '%s' "$resolved" | cut -f2)
   [[ -n "$file" ]] && rel="$file"
+  # A REFUSAL, not a zero-hit answer: find_implementations was never called, so
+  # no implementation was ruled out. It reported the same exit code as a real
+  # empty result set, which is the distinction this whole taxonomy turns on.
   if [[ -z "$name_path" || -z "$rel" ]]; then
-    err "could not locate symbol '$1' in $2"
+    err "could not locate symbol '$1' in $2 — find_implementations was not run, so nothing was ruled out"
     hint "cs def $1 $2            (check the symbol exists and how it is spelled)"
-    return 1
+    return $CS_EXIT_REFUSED
   fi
 
+  # Run as two steps rather than one pipeline, because the pipeline collapsed
+  # exactly the two outcomes that must never be confused: a server that produced
+  # no answer, and a server that answered "none". Both left "$out" empty.
+  #
   # Formatted and capped like every other subcommand. Raw Serena JSON was both
   # unscoreable and uncapped, so the one engine whose answers are strongest was
   # also the one whose output could flood a context window unannounced.
-  local out
-  out=$(run_timed python3 "$lib_dir/serena_call.py" "$repo_dir" find_implementations \
+  local out raw err_file rc
+  raw=$(mktemp -t "cs-serena.$$"); err_file=$(mktemp -t "cs-serena-err.$$")
+  run_timed python3 "$lib_dir/serena_call.py" "$repo_dir" find_implementations \
         "{\"name_path\":\"$name_path\",\"relative_path\":\"$rel\"}" \
-        | python3 "$lib_dir/serena_fmt.py" "$2")
+        >"$raw" 2>"$err_file"; rc=$?
+  if [[ -s "$err_file" ]]; then cat "$err_file" >&2; fi
+  out=$(python3 "$lib_dir/serena_fmt.py" "$2" < "$raw")
   if [[ -z "$out" ]]; then
+    # Dies unless the emptiness is an answer rather than the absence of one.
+    serena_answered_or_die "$rc" "$raw" "$err_file" impls "$1" "$2"
+    rm -f "$raw" "$err_file"
+    answer resolved "serena (LSP)" "scoped to $2"
     report_answer 0 0
     hint "cs def $1              (confirm the symbol is spelled as the server sees it)" \
          "cs calls '<pattern>'   (an implementation the server could not load is invisible here)"
-    return 1
+    return $CS_EXIT_NO_HITS
   fi
+  rm -f "$raw" "$err_file"
+  # Set only now, once the server has affirmatively produced something. The
+  # label used to be assigned before the call and survived every failure.
+  answer resolved "serena (LSP)" "scoped to $2"
   emit_capped "$out"
   report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
 }
@@ -1022,17 +1377,28 @@ cmd_refs() {
   require_python3 refs "driving the language server and formatting its answer"
   local repo_dir="$view/$2"
   [[ -d "$repo_dir" ]] || die "no such repo: $2"
-  answer resolved "serena (LSP)" "scoped to $2"
-  local out
-  out=$(run_timed python3 "$lib_dir/serena_call.py" "$repo_dir" find_referencing_symbols \
+  # Before `answer resolved` is set, and before the server is started: uvx,
+  # python3 and the repo directory all passing says nothing about whether this
+  # language can be loaded at all.
+  require_serena_toolchain refs "$1" "$2" "$repo_dir"
+  local out raw err_file rc
+  raw=$(mktemp -t "cs-serena.$$"); err_file=$(mktemp -t "cs-serena-err.$$")
+  run_timed python3 "$lib_dir/serena_call.py" "$repo_dir" find_referencing_symbols \
         "{\"name_path\":\"$1\",\"relative_path\":\"$3\"}" \
-        | python3 "$lib_dir/serena_fmt.py" "$2")
+        >"$raw" 2>"$err_file"; rc=$?
+  if [[ -s "$err_file" ]]; then cat "$err_file" >&2; fi
+  out=$(python3 "$lib_dir/serena_fmt.py" "$2" < "$raw")
   if [[ -z "$out" ]]; then
+    serena_answered_or_die "$rc" "$raw" "$err_file" refs "$1" "$2"
+    rm -f "$raw" "$err_file"
+    answer resolved "serena (LSP)" "scoped to $2"
     report_answer 0 0
     hint "cs def $1 $2            (confirm the symbol and file are right)" \
          "cs uses '$1'           (a reference across a repo boundary is a string, not a symbol)"
-    return 1
+    return $CS_EXIT_NO_HITS
   fi
+  rm -f "$raw" "$err_file"
+  answer resolved "serena (LSP)" "scoped to $2"
   emit_capped "$out"
   report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
 }
@@ -1092,7 +1458,7 @@ cmd_history() {
     report_answer 0 0
     hint "cs seam '$want'        (confirm any repo contains it at all)" \
          "cs history '<shorter substring>'   (a reformat can hide the original spelling)"
-    return 1
+    return $CS_EXIT_NO_HITS
   fi
   # Sorted by date across every repo, because the point is the interleaving:
   # a producer's change landing days before a consumer's incident is the signal.
@@ -1119,6 +1485,16 @@ cmd_repos() {
 cmd_why() {
   if [[ $# -ge 1 ]]; then
     blind_spots "$1" || die "unknown answer kind: $1 (resolved, declared, structural, historical, heuristic, textual)"
+    # The blind spots above are what the kind cannot see IN PRINCIPLE. Whether
+    # you can get an answer of this kind AT ALL on this machine is a different
+    # question with the same consequence, and it was only answerable by reading
+    # `cs engines` and knowing the routing table by heart.
+    local row state detail
+    row=$(kind_status "$1")
+    state="${row%%|*}"; detail="${row#*|}"
+    [[ "$state" == ok ]] || state=$(printf '%s' "$state" | tr 'a-z' 'A-Z')
+    printf '\nOn this machine: %s is %s — %s\n' "$1" "$state" "$detail"
+    printf 'Backs: %s\n' "$(kind_subcommands "$1")"
     return 0
   fi
   cat <<'TABLE'
@@ -1136,7 +1512,20 @@ heuristic   low     text match, prose filtered     weak
 textual     lowest  ripgrep / grep                 weak
 
 Run `cs why <kind>` for what that kind specifically cannot see.
+
+EXIT CODES -- a refusal and a zero-hit answer are opposite facts, so they are
+different numbers. Branch on the code rather than reading the message:
+
+  0   the query ran and found at least one hit
+  1   REFUSAL -- the query did not run. Nothing was searched, so nothing was
+      ruled out. Fix the cause; do not fall back to grep.
+  2   the query ran honestly and found nothing. Weigh it by the kind above.
+
 TABLE
+  # Which kinds are reachable here, not only what each cannot see. A kind whose
+  # every backing engine is missing produces no answers at all, and that was
+  # visible nowhere.
+  print_kinds_table
 }
 
 fleet_only=0

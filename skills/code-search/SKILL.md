@@ -47,6 +47,25 @@ zero hits that would read exactly like a real "nothing uses this". If `cs`
 reports python3 missing, tell the user; `cs seam` still works without it, but
 counts comments as hits.
 
+**Read the `ANSWER KIND` table in `cs engines`, not just the binary list.** The
+binaries are not the decision-relevant fact — which *kinds* of answer this
+machine can produce is, because that is what the negative results are worth:
+
+```
+ANSWER KIND  STATUS
+structural   UNAVAILABLE — needs ast-grep or semgrep, neither installed → cs calls and cs def both refuse
+               backs: cs calls, cs def
+resolved     DEGRADED — dotnet ok, java MISSING (Java/Kotlin), node ok → cs impls / cs refs refuse for the missing languages
+               backs: cs impls, cs refs
+```
+
+There is a realistic install where both *strong* code-derived kinds are gone —
+no ast-grep and no semgrep removes `structural`, and a missing language
+toolchain removes `resolved` for that language — while five of the seven binary
+rows still say `ok`. If a kind you were about to rely on is `UNAVAILABLE`, say
+so rather than falling back to a weaker kind silently. `cs why <kind>` also
+reports whether that kind is reachable here.
+
 ## Which subcommand
 
 Run `cs which` for this table at any time.
@@ -124,17 +143,43 @@ Four warnings `cs` emits that you must pass on rather than swallow:
 
 ## When cs refuses, it is protecting you from a false negative
 
-`cs` exits non-zero with an explanation rather than returning an empty result
-when it cannot answer honestly: no such fleet root, no repos in it, python3
-missing, or `--ticket=<id>` naming a workspace that does not exist. **Do not
-work around a refusal by falling back to raw `grep`** — the refusal means the
+`cs` exits `1` with an explanation rather than returning an empty result when it
+cannot answer honestly: no such fleet root, no repos in it, python3 missing,
+`--ticket=<id>` naming a workspace that does not exist, or — for `cs impls` and
+`cs refs` — a repo whose **language toolchain** is not installed. **Do not work
+around a refusal by falling back to raw `grep`** — the refusal means the
 conditions for a trustworthy negative are not met, and grep's negative is
 weaker still. Fix the cause, or tell the user what is missing.
 
-Note the difference between exit codes: a refusal prints an error and explains
-what is wrong, while a *successful* query that simply found nothing prints
-`0 hit(s)` with an answer-kind label and a "nothing found — try:" hint. Both
-exit non-zero. Read which one you got before reporting "nothing uses this".
+That last one is worth naming, because it is the strongest label on the weakest
+evidence: Serena is a *driver* for a language server, and a language server
+needs a .NET SDK to load a C# project, a JVM for Java or Kotlin, node for
+TypeScript. Without it the server loads nothing and returns nothing, which used
+to print as `answer: resolved via serena (LSP) · 0 hit(s)` — "no reference,
+within that repo", asserted about a repo where nothing had been read. `cs` now
+refuses, and never labels `resolved` a result the server did not affirmatively
+produce (an error, a timeout, or an empty response all refuse instead).
+
+**Branch on the exit code, not on the message.** The three outcomes have three
+codes:
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| `0` | the query ran and found ≥1 hit | report the hits, with the answer kind |
+| `1` | **refusal** — the query did not run | fix the cause, or tell the user what is missing. Never report a negative. |
+| `2` | the query ran honestly and found nothing | weigh it by the answer kind before saying "nothing uses this" |
+
+`1` and `2` are opposite facts: one means *this search did not happen*, the
+other means *this search happened and the answer is no*. Both used to be `1`,
+which made the distinction available only as prose on stderr — so the obvious
+thing to write,
+
+```sh
+if cs uses "$route" >/dev/null 2>&1; then echo "in use"; else echo "unused"; fi
+```
+
+reported `unused` for a typo'd `FLEET_ROOT`. That is the false negative this
+whole design exists to prevent, so read the code, not the sentence.
 
 ## Finding a cause in another repo
 
@@ -276,6 +321,13 @@ installed.
 - **A structural engine returns nothing for a language it cannot parse**, which
   looks identical to "no matches". Name the language (`cs calls '<pat>' csharp`)
   to turn that silence into an error.
+- **`resolved` needs a language toolchain, not just Serena.** `cs impls` and
+  `cs refs` preflight the repo's dominant language against the runtime its
+  server needs (C# → `dotnet`, Java/Kotlin → `java`, TS/JS → `node`) and refuse
+  when it is absent. A language *outside* that mapping — Python, Go, Rust — is
+  not preflighted: `cs` warns that it did not check, and an empty result there
+  may still mean the project failed to load. Check `cs engines` before treating
+  such a negative as strong.
 - **`cs uses` filters comments by file extension**, so its coverage is a table
   rather than a parser: 106 extensions plus 13 well-known filenames. A file in
   a language outside the table is passed through unfiltered and *named* in the
