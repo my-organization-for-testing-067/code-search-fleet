@@ -47,7 +47,34 @@ fi
 info "${C_BOLD}fleet:${C_OFF} $FLEET_ROOT"
 info ""
 
+# Captured once, up front: several preconditions below are questions about this
+# machine that `cs engines` already answers, and re-running it per check would
+# be both slower and a second place for the answer to drift.
+_engines_probe=$("$here/cs" engines 2>/dev/null || true)
+
 pass=0; fail=0; failed_ids=()
+
+# A check that cannot run is not a check that passed, and it is not a failure
+# either. Both mistakes cost the same thing -- credibility. Failing where a
+# dependency is merely absent means a contributor on the machine this tool is
+# built for ("every engine is optional") sees red and cannot tell it from a
+# regression they introduced; counting a skip as a pass means a run that
+# exercised nothing still reports a clean sweep.
+#
+# So skips are counted and named, and the summary line carries all three.
+skipped=0; skipped_why=()
+skip() {  # skip <check-name> <why>
+  warn "$1 SKIPPED ($2)"
+  skipped=$((skipped + 1)); skipped_why+=("$1: $2")
+}
+
+# Whether Serena can actually analyse the C# fixture here. `cs engines` already
+# computes this -- reading it back is the same trick the timeout check uses, and
+# it keeps the toolchain table in cs as the single source of truth.
+have_dotnet_toolchain() {
+  printf '%s\n' "$_engines_probe" | grep -q '^dotnet .*ok'
+}
+have_rg_binary_here() { [[ -x "$(command -v rg 2>/dev/null || true)" ]]; }
 
 check() {
   local id="$1"; shift
@@ -76,9 +103,15 @@ else
   err "discount-engine (cs provides returned nothing)"; fail=$((fail + 1))
 fi
 
-# The LSP-backed query is slow and needs a per-language toolchain, so it is
-# skipped rather than failed when Serena cannot run here.
-if command -v uvx >/dev/null 2>&1; then
+# The fixture repo is C#, so this needs a .NET SDK as well as uv -- `cs refs`
+# now refuses without one rather than answering `resolved · 0 hit(s)`, which is
+# the whole point of that change. Treating that refusal as a wrong answer made
+# the fix look like a regression on every machine without dotnet.
+if ! command -v uvx >/dev/null 2>&1; then
+  skip "reserve-implementation" "uv not installed; cs refs unavailable"
+elif ! have_dotnet_toolchain; then
+  skip "reserve-implementation" "no .NET SDK; cs refs correctly refuses on a C# repo"
+else
   info "  running the LSP query (slow, starts a language server)…"
   refs_out=$("$here/cs" refs IInventoryStore inventory-api-dotnet \
               src/Domain/IInventoryStore.cs 2>/dev/null \
@@ -88,8 +121,6 @@ if command -v uvx >/dev/null 2>&1; then
   else
     err "reserve-implementation"; fail=$((fail + 1)); failed_ids+=("reserve-implementation")
   fi
-else
-  warn "reserve-implementation SKIPPED (uv not installed; cs refs unavailable)"
 fi
 
 # ---- engine parity ---------------------------------------------------------
@@ -145,7 +176,7 @@ if [[ -x "$(command -v rg 2>/dev/null || true)" ]]; then
   # after this one -- a test that quietly damages its own fixture.
   rm -f "$probe_repo/.github/workflows/parity-probe.yml"
 else
-  warn "engine parity SKIPPED (no ripgrep binary here; only the grep backend exists)"
+  skip "engine parity" "no ripgrep binary here; only the grep backend exists"
 fi
 
 # ---- answer provenance -----------------------------------------------------
@@ -195,7 +226,17 @@ fi
 # results", because the caller then concludes nothing uses the thing they were
 # about to change. Engines run in subshells, so the timeout has to survive a
 # process boundary to be reported at all -- which is why this is tested rather
-# than assumed. The LSP path is used because it is reliably slower than 1s.
+# than assumed.
+#
+# It used to drive this through `cs refs`, on the grounds that a language server
+# is "reliably slower than 1s". The toolchain preflight removed that guarantee:
+# on a machine with no .NET SDK, cs refs now refuses instantly, nothing times
+# out, and the check failed while reporting that timeouts were invisible. The
+# property was fine; the probe could no longer reach it.
+#
+# A stub engine that sleeps reaches it on every machine, including the ones
+# where no language server can run -- which is exactly where a timeout bug would
+# go unnoticed longest.
 #
 # The precondition is computed from a captured string rather than piped into
 # `grep -q`. Under `set -o pipefail` that pipeline reports failure whenever grep
@@ -203,11 +244,13 @@ fi
 # not a missing timeout(1) -- so merely APPENDING a line to `cs engines` output
 # turned this check into a silent SKIP. A check that downgrades itself when an
 # unrelated thing changes is worse than no check, because the run still says
-# "0 failed".
-_engines_out=$("$here/cs" engines 2>/dev/null || true)
-if command -v uvx >/dev/null 2>&1 && printf '%s\n' "$_engines_out" | grep -q '^timeout: *[0-9]'; then
-  to=$(CS_TIMEOUT=1 "$here/cs" refs IInventoryStore inventory-api-dotnet \
-        src/Domain/IInventoryStore.cs 2>&1 >/dev/null | grep -c 'PARTIAL')
+# "0 failed". This block is the mirror image of that hazard and costs the same.
+if printf '%s\n' "$_engines_probe" | grep -q '^timeout: *[0-9]'; then
+  slow=$(mktemp -d)
+  printf '#!/bin/sh\nsleep 30\n' > "$slow/rg"; chmod +x "$slow/rg"
+  to=$(PATH="$slow:$PATH" CS_TEXT_ENGINE=ripgrep CS_TIMEOUT=1 \
+       "$here/cs" seam 'reservationId' 2>&1 >/dev/null | grep -c 'PARTIAL')
+  rm -rf "$slow"
   if [[ "$to" -ge 1 ]]; then
     ok "a timed-out engine reports PARTIAL, not empty"; pass=$((pass + 1))
   else
@@ -215,7 +258,7 @@ if command -v uvx >/dev/null 2>&1 && printf '%s\n' "$_engines_out" | grep -q '^t
     failed_ids+=("timeout-visibility")
   fi
 else
-  warn "timeout visibility SKIPPED (needs uv and a timeout(1); brew install coreutils)"
+  skip "timeout visibility" "no timeout(1) on this machine; brew install coreutils"
 fi
 
 # A negative result must not be silent about being weak evidence, and a capped
@@ -274,7 +317,7 @@ if [[ -f "$hist_file" ]]; then
     git -C "$hist_repo" reset --hard -q "$hist_base" 2>/dev/null
   fi
 else
-  warn "history checks SKIPPED (fixture layout changed)"
+  skip "history checks" "fixture layout changed"
 fi
 
 # ---- two-level view --------------------------------------------------------
@@ -334,7 +377,7 @@ if [[ $worktrees_ok -eq 1 ]]; then
     git -C "$FLEET_ROOT/$r" branch -D verify/layering >/dev/null 2>&1 || true
   done
 else
-  warn "could not create worktrees; layering untested"
+  skip "two-level view" "could not create git worktrees here"
 fi
 rm -rf "$tickets_tmp"
 
@@ -581,13 +624,18 @@ fi
 # Both backends are checked, since each builds its own flag array.
 excl_all=$("$here/cs" engines 2>/dev/null | grep '^skipping' | sed 's/^skipping: *//')
 excl_bad=()
-for eng in ripgrep grep; do
+# Built from what is installed. Forcing CS_TEXT_ENGINE=ripgrep on a machine
+# with no ripgrep binary cannot return hits, so the check reported a broken
+# exclusion list when the exclusion list was fine.
+excl_engines=(grep)
+have_rg_binary_here && excl_engines=(ripgrep grep)
+for eng in "${excl_engines[@]}"; do
   n=$(CS_EXCLUDE_REMOVE="$excl_all" CS_TEXT_ENGINE="$eng" \
       "$here/cs" seam 'orders.reserved.v1' --quiet 2>/dev/null | grep -c 'EventPublisher')
   [[ "$n" -ge 1 ]] || excl_bad+=("$eng")
 done
 if [[ ${#excl_bad[@]} -eq 0 ]]; then
-  ok "an emptied exclusion list still searches (both backends)"; pass=$((pass + 1))
+  ok "an emptied exclusion list still searches (${excl_engines[*]})"; pass=$((pass + 1))
 else
   err "CS_EXCLUDE_REMOVE emptying the list broke: ${excl_bad[*]}"
   fail=$((fail + 1)); failed_ids+=("empty-exclusion-list")
@@ -805,7 +853,7 @@ if [[ -x "$(command -v rg 2>/dev/null || true)" ]]; then
     fail=$((fail + 1)); failed_ids+=("unreadable-backend-parity")
   fi
 else
-  warn "skipped-file parity SKIPPED (no ripgrep binary here)"
+  skip "skipped-file parity" "no ripgrep binary here"
 fi
 
 # The whole point of the split: this must not weaken the systemic refusals.
@@ -814,15 +862,67 @@ refuses "a bad regex still refuses even with unreadable files present" "engine f
   "$here/cs" text 'foo['
 
 # And a query that DOES find things still says the answer is incomplete.
-dang_hits=$("$here/cs" seam 'orders.reserved.v1' 2>&1); dang_hrc=$?
-if [[ $dang_hrc -eq 0 ]] && printf '%s' "$dang_hits" | grep -q 'PARTIAL'; then
-  ok "a result with hits still reports the skipped files"; pass=$((pass + 1))
+#
+# Only asserted on the ripgrep backend, and that asymmetry is deliberate: rg
+# names the unreadable file in its own stderr, so cs gets this for free, while
+# recursive grep says nothing and cs has to walk the fleet to find out. That
+# walk is run only when the query found nothing -- a negative is where a silent
+# skip becomes a false "this is dead", and a result WITH hits already gives the
+# reader something to look at. Paying for a second filesystem walk on every
+# grep query that already has an answer is not worth it.
+if have_rg_binary_here; then
+  dang_hits=$(CS_TEXT_ENGINE=ripgrep "$here/cs" seam 'orders.reserved.v1' 2>&1); dang_hrc=$?
+  if [[ $dang_hrc -eq 0 ]] && printf '%s' "$dang_hits" | grep -q 'PARTIAL'; then
+    ok "a result with hits still reports the skipped files"; pass=$((pass + 1))
+  else
+    err "a partial result with hits did not say it was partial (exit $dang_hrc)"
+    fail=$((fail + 1)); failed_ids+=("unreadable-hits-partial")
+  fi
 else
-  err "a partial result with hits did not say it was partial (exit $dang_hrc)"
-  fail=$((fail + 1)); failed_ids+=("unreadable-hits-partial")
+  skip "partial-with-hits" "no ripgrep binary; grep reports skips only on a negative"
 fi
 
 rm -f "$dangle_repo/CLAUDE.local.md" "$dangle_repo/src/import"
+
+# ---- the symbol index's cache key ------------------------------------------
+# `cs def` caches its index at a path derived from a hash of the view. The hash
+# chain was `md5 -q || md5sum` — and `md5` lives in /sbin on macOS while
+# `md5sum` does not exist there at all, so a trimmed PATH found NEITHER. The
+# chain then produced an EMPTY fingerprint instead of failing, the cache path
+# became the constant `cs-tags-.tags`, and every fleet shared one symbol index.
+# `cs def` answered one fleet's question from another fleet's index: a confident
+# wrong answer in the one command whose entire job is "where is this defined".
+#
+# Found by running this suite on a stripped PATH, not by reading the code.
+info ""
+info "${C_BOLD}symbol index cache key${C_OFF}"
+nohash=$(mktemp -d)
+for h in md5 md5sum shasum; do printf '#!/bin/sh\nexit 127\n' > "$nohash/$h"; done
+chmod +x "$nohash"/*
+nh_out=$(PATH="$nohash:$PATH" "$here/cs" def DiscountEngine --refresh 2>&1)
+if printf '%s' "$nh_out" | grep -q 'DiscountEngine.java'; then
+  ok "the fingerprint falls back past md5/md5sum to a POSIX checksum"
+  pass=$((pass + 1))
+else
+  err "cs def broke when md5 and md5sum were unavailable"
+  fail=$((fail + 1)); failed_ids+=("fingerprint-fallback")
+fi
+
+# And when nothing at all can hash, it must rebuild rather than share a key.
+# Sharing one is the defect; rebuilding is merely slower.
+printf '#!/bin/sh\nexit 127\n' > "$nohash/cksum"; chmod +x "$nohash/cksum"
+nk_out=$(PATH="$nohash:$PATH" "$here/cs" def DiscountEngine 2>&1)
+if printf '%s' "$nk_out" | grep -q 'DiscountEngine.java' \
+   && printf '%s' "$nk_out" | grep -q 'cannot be cached safely'; then
+  ok "with no hashing tool at all, the index is rebuilt rather than shared"
+  pass=$((pass + 1))
+else
+  err "no-hash fallback did not answer, or cached under a shared key anyway"
+  fail=$((fail + 1)); failed_ids+=("fingerprint-nokey")
+fi
+rm -rf "$nohash"
+# The constant-path index the old code wrote, in case this machine has one.
+rm -f "${TMPDIR:-/tmp}/cs-tags-.tags"
 
 # ---- porcelain -------------------------------------------------------------
 # The exit code separated a refusal from an honest zero; everything else needed
@@ -924,7 +1024,14 @@ else
 fi
 
 info ""
-info "${C_BOLD}$pass passed, $fail failed${C_OFF}"
+if [[ $skipped -gt 0 ]]; then
+  info "${C_BOLD}$pass passed, $fail failed, $skipped skipped${C_OFF}"
+  # Named, not just counted: a skip is a check that did not run, and the reader
+  # has to be able to see whether the thing they care about was one of them.
+  for s in "${skipped_why[@]:-}"; do [[ -n "$s" ]] && info "  skipped: $s"; done
+else
+  info "${C_BOLD}$pass passed, $fail failed${C_OFF}"
+fi
 for f in "${failed_ids[@]:-}"; do
   [[ -n "$f" ]] && info "  re-run one: $here/score-seams $f -"
 done

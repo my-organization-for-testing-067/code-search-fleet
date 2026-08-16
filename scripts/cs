@@ -323,6 +323,7 @@ cleanup_view() {
   [[ -n "${CS_ENGINE_ERR_FLAG:-}" ]] && rm -f "$CS_ENGINE_ERR_FLAG"
   [[ -n "${CS_SKIPPED_FLAG:-}" ]] && rm -f "$CS_SKIPPED_FLAG"
   rm -f "${TMPDIR:-/tmp}"/cs-engerr."$$".* "${TMPDIR:-/tmp}"/cs-uses."$$".* 2>/dev/null
+  rm -f "${TMPDIR:-/tmp}"/cs-tags-nokey."$$".tags 2>/dev/null
   return 0
 }
 # $? is captured first: the porcelain envelope reports the real exit status, and
@@ -620,6 +621,13 @@ classify_engine_stderr() {
 # entirely by per-file errors is PARTIAL; anything else is a failure.
 note_search_result() {
   local rc="${1:-0}" ef="$2" eng="$3" what="$4"
+  # A timeout is its own category and run_timed has already flagged it. Filing
+  # it as a generic engine failure too would bury the one word the caller is
+  # told to look for -- PARTIAL -- under "an engine failed".
+  if [[ "$rc" -eq 124 ]] && timed_out; then
+    classify_engine_stderr "$ef" >/dev/null 2>&1 || true
+    return 0
+  fi
   if classify_engine_stderr "$ef"; then
     # Every message accounted for as a skipped file. An exit >=2 with NO
     # explanation at all is still a failure -- silence is not evidence of
@@ -654,6 +662,13 @@ engines_ok_or_die() {  # <subcommand>
   # symlinks is still an answer -- refusing there blocked every negative on the
   # whole fleet over two files that had nothing to do with the query.
   scan_unreadable_for_grep
+  # A run that did not finish has not established a negative, so it refuses --
+  # but it refuses in the PARTIAL vocabulary, which is the word the skill tells
+  # an agent to look for and pass on.
+  if timed_out; then
+    die "cs $1: an engine hit the ${CS_TIMEOUT:-120}s timeout and found nothing — PARTIAL, not an answer
+  the search did not finish, so nothing was ruled out; raise CS_TIMEOUT and rerun"
+  fi
   engine_failed || return 0
   die "cs $1: an engine failed, so this empty result is not an answer
 $(engine_error_lines | sed 's/^/  /')
@@ -1388,12 +1403,30 @@ cmd_uses() {
 # is a fresh temp directory of symlinks on every invocation, so including it
 # would change the key every run and the cache would never hit at all -- which
 # is exactly the case where the fleet is large and the saving matters.
+#
+# The hashing chain is longer than it looks like it needs to be. `md5` lives in
+# /sbin on macOS and `md5sum` does not exist there at all, so a trimmed PATH
+# finds NEITHER -- and the old `md5 -q || md5sum` chain then produced an EMPTY
+# fingerprint rather than failing. The cache path became the constant
+# `cs-tags-.tags`, every fleet shared one symbol index, and `cs def` answered
+# one fleet's question from another fleet's index. A confident wrong answer, in
+# the one command whose entire job is "where is this defined".
+#
+# Returns non-zero when nothing on this machine can hash, so the caller can skip
+# the cache instead of sharing one. Slower is a cost; wrong is a defect.
 view_fingerprint() {
-  local d
-  { for d in $(real_dirs); do
-      printf '%s %s\n' "$d" "$(git -C "$d" rev-parse HEAD 2>/dev/null || echo nogit)"
-    done
-  } | sort | (md5 -q 2>/dev/null || md5sum 2>/dev/null | cut -d' ' -f1)
+  local d data h out
+  data=$({ for d in $(real_dirs); do
+             printf '%s %s\n' "$d" "$(git -C "$d" rev-parse HEAD 2>/dev/null || echo nogit)"
+           done
+         } | sort)
+  # cksum is POSIX and therefore the backstop: a weak checksum is still a
+  # correct cache KEY, because a collision only costs a rebuild.
+  for h in "md5 -q" "md5sum" "shasum -a 1" "cksum"; do
+    out=$(printf '%s\n' "$data" | $h 2>/dev/null | head -1 | awk '{print $1}')
+    [[ -n "$out" ]] && { printf '%s\n' "$out"; return 0; }
+  done
+  return 1
 }
 
 cmd_def() {
@@ -1411,11 +1444,19 @@ cmd_def() {
   # a short TTL as the backstop for uncommitted edits -- which refs cannot see
   # and which are exactly what you have while working a ticket. The staleness
   # window is bounded and stated rather than hidden; --refresh forces a rebuild.
-  local fp tags age ttl="${CS_TAGS_TTL:-60}" cached=""
-  fp=$(view_fingerprint)
-  tags="${TMPDIR:-/tmp}/cs-tags-${fp}.tags"
+  local fp tags age ttl="${CS_TAGS_TTL:-60}" cached="" no_cache=0
+  if fp=$(view_fingerprint); then
+    tags="${TMPDIR:-/tmp}/cs-tags-${fp}.tags"
+  else
+    # Nothing here can hash, so there is no key that distinguishes this fleet
+    # from another. Build a private index and throw it away rather than write to
+    # a shared path that would answer the next fleet's question with this one's.
+    no_cache=1
+    tags="${TMPDIR:-/tmp}/cs-tags-nokey.$$.tags"
+    warn "no md5/shasum/cksum on PATH — the symbol index cannot be cached safely, so it is rebuilt for this query"
+  fi
 
-  if [[ $refresh_index -eq 0 && -s "$tags" ]]; then
+  if [[ $no_cache -eq 0 && $refresh_index -eq 0 && -s "$tags" ]]; then
     age=$(( $(date +%s) - $(file_mtime "$tags") ))
     if [[ $age -ge 0 && $age -lt $ttl ]]; then cached="cached ${age}s ago"; fi
   fi
