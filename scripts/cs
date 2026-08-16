@@ -60,9 +60,8 @@
 #                    the effective list)
 #
 # Requires: python3 (uses, provides, deps, publishes, versions, owns, impls,
-# refs). Everything
-# else is optional -- `cs engines` reports what is present and cs routes around
-# what is not.
+# refs). Everything else is optional -- `cs engines` reports what is present,
+# and cs routes around what is not.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
@@ -94,9 +93,10 @@ require_fleet() {
 }
 
 # python3 is NOT an optional engine. The engines below degrade to each other and
-# `cs engines` reports which are missing; python3 is different, because four
-# subcommands pipe THROUGH it -- `uses` through filter_code.py, `provides`,
-# `deps` and `publishes` through deps.py. Without it the pipe fails and the
+# `cs engines` reports which are missing; python3 is different, because half the
+# subcommands pipe THROUGH it -- `uses` through filter_code.py, the manifest
+# readers through deps.py, `owns` through owners.py, the LSP pair through
+# serena_call.py. Without it the pipe fails and the
 # stage produces nothing, which every one of those subcommands then reports as
 # a perfectly formatted zero-hit answer, still labelled "prose filtered". That
 # is the same manufactured negative the fleet-root guards above exist to

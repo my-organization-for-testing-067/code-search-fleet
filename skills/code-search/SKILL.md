@@ -1,6 +1,6 @@
 ---
 name: code-search
-description: Search across many repositories at once — find who calls an endpoint, where a symbol is defined, what implements an interface, or which repo publishes a package. Use whenever a question spans more than one repo, or when grep alone gives noisy or incomplete answers. Trigger phrases: "who calls", "where is X defined", "what implements", "across the repos", "which repo", "find usages", "is this endpoint dead", "impact of changing".
+description: Search across many repositories at once — find who calls an endpoint, where a symbol is defined, what implements an interface, which repo publishes a package, who owns the code (CODEOWNERS), and whether every repo pins the same version of a shared package. Use whenever a question spans more than one repo, or when grep alone gives noisy or incomplete answers. Trigger phrases: "who calls", "where is X defined", "what implements", "across the repos", "which repo", "find usages", "is this endpoint dead", "impact of changing", "who owns", "which team owns", "what version of", "version drift".
 ---
 
 # Searching a fleet of repositories
@@ -41,10 +41,11 @@ user for the directory holding their repos rather than guessing.
 
 Every *engine* is optional. `cs engines` reports what is present, and `cs` routes
 around whatever is missing rather than failing silently. **`python3` is the
-exception** — `uses`, `provides`, `deps`, `publishes`, `impls` and `refs` run
-through it, and refuse without it rather than returning zero hits that would
-read exactly like a real "nothing uses this". If `cs` reports python3 missing,
-tell the user; `cs seam` still works without it, but counts comments as hits.
+exception** — `uses`, `provides`, `deps`, `publishes`, `versions`, `owns`,
+`impls` and `refs` run through it, and refuse without it rather than returning
+zero hits that would read exactly like a real "nothing uses this". If `cs`
+reports python3 missing, tell the user; `cs seam` still works without it, but
+counts comments as hits.
 
 ## Which subcommand
 
