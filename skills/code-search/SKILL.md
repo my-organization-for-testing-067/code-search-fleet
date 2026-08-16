@@ -181,6 +181,35 @@ if cs uses "$route" >/dev/null 2>&1; then echo "in use"; else echo "unused"; fi
 reported `unused` for a typo'd `FLEET_ROOT`. That is the false negative this
 whole design exists to prevent, so read the code, not the sentence.
 
+**A broken engine refuses too**, which is what makes `2` worth trusting. An
+engine that is installed and *failing* — ripgrep exiting 2, a regex that does
+not compile, `ast-grep` rejecting its own pattern, a crashing helper — produces
+empty output that is byte-identical to an honest negative. `cs` checks every
+engine's exit status, so `2` means the search actually ran to completion. If you
+see a refusal naming an engine, report the engine; do not retry with `grep`.
+
+### `--porcelain` when you want the metadata as data
+
+`--porcelain` (or `CS_JSON=1`) replaces the result lines on stdout with one JSON
+object. Everything you would otherwise have to scrape off stderr is a field:
+
+```sh
+cs uses '/api/v1/inventory/reserve' --porcelain
+```
+```json
+{"cs":1,"subcommand":"uses","exit":0,"refused":false,"reason":null,
+ "kind":"heuristic","engine":"ripgrep","note":"literal, prose filtered",
+ "hits":2,"repos":2,"degraded":null,"partial":false,"truncated":false,
+ "returned":2,"engine_errors":[],"hints":[],
+ "results":[{"repo":"…","path":"…","line":7,"text":"…"}]}
+```
+
+Refusals emit the envelope too, with `refused: true` and the reason — that is
+the case with no result stream to attach anything to, and the one you most need
+to detect. `hits` is how many exist and `returned` how many are in `results`;
+if they differ the answer was capped. stderr is unchanged, so `--porcelain`
+composes with `--quiet` rather than replacing it.
+
 ## Finding a cause in another repo
 
 When something breaks and nothing in its own repo changed, the trigger is in a

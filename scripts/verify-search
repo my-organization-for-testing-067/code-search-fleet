@@ -496,6 +496,14 @@ finds_nothing "a genuine zero-hit cs text exits 2"     "$here/cs" text "$absent"
 finds_nothing "a genuine zero-hit cs def exits 2"      "$here/cs" def "CsAbsentSymbol$$"
 finds_nothing "a genuine zero-hit cs history exits 2"  "$here/cs" history "$absent"
 finds_nothing "a genuine zero-hit cs provides exits 2" "$here/cs" provides "com.acme:$absent"
+# The mirror-image mistake, and one this suite shipped: hardening the manifest
+# readers against a crashing module turned their legitimate "ran, matched
+# nothing" (exit 1, which deps.py and owners.py both use) into a refusal. Both
+# directions have to be pinned, or fixing one silently breaks the other.
+finds_nothing "an unowned path is an answer, not a refusal" \
+  "$here/cs" owns pricing-lib-java/src/main/java/com/acme/pricing/DiscountEngine.java
+finds_nothing "an undeclared coordinate is an answer, not a refusal" \
+  "$here/cs" versions "$absent"
 
 # The codes have to be written down where a caller looks, or they are a private
 # convention. Both `cs --help` (the file header) and `cs why` must state them.
@@ -688,6 +696,156 @@ if [[ -d "$probe_src" ]]; then
     fail=$((fail + 1)); failed_ids+=("prose-filter-languages")
   fi
   rm -rf "$probe_repo"
+fi
+
+# ---- a BROKEN engine is not an absent one ----------------------------------
+# `cs engines` reports what is on PATH. It cannot report that ripgrep is on
+# PATH and exiting 2 on every query, that ast-grep no longer understands its
+# pattern dialect, or that the regex the caller typed does not compile. Each of
+# those produced no output, and each was then reported as `0 hit(s)`.
+#
+# Splitting the exit codes made this worse rather than better: a caller that
+# correctly branches on 2 now gets "this search happened and the answer is no"
+# from a search that crashed. So every engine's status is checked, and an empty
+# result from a failed engine refuses.
+info ""
+info "${C_BOLD}a broken engine must not look like a negative result${C_OFF}"
+
+# A pattern that does not compile is the version of this a user hits without any
+# broken install at all.
+refuses "an uncompilable regex refuses"   "regex\|engine failed" \
+  "$here/cs" text 'foo['
+
+# Shims that exit 3: on PATH, runnable, and wrong — the state no availability
+# check can see. ctags is not shimmed here because cs resolves it by absolute
+# path (to dodge macOS's BSD ctags), so PATH cannot hide it.
+brk=$(mktemp -d)
+for b in rg git ast-grep semgrep; do printf '#!/bin/sh\nexit 3\n' > "$brk/$b"; done
+chmod +x "$brk"/*
+refuses "a broken text engine refuses (cs text)"  "engine failed" \
+  env PATH="$brk:$PATH" "$here/cs" text 'reservationId'
+refuses "a broken text engine refuses (cs seam)"  "engine failed" \
+  env PATH="$brk:$PATH" "$here/cs" seam 'reservationId'
+refuses "a broken text engine refuses (cs uses)"  "engine failed" \
+  env PATH="$brk:$PATH" "$here/cs" uses 'reservationId'
+refuses "a broken git refuses (cs history)"       "engine failed" \
+  env PATH="$brk:$PATH" "$here/cs" history 'reservationId'
+refuses "a broken structural engine refuses"      "engine failed" \
+  env PATH="$brk:$PATH" "$here/cs" calls '$X.IsEnabled($K)'
+rm -rf "$brk"
+
+# The manifest readers all pipe through one python3 module and none checked
+# whether it succeeded. `cs deps` and `cs publishes` were the worst of the set:
+# they exited 0 with no output, and 0 is the code that means "found something".
+brokenlib=$(mktemp -d)
+mkdir -p "$brokenlib/lib"
+cp "$here/cs" "$brokenlib/cs"
+cp "$here/lib"/*.py "$here/lib/common.sh" "$brokenlib/lib/" 2>/dev/null
+for m in deps owners filter_code; do printf 'import sys\nsys.exit(9)\n' > "$brokenlib/lib/$m.py"; done
+refuses "a crashing deps.py refuses (cs deps)"      "deps.py failed" "$brokenlib/cs" deps
+refuses "a crashing deps.py refuses (cs publishes)" "deps.py failed" "$brokenlib/cs" publishes
+refuses "a crashing deps.py refuses (cs provides)"  "deps.py failed" "$brokenlib/cs" provides com.acme:pricing-lib
+refuses "a crashing deps.py refuses (cs versions)"  "deps.py failed" "$brokenlib/cs" versions
+refuses "a crashing prose filter refuses (cs uses)" "engine failed"  "$brokenlib/cs" uses 'reservationId'
+rm -rf "$brokenlib"
+
+# ---- porcelain -------------------------------------------------------------
+# The exit code separated a refusal from an honest zero; everything else needed
+# to weigh an answer — the kind, and the four warnings SKILL.md tells an agent
+# to pass on rather than swallow — was still prose on stderr.
+info ""
+info "${C_BOLD}porcelain${C_OFF}"
+
+# stdout must be exactly one JSON object, and its results must agree line for
+# line with what plain mode prints. A porcelain mode that quietly drops the last
+# hit would be worse than none, since nothing would ever reveal it.
+porc_bad=()
+for spec in "uses|reservationId" "seam|reservationId" "text|reservationId" "def|Reserve" \
+            "deps|" "publishes|" "versions|" "owns|" "history|reservationId" \
+            "provides|com.acme:pricing-lib"; do
+  psub="${spec%%|*}"; parg="${spec#*|}"
+  if [[ -n "$parg" ]]; then
+    plain_n=$("$here/cs" "$psub" "$parg" 2>/dev/null | grep -c '[^[:space:]]')
+    jsn=$("$here/cs" "$psub" "$parg" --porcelain 2>/dev/null)
+  else
+    plain_n=$("$here/cs" "$psub" 2>/dev/null | grep -c '[^[:space:]]')
+    jsn=$("$here/cs" "$psub" --porcelain 2>/dev/null)
+  fi
+  # One object, one line.
+  [[ "$(printf '%s' "$jsn" | grep -c '')" -eq 1 ]] || { porc_bad+=("$psub:not-one-line"); continue; }
+  json_n=$(printf '%s' "$jsn" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("BAD"); raise SystemExit
+print(len(d["results"]) if d["returned"] == len(d["results"]) else "BAD")
+' 2>/dev/null)
+  [[ "$json_n" == "$plain_n" ]] || porc_bad+=("$psub:plain=$plain_n/json=$json_n")
+done
+if [[ ${#porc_bad[@]} -eq 0 ]]; then
+  ok "porcelain emits one JSON object matching plain output, for 10 subcommands"
+  pass=$((pass + 1))
+else
+  err "porcelain disagreed with plain output: ${porc_bad[*]}"
+  fail=$((fail + 1)); failed_ids+=("porcelain-parity")
+fi
+
+# A refusal has no result stream to attach anything to, which is exactly why it
+# is the case a caller most needs the envelope for.
+ref_json=$(env FLEET_ROOT="/nonexistent/$$/fleet" "$here/cs" uses 'x' --porcelain 2>/dev/null)
+if printf '%s' "$ref_json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["refused"] is True, "refused not true"
+assert d["exit"] == 1, "exit not 1"
+assert d["kind"] is None, "kind should be null on a refusal"
+assert d["reason"], "no reason given"
+assert d["results"] == [], "results not empty"
+' 2>/dev/null; then
+  ok "a refusal emits a porcelain envelope saying so"; pass=$((pass + 1))
+else
+  err "a refusal produced no usable porcelain envelope"
+  fail=$((fail + 1)); failed_ids+=("porcelain-refusal")
+fi
+
+# CS_JSON=1 exists for a caller wrapping cs in a script it does not control.
+if CS_JSON=1 "$here/cs" uses 'reservationId' 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+  ok "CS_JSON=1 turns porcelain on without a flag"; pass=$((pass + 1))
+else
+  err "CS_JSON=1 did not produce JSON"; fail=$((fail + 1)); failed_ids+=("porcelain-env")
+fi
+
+# The metadata is the point: a capped result must be distinguishable from a
+# complete one without re-reading a stderr warning the caller never saw.
+cap_json=$(CS_MAX_RESULTS=2 "$here/cs" seam 'reserve' --porcelain 2>/dev/null)
+if printf '%s' "$cap_json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["truncated"] is True, "truncated not flagged"
+assert d["returned"] == 2, "returned should be the cap"
+assert d["hits"] > 2, "hits should be the true total"
+assert d["kind"], "no answer kind"
+' 2>/dev/null; then
+  ok "porcelain reports truncation, the cap, and the true total separately"
+  pass=$((pass + 1))
+else
+  err "porcelain did not distinguish a capped result from a complete one"
+  fail=$((fail + 1)); failed_ids+=("porcelain-truncation")
+fi
+
+# A quoted string in a result line is the obvious way to produce invalid JSON,
+# and the fixture is full of them.
+if "$here/cs" uses 'orders.reserved.v1' --porcelain 2>/dev/null \
+   | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert any(chr(34) in r["text"] for r in d["results"]), "no quoted text in fixture results"
+' 2>/dev/null; then
+  ok "result text containing quotes survives JSON encoding"; pass=$((pass + 1))
+else
+  err "porcelain mis-encoded a result line containing quotes"
+  fail=$((fail + 1)); failed_ids+=("porcelain-escaping")
 fi
 
 info ""

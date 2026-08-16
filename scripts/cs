@@ -49,6 +49,8 @@
 #   --all            no result cap for this query
 #   --engine=<name>  force one engine and fail rather than fall back
 #   --refresh        rebuild the cached symbol index instead of reusing it
+#   --porcelain      one JSON object on stdout instead of result lines
+#                    (CS_JSON=1 does the same; stderr is unaffected)
 #
 # Environment:
 #   CS_MAX_RESULTS   result cap, default 200 (0 = unlimited)
@@ -71,6 +73,19 @@
 # reported "unused" for a typo'd FLEET_ROOT, the exact false negative the whole
 # design is organised against. Branch on the code, not on the message.
 #
+# A BROKEN engine refuses too, and that is the point of the distinction: an
+# engine that is installed and failing (ripgrep exiting 2, an uncompilable
+# regex, a crashing deps.py) produces no output, which is indistinguishable
+# from an honest zero until its exit status is read. Every engine's status is
+# checked, so 2 means the search actually ran.
+#
+# --porcelain / CS_JSON=1 puts the same facts on stdout as one JSON object:
+#   {"cs":1,"subcommand":…,"exit":…,"refused":…,"reason":…,"kind":…,"engine":…,
+#    "note":…,"hits":…,"repos":…,"degraded":…,"partial":…,"truncated":…,
+#    "returned":…,"engine_errors":[…],"hints":[…],"results":[…]}
+# `hits` is how many exist and `returned` how many are in `results`; comparing
+# them is how a caller sees a cap without reading a stderr warning.
+#
 # Requires: python3 (uses, provides, deps, publishes, versions, owns, impls,
 # refs). Everything else is optional -- `cs engines` reports what is present,
 # and cs routes around what is not.
@@ -92,6 +107,82 @@ root="${FLEET_ROOT:-$PWD}"
 # working; 2 is the newly distinguishable case.
 CS_EXIT_REFUSED=1
 CS_EXIT_NO_HITS=2
+
+# ---- machine-readable output -----------------------------------------------
+# The exit code above split "did not run" from "ran and found nothing", but
+# everything else a caller needs to weigh an answer was still prose on stderr:
+# the answer KIND, and the four warnings the skill instructs an agent to pass on
+# rather than swallow (PARTIAL, `showing N of M`, `degraded:`, `prose filtered
+# except:`). All are load-bearing and all are easy to discard.
+#
+# --porcelain (or CS_JSON=1) puts one JSON object on stdout instead of the
+# result lines, carrying the metadata alongside the hits -- including on a
+# refusal, which is the case a caller most needs to detect and the one with no
+# result stream to attach anything to.
+#
+# stderr is untouched: the human diagnostics stay exactly where they were, so
+# --porcelain composes with --quiet rather than replacing it.
+porcelain=0
+CS_RESULTS=""      # what would have gone to stdout
+CS_HINTS=""        # the "nothing found — try:" suggestions
+CS_REFUSAL=""      # the message from die(), if we refused
+CS_HITS=""; CS_REPOS=""; CS_SUB=""; CS_QUERY=""
+
+# JSON string escaping, in bash rather than through python3, so that porcelain
+# works everywhere cs does -- `cs text` and `cs seam` run without python3, and a
+# refusal for a MISSING python3 obviously cannot format itself with it.
+# Raw UTF-8 is legal inside a JSON string, so only the structural characters and
+# the control characters that can actually occur here are escaped.
+json_str() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\t'/\\t}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\n'/\\n}"
+  printf '"%s"' "$s"
+}
+# A number, or `null` when the value is unknown -- never an empty string, which
+# would make `hits` unreadable without a type check on the far side.
+json_num() { case "${1:-}" in ''|*[!0-9]*) printf 'null' ;; *) printf '%s' "$1" ;; esac; }
+
+# Result lines are `repo/path:line: text` for every search subcommand, so they
+# are split into fields rather than handed over as strings a caller would have
+# to re-parse with the regex this tool already applied. A line that does not
+# match that shape (cs deps, cs versions, cs owns, cs history) is carried whole
+# under "text", which keeps one array type across every subcommand.
+json_results() {
+  local first=1 line repo path lineno text
+  printf '['
+  # `|| [[ -n "$line" ]]`: read returns non-zero on a final line with no
+  # trailing newline, and dropping it silently cost exactly one hit per query.
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] || continue
+    [[ $first -eq 1 ]] || printf ','
+    first=0
+    if [[ "$line" =~ ^([^/]+)/(.+):([0-9]+):\ ?(.*)$ ]]; then
+      repo="${BASH_REMATCH[1]}"; path="${BASH_REMATCH[2]}"
+      lineno="${BASH_REMATCH[3]}"; text="${BASH_REMATCH[4]}"
+      printf '{"repo":%s,"path":%s,"line":%s,"text":%s}' \
+        "$(json_str "$repo")" "$(json_str "$path")" "$lineno" "$(json_str "$text")"
+    else
+      printf '{"repo":null,"path":null,"line":null,"text":%s}' "$(json_str "$line")"
+    fi
+  done
+  printf ']'
+}
+
+json_lines() {  # a plain array of strings, for hints and engine errors
+  local first=1 line
+  printf '['
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] || continue
+    [[ $first -eq 1 ]] || printf ','
+    first=0
+    printf '%s' "$(json_str "$line")"
+  done
+  printf ']'
+}
 
 # Refuse to answer rather than answer "nothing found" from an empty or missing
 # fleet. A negative result is the answer that makes a breaking change look safe,
@@ -162,6 +253,60 @@ ticket_root="${TICKET_ROOT:-}"
 ticket_id=""
 layer_note=""
 
+# common.sh's die() is the single refusal path, and porcelain needs the reason
+# it carried -- a refusal is the outcome a caller most needs to detect, and the
+# one with no result stream to attach anything to. Redefined rather than edited
+# in common.sh, because the other fleet scripts have no envelope to fill in.
+# stderr keeps the human message either way.
+die() { CS_REFUSAL="$*"; err "$*"; exit "$CS_EXIT_REFUSED"; }
+
+# One JSON object on stdout, emitted from the EXIT trap so that it is produced
+# on every path -- including die(), which does not come back. Verified that a
+# command-substitution subshell does not run this trap, so the envelope cannot
+# leak into a captured value.
+cs_emit_porcelain() {
+  local rc="$1"
+  [[ $porcelain -eq 1 ]] || return 0
+  local refused=false
+  [[ "$rc" -eq "$CS_EXIT_REFUSED" ]] && refused=true
+  local partial=false
+  timed_out && partial=true
+  printf '{'
+  printf '"cs":1,'
+  printf '"subcommand":%s,' "$(json_str "$CS_SUB")"
+  printf '"query":%s,'      "$(json_str "$CS_QUERY")"
+  printf '"exit":%s,'       "$rc"
+  printf '"refused":%s,'    "$refused"
+  if [[ -n "$CS_REFUSAL" ]]; then
+    printf '"reason":%s,' "$(json_str "$CS_REFUSAL")"
+  else
+    printf '"reason":null,'
+  fi
+  if [[ -n "$CS_KIND" ]]; then
+    printf '"kind":%s,'   "$(json_str "$CS_KIND")"
+    printf '"engine":%s,' "$(json_str "$CS_ENGINE")"
+  else
+    printf '"kind":null,"engine":null,'
+  fi
+  if [[ -n "$CS_NOTE" ]]; then printf '"note":%s,' "$(json_str "$CS_NOTE")"
+  else printf '"note":null,'; fi
+  printf '"hits":%s,'  "$(json_num "$CS_HITS")"
+  printf '"repos":%s,' "$(json_num "$CS_REPOS")"
+  if [[ -n "$CS_DEGRADED" ]]; then printf '"degraded":%s,' "$(json_str "$CS_DEGRADED")"
+  else printf '"degraded":null,'; fi
+  printf '"partial":%s,' "$partial"
+  # "hits" is how many exist; "returned" is how many are in the array below.
+  # A caller comparing the two learns whether it is holding the whole answer --
+  # which is the question the `showing N of M` warning answers for a human.
+  if [[ -n "$CS_TRUNCATED" ]]; then printf '"truncated":true,'
+  else printf '"truncated":false,'; fi
+  printf '"returned":%s,' "$(printf '%s' "$CS_RESULTS" | grep -c '[^[:space:]]')"
+  printf '"engine_errors":%s,' "$(engine_error_lines | json_lines)"
+  printf '"hints":%s,'         "$(printf '%s' "$CS_HINTS"   | json_lines)"
+  printf '"results":%s'        "$(printf '%s' "$CS_RESULTS" | json_results)"
+  printf '}\n'
+}
+
 cleanup_view() {
   [[ -n "$view_tmp" && -d "$view_tmp" ]] && rm -rf "$view_tmp"
   [[ -n "${CS_TIMEOUT_FLAG:-}" ]] && rm -f "$CS_TIMEOUT_FLAG"
@@ -172,11 +317,20 @@ cleanup_view() {
   # the paths that refuse on a malformed answer exit through die(), which does
   # not come back to a rm.
   rm -f "${TMPDIR:-/tmp}"/cs-serena."$$".* "${TMPDIR:-/tmp}"/cs-serena-err."$$".* 2>/dev/null
+  [[ -n "${CS_ENGINE_ERR_FLAG:-}" ]] && rm -f "$CS_ENGINE_ERR_FLAG"
+  return 0
+}
+# $? is captured first: the porcelain envelope reports the real exit status, and
+# anything run before reading it would overwrite it.
+cs_on_exit() {
+  local rc=$?
+  cs_emit_porcelain "$rc"
+  cleanup_view
   return 0
 }
 # INT and TERM as well as EXIT: bash does not run an EXIT trap for an
 # uncaught signal, and being ^C'd mid-index is the likeliest way to leak one.
-trap cleanup_view EXIT INT TERM
+trap cs_on_exit EXIT INT TERM
 
 detect_ticket() {
   [[ -n "$ticket_root" ]] && return 0
@@ -380,6 +534,56 @@ run_timed() {
 }
 timed_out() { [[ -s "$CS_TIMEOUT_FLAG" ]]; }
 
+# ---- engine failure --------------------------------------------------------
+# A broken engine and an absent one are different problems with the same
+# symptom, and only the absent one was handled. `cs engines` reports what is on
+# PATH; it cannot report that ripgrep is on PATH and exiting 2 on every query,
+# that ast-grep no longer understands its own pattern dialect, or that the regex
+# the caller typed does not compile. Every one of those produced no output, and
+# every one was then reported as `0 hit(s)` -- and since the exit code now
+# separates a refusal from an honest zero, reporting it as an honest zero is a
+# stronger lie than it used to be: a caller that correctly branches on 2 gets
+# "this search happened and the answer is no" from a search that crashed.
+#
+# The three text/structural engines share one convention, which is what makes
+# this detectable at all:
+#
+#   ripgrep, POSIX grep, ast-grep:  0 = matched, 1 = no match, >=2 = error
+#   semgrep, git:                   0 = ran (match or not), non-zero = error
+#
+# A file rather than a variable, for the same reason as CS_TIMEOUT_FLAG: engines
+# run inside command substitutions, and a variable set there is discarded before
+# anything can report it.
+CS_ENGINE_ERR_FLAG="$(mktemp -t cs-engine-err.XXXXXX)"
+engine_error()       { printf '%s\n' "$*" >> "$CS_ENGINE_ERR_FLAG"; }
+engine_failed()      { [[ -s "$CS_ENGINE_ERR_FLAG" ]]; }
+engine_error_lines() { sort -u "$CS_ENGINE_ERR_FLAG" 2>/dev/null; }
+
+# note_grep_status <rc> <engine> <what it was doing>
+# For the 0/1/>=2 family. 1 is a real "no match" and must stay silent.
+note_grep_status() {
+  [[ "${1:-0}" -ge 2 ]] && engine_error "$2 exited $1 while $3"
+  return 0
+}
+# note_run_status <rc> <engine> <what it was doing>
+# For engines that report 0 whether or not they matched.
+note_run_status() {
+  [[ "${1:-0}" -ne 0 ]] && engine_error "$2 exited $1 while $3"
+  return 0
+}
+
+# Called at every zero-hit branch, before the emptiness is reported as an
+# answer. This is the structural-tier twin of serena_answered_or_die.
+engines_ok_or_die() {  # <subcommand>
+  engine_failed || return 0
+  die "cs $1: an engine failed, so this empty result is not an answer
+$(engine_error_lines | sed 's/^/  /')
+  nothing here was searched to completion, and a zero-hit result from a broken
+  engine is precisely the manufactured negative this tool exists to prevent
+  check: cs engines   (which engines are present, and which answer kinds work)
+  if you passed a regex, check it compiles: cs text needs a valid pattern"
+}
+
 # grep_fleet <regex|literal> <pattern>
 #
 # The mode is named rather than passed as a flag, because the two backends do
@@ -404,6 +608,7 @@ grep_fleet() {
       regex)   extra="-E" ;;
     esac
   fi
+  local rc=0
   if [[ "$engine" == ripgrep ]]; then
     # --regexp is ripgrep's default, so pass a harmless flag instead of none.
     [[ "$extra" == "--regexp" ]] && extra="--no-config"
@@ -412,6 +617,10 @@ grep_fleet() {
     (cd "$view" && run_timed rg --follow --hidden --no-ignore \
         --no-heading --line-number --color=never \
         ${globs[@]+"${globs[@]}"} "$extra" -- "$pattern" .)
+    rc=$?
+    # 1 is "no match" and must stay silent; 2 is a real failure -- most often an
+    # uncompilable regex, which used to be reported as a confident zero.
+    note_grep_status "$rc" ripgrep "searching for '$pattern'"
   else
     # BSD grep's -R follows a symlink named on the command line but NOT one it
     # meets while recursing, so `grep -R pattern .` silently finds nothing in a
@@ -422,7 +631,10 @@ grep_fleet() {
     for d in ${CS_EXCLUDE_DIRS[@]+"${CS_EXCLUDE_DIRS[@]}"}; do ex+=("--exclude-dir=$d"); done
     run_timed grep -Rn --binary-files=without-match \
         ${ex[@]+"${ex[@]}"} "$extra" -- "$pattern" "$view"/*/ 2>/dev/null
+    rc=$?
+    note_grep_status "$rc" grep "searching for '$pattern'"
   fi
+  return $rc
 }
 ctags_bin() {
   # On macOS, Homebrew's universal-ctags is shadowed by the BSD ctags in
@@ -767,6 +979,16 @@ print_kinds_table() {
 # scoreable "repo/path:line: text" stream every caller and score-seams expect.
 report_answer() {
   local hits="${1:-}" repos="${2:-}"
+  # Recorded before the early return, because --quiet suppresses the human line
+  # and must not also empty the porcelain envelope.
+  CS_HITS="$hits"; CS_REPOS="$repos"
+  # An engine that failed but still produced output means the results are a
+  # subset of the truth, exactly like a timeout. Said out loud rather than left
+  # to look complete; the empty case refuses instead, via engines_ok_or_die.
+  if engine_failed; then
+    warn "an engine failed during this query; these results are INCOMPLETE:"
+    engine_error_lines | sed 's/^/  /' >&2
+  fi
   [[ $quiet -eq 1 || -z "$CS_KIND" ]] && return 0
   local line="${C_BOLD}answer:${C_OFF} $CS_KIND via $CS_ENGINE"
   [[ -n "$CS_NOTE" ]] && line="$line ($CS_NOTE)"
@@ -795,14 +1017,26 @@ emit_capped() {
   local out="$1" total
   total=$(printf '%s\n' "$out" | grep -c '' )
   if [[ "${CS_MAX_RESULTS:-200}" -gt 0 && "$total" -gt "${CS_MAX_RESULTS}" ]]; then
-    printf '%s\n' "$out" | head -n "$CS_MAX_RESULTS"
+    emit_plain "$(printf '%s\n' "$out" | head -n "$CS_MAX_RESULTS")"
     CS_TRUNCATED="$total"
     # When truncating, the distribution is the useful part of what was cut.
     info ""
     info "${C_BOLD}hits per repo (all $total, not just those shown):${C_OFF}"
     printf '%s\n' "$out" | cut -d/ -f1 | sort | uniq -c | sort -rn | sed 's/^/  /' >&2
   else
-    printf '%s\n' "$out"
+    emit_plain "$out"
+  fi
+}
+
+# The single door to stdout. In porcelain mode the lines are buffered into the
+# JSON envelope instead of printed, so that stdout carries exactly one object
+# and no subcommand has to know which mode it is running in.
+emit_plain() {
+  if [[ $porcelain -eq 1 ]]; then
+    if [[ -n "$CS_RESULTS" ]]; then CS_RESULTS="$CS_RESULTS
+$1"; else CS_RESULTS="$1"; fi
+  else
+    printf '%s\n' "$1"
   fi
 }
 
@@ -873,13 +1107,22 @@ cmd_engines() {
   return 0
 }
 
-hint() { info ""; info "${C_BOLD}nothing found — try:${C_OFF}"; while [[ $# -gt 0 ]]; do info "  $1"; shift; done; }
+hint() {
+  info ""; info "${C_BOLD}nothing found — try:${C_OFF}"
+  while [[ $# -gt 0 ]]; do
+    info "  $1"
+    if [[ -n "$CS_HINTS" ]]; then CS_HINTS="$CS_HINTS
+$1"; else CS_HINTS="$1"; fi
+    shift
+  done
+}
 
 cmd_text() {
   [[ $# -ge 1 ]] || die "cs text <pattern>"
   answer textual "$(text_engine)" "regex"
   local out; out=$(grep_fleet regex "$1" | normalize)
   if [[ -z "$out" ]]; then
+    engines_ok_or_die text
     report_answer 0 0
     hint "cs def $1              (it may be a symbol, not literal text)" \
          "cs calls '<pattern>'   (it may only appear as a call shape)"
@@ -899,6 +1142,7 @@ cmd_seam() {
   hits=$(grep_fleet literal "$1" | normalize)
   if [[ -z "$hits" ]]; then
     info "no repo mentions '$1'"
+    engines_ok_or_die seam
     report_answer 0 0
     return $CS_EXIT_NO_HITS
   fi
@@ -968,16 +1212,26 @@ cmd_uses() {
   # provenance claim the run did not honour -- the exact overstatement the kind
   # labels exist to prevent -- so the note is built from what actually happened.
   unsup_file="$(mktemp -t cs-unsup.XXXXXX)"
+  # pipefail makes this the status of whichever stage failed. grep_fleet's own
+  # 1 ("no match") is legitimate and is filtered out by note_grep_status, which
+  # already ran inside it; what is caught here is filter_code.py dying, which
+  # emptied the stream and left `cs uses` reporting a confident zero while still
+  # claiming "prose filtered" -- a filter that had not run.
+  local filter_rc
   hits=$(grep_fleet literal "$1" | normalize \
          | python3 "$lib_dir/filter_code.py" --root "$view" --report-unsupported 2>"$unsup_file")
+  filter_rc=$?
   unsupported=$(cut -f1 "$unsup_file" | sort -u | tr '\n' ' ' | sed 's/ $//')
   rm -f "$unsup_file"
+  # grep_fleet returns 1 on a legitimate no-match, and the pipeline inherits it.
+  [[ "$filter_rc" -gt 1 ]] && engine_error "filter_code.py exited $filter_rc while removing comments from the hits"
   if [[ -n "$unsupported" ]]; then
     answer heuristic "$(text_engine)" "literal, prose filtered except: $unsupported"
   else
     answer heuristic "$(text_engine)" "literal, prose filtered"
   fi
   if [[ -z "$hits" ]]; then
+    engines_ok_or_die uses
     info "no code uses '$1'"
     local prose
     prose=$(grep_fleet literal "$1" | normalize | python3 "$lib_dir/filter_code.py" --invert --root "$view" 2>/dev/null)
@@ -1059,6 +1313,11 @@ cmd_def() {
     find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'cs-tags-*.tags' -mmin +1440 -delete 2>/dev/null
     local tmp_tags="$tags.$$.building"
     run_timed "$ct" -R --links=yes --fields=+n -f "$tmp_tags" "$view"/*/ 2>/dev/null
+    # A ctags run that fails PARTWAY leaves a non-empty index covering some of
+    # the fleet, which the -s check below happily accepts -- so a symbol in an
+    # unindexed repo comes back "not defined anywhere" with a normal structural
+    # label. Total failure was already caught; partial failure was not.
+    note_run_status $? ctags "building the fleet symbol index"
     if [[ ! -s "$tmp_tags" ]]; then
       rm -f "$tmp_tags"
       die "ctags produced no index under $root"
@@ -1084,6 +1343,7 @@ cmd_def() {
       printf "%s:%s: [%s] %s\n", $2, line, kind, want
   }' "$tags" | normalize | sort -u | { if [[ -n "$only" ]]; then grep "^$only/" || true; else cat; fi; })
   if [[ -z "$out" ]]; then
+    engines_ok_or_die def
     report_answer 0 0
     hint "cs text '$1'           (ctags misses symbols built dynamically)" \
          "cs refs $1 <repo> <file>  (for a precise, LSP-backed answer)"
@@ -1101,11 +1361,30 @@ cmd_def() {
 # the one question code search structurally cannot: choosing between two
 # same-named symbols requires knowing which repo the caller actually depends
 # on, and that lives in build manifests, not in code.
+# The manifest readers all pipe through one python3 module, and none of them
+# looked at whether it succeeded. A crash in deps.py made `cs provides` and
+# `cs versions` report a confident zero, and made `cs deps` and `cs publishes`
+# exit 0 with no output at all -- the worst of the set, because exit 0 is the
+# code that means "the query ran and found something".
+#
+# deps.py and owners.py already draw the same distinction cs does -- 0 found
+# something, 1 ran and found nothing, >=2 failed -- so only >=2 is an error
+# here. Treating every non-zero as a failure turns a legitimate "no repo
+# publishes this" into a refusal, which is the mirror image of the bug being
+# fixed and just as wrong: it makes an honest negative undetectable.
+manifest_ok_or_die() {  # <rc> <subcommand> <module> <what it was reading>
+  [[ "${1:-0}" -le 1 ]] && return 0
+  die "cs $2: $3 failed (exited $1), so nothing was read
+  it was $4, and no manifest was parsed — this is not 'nothing is declared'
+  check: cs repos   (are the repos in view the ones you expect?)"
+}
+
 cmd_provides() {
   [[ $# -ge 1 ]] || die "cs provides <coordinate>"
   require_python3 provides "reading the build manifests that declare it"
   answer declared "build manifests" "publish declarations"
-  local out; out=$(python3 "$lib_dir/deps.py" "$view" provides "$1")
+  local out rc; out=$(python3 "$lib_dir/deps.py" "$view" provides "$1"); rc=$?
+  manifest_ok_or_die "$rc" provides deps.py "looking for what publishes '$1'"
   # A bare `printf '%s\n' ""` emits a blank line, which reads as an answer and
   # is what `cs def X "$(cs provides …)"` silently turns into "every repo".
   if [[ -z "$out" ]]; then
@@ -1114,21 +1393,25 @@ cmd_provides() {
          "cs seam '$1'           (the coordinate may be referenced but not declared here)"
     return $CS_EXIT_NO_HITS
   fi
-  printf '%s\n' "$out"
+  emit_plain "$out"
   report_answer
 }
 
 cmd_deps() {
   require_python3 deps "reading the build manifests the graph is built from"
   answer declared "build manifests" "dependency declarations"
-  python3 "$lib_dir/deps.py" "$view" deps "${1:-}"
+  local out rc; out=$(python3 "$lib_dir/deps.py" "$view" deps "${1:-}"); rc=$?
+  manifest_ok_or_die "$rc" deps deps.py "building the fleet dependency graph"
+  emit_plain "$out"
   report_answer
 }
 
 cmd_publishes() {
   require_python3 publishes "reading the build manifests the graph is built from"
   answer declared "build manifests" "publish declarations"
-  python3 "$lib_dir/deps.py" "$view" publishes
+  local out rc; out=$(python3 "$lib_dir/deps.py" "$view" publishes); rc=$?
+  manifest_ok_or_die "$rc" publishes deps.py "reading what each repo publishes"
+  emit_plain "$out"
   report_answer
 }
 
@@ -1141,11 +1424,12 @@ cmd_publishes() {
 cmd_versions() {
   require_python3 versions "reading the version each build manifest pins"
   answer declared "build manifests" "${1:+$1, }version declarations"
-  local out err_file
+  local out rc err_file
   err_file=$(mktemp -t cs-versions.XXXXXX)
-  out=$(python3 "$lib_dir/deps.py" "$view" versions "${1:-}" 2>"$err_file")
+  out=$(python3 "$lib_dir/deps.py" "$view" versions "${1:-}" 2>"$err_file"); rc=$?
   if [[ -s "$err_file" ]]; then cat "$err_file" >&2; fi
   rm -f "$err_file"
+  manifest_ok_or_die "$rc" versions deps.py "reading the version each manifest pins"
   if [[ -z "$out" ]]; then
     report_answer 0 0
     hint "cs deps               (the coordinate may be spelled differently in the manifest)" \
@@ -1153,7 +1437,7 @@ cmd_versions() {
          "cs versions           (with no argument: every coordinate the fleet declares)"
     return $CS_EXIT_NO_HITS
   fi
-  printf '%s\n' "$out"
+  emit_plain "$out"
   # DRIFT is the finding; say so rather than leaving it in the table. A version
   # spread the caller did not notice is the same class of miss as a caller in a
   # repo they did not search.
@@ -1191,7 +1475,10 @@ cmd_owns() {
   # out -- while owners.py succeeding with no rows is an honest "nothing names
   # this". Collapsing them is the same mistake as collapsing a missing fleet
   # root into "nothing found".
-  if [[ $rc -ne 0 ]]; then
+  # >=2 only. owners.py returns 1 for "ran, and no rule matched", which is a
+  # real answer -- the last release treated it as a failure and refused, so
+  # `cs owns` on a path no CODEOWNERS rule covers stopped being answerable.
+  if [[ $rc -ge 2 ]]; then
     die "cs owns: could not read CODEOWNERS across the fleet (owners.py exited $rc)
   nothing was parsed, so this is not 'nobody owns it'
   check: cs repos (is the view what you expect?)"
@@ -1203,7 +1490,7 @@ cmd_owns() {
          "cs repos              (the exact repo names in view)"
     return $CS_EXIT_NO_HITS
   fi
-  printf '%s\n' "$out"
+  emit_plain "$out"
   # Stated every time, because a CODEOWNERS answer is the one most likely to be
   # repeated to a person as fact. It says who the file names, which is not the
   # same as who will review the change or who understands the code.
@@ -1231,20 +1518,30 @@ cmd_calls() {
     ast-grep)
       local args=(--follow -p "$pattern")
       [[ -n "$lang" ]] && args+=(-l "$lang")
-      out=$( (cd "$view" && run_timed ast-grep "${args[@]}" 2>/dev/null) | normalize ) ;;
+      local ag_raw ag_rc
+      ag_raw=$( (cd "$view" && run_timed ast-grep "${args[@]}" 2>/dev/null) ); ag_rc=$?
+      # ast-grep follows the grep convention, so an unparseable pattern or an
+      # unknown language is >=2 and distinguishable from an honest no-match.
+      note_grep_status "$ag_rc" ast-grep "matching '$pattern'${lang:+ in $lang}"
+      out=$(printf '%s\n' "$ag_raw" | normalize) ;;
     semgrep)
       # semgrep does not follow symlinks, so it is pointed at the real paths.
       local args=(-e "$pattern" --quiet --no-git-ignore)
       [[ -n "$lang" ]] && args+=(-l "$lang")
+      # semgrep exits 0 whether or not it matched, so any non-zero is an error.
+      # Recorded per repo inside the loop, because the loop's own status is only
+      # that of the last repo and a failure on the first would vanish.
       local d
       out=$(while IFS= read -r d; do
               [[ -n "$d" ]] || continue
               (cd "$(dirname "$d")" && run_timed semgrep "${args[@]}" "$(basename "$d")" 2>/dev/null)
+              note_run_status $? semgrep "matching '$pattern' in $(basename "$d")"
             done < <(real_dirs) | normalize) ;;
     *) die "unknown structural engine: $engine" ;;
   esac
 
   if [[ -z "$out" ]]; then
+    engines_ok_or_die calls
     report_answer 0 0
     # A structural engine returns nothing both when there is no match and when
     # it cannot parse the language at all. Those are very different, and the
@@ -1430,8 +1727,13 @@ cmd_history() {
       [[ -n "$d" && -d "$d/.git" ]] || continue
       name=$(basename "$d")
       [[ -n "$only" && "$name" != "$only" ]] && continue
+      # `|| continue` swallowed every git failure, so a repo git could not read
+      # -- a corrupt object store, a missing binary, an unreadable ref -- was
+      # indistinguishable from a repo with no matching commits. git exits 0
+      # whether or not the pickaxe matched, so non-zero is always a real error.
       log=$(run_timed git -C "$d" log --all --no-merges "$flag$want" \
-              --pretty=format:'%cs%x09%h%x09%an%x09%s' -- . 2>/dev/null) || continue
+              --pretty=format:'%cs%x09%h%x09%an%x09%s' -- . 2>/dev/null)
+      note_run_status $? git "reading history of $name"
       [[ -n "$log" ]] || continue
       out+=$(printf '%s\n' "$log" | sed "s|^|$name\t|")$'\n'
     done < <(real_dirs)
@@ -1454,6 +1756,7 @@ cmd_history() {
   fi
 
   if [[ -z "$rows" ]]; then
+    engines_ok_or_die history
     info "no commit in the view added, removed, or modified a line containing '$want'"
     report_answer 0 0
     hint "cs seam '$want'        (confirm any repo contains it at all)" \
@@ -1462,8 +1765,8 @@ cmd_history() {
   fi
   # Sorted by date across every repo, because the point is the interleaving:
   # a producer's change landing days before a consumer's incident is the signal.
-  printf '%s' "$rows" | sort -t$'\t' -k2,2 \
-    | awk -F'\t' '{ printf "%s  %-28s %-9s %-18s %s\n", $2, $1, $3, substr($4,1,18), $5 }'
+  emit_plain "$(printf '%s' "$rows" | sort -t$'\t' -k2,2 \
+    | awk -F'\t' '{ printf "%s  %-28s %-9s %-18s %s\n", $2, $1, $3, substr($4,1,18), $5 }')"
   report_answer "$(printf '%s' "$rows" | grep -c '')" \
                 "$(printf '%s' "$rows" | cut -f1 | sort -u | grep -c '')"
 }
@@ -1517,9 +1820,19 @@ EXIT CODES -- a refusal and a zero-hit answer are opposite facts, so they are
 different numbers. Branch on the code rather than reading the message:
 
   0   the query ran and found at least one hit
-  1   REFUSAL -- the query did not run. Nothing was searched, so nothing was
-      ruled out. Fix the cause; do not fall back to grep.
+  1   REFUSAL -- the query did not run, or an engine failed part-way. Nothing
+      was searched to completion, so nothing was ruled out. Fix the cause; do
+      not fall back to grep.
   2   the query ran honestly and found nothing. Weigh it by the kind above.
+
+A broken engine refuses rather than reporting 0 hits: ripgrep exiting 2, a
+regex that does not compile, or a crashing helper all produce empty output that
+is otherwise identical to an honest negative.
+
+--porcelain (or CS_JSON=1) puts one JSON object on stdout carrying all of the
+above -- kind, engine, hits, repos, degraded, partial, truncated, engine_errors
+and the results themselves -- including on a refusal, which has no result
+stream to attach anything to. stderr is unchanged either way.
 
 TABLE
   # Which kinds are reachable here, not only what each cannot see. A kind whose
@@ -1531,6 +1844,9 @@ TABLE
 fleet_only=0
 show_why=0
 quiet=0
+# Env as well as a flag: a caller wrapping cs in a script it does not control
+# can set CS_JSON=1 once rather than threading a flag through every call site.
+case "${CS_JSON:-0}" in 1|true|yes) porcelain=1 ;; esac
 touched_mode=0
 refresh_index=0
 force_engine=""
@@ -1547,6 +1863,7 @@ for a in "$@"; do
     --touched) touched_mode=1 ;;
     --engine=*) force_engine="${a#--engine=}" ;;
     --refresh) refresh_index=1 ;;
+    --porcelain|--json) porcelain=1 ;;
     *) args+=("$a") ;;
   esac
 done
@@ -1559,6 +1876,7 @@ set -- "${args[@]:-}"
 
 [[ $# -ge 1 && -n "${1:-}" ]] || usage 1
 sub="$1"; shift
+CS_SUB="$sub"; CS_QUERY="${1:-}"
 # Everything that reads the fleet must have one; the four that only explain the
 # tool must not require it, or the setup you are trying to diagnose blocks the
 # diagnosis. `cs engines` is deliberately in the exempt list and prints the root

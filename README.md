@@ -28,7 +28,7 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 45 checks against a throwaway fixture fleet
+scripts/verify-search              # 63 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only
@@ -142,6 +142,34 @@ if cs uses "$route" >/dev/null 2>&1; then echo "in use"; else echo "unused"; fi
 failure they got is a reasonable instruction for a human and a useless one for a
 script.
 
+A **broken** engine refuses as well, which is what makes `2` worth trusting.
+`cs engines` can report what is on `PATH`; it cannot report that ripgrep is on
+`PATH` and exiting 2 on every query, that the regex you typed does not compile,
+or that `deps.py` is crashing. Each produced no output and was reported as
+`0 hit(s)` — and splitting the exit codes made that *worse*, because a caller
+correctly branching on `2` now gets "the answer is no" from a search that
+crashed. Every engine's status is checked (`ripgrep`, `grep` and `ast-grep`
+share the `0`/`1`/`≥2` convention; `semgrep` and `git` report `0` either way),
+and an empty result from a failed engine refuses.
+
+### And the metadata is available as data
+
+Everything that decides how much an answer is worth was prose on stderr — the
+answer kind and the four warnings that must not be swallowed. `--porcelain` (or
+`CS_JSON=1`) puts one JSON object on stdout instead of the result lines:
+
+```json
+{"cs":1,"subcommand":"uses","exit":0,"refused":false,"kind":"heuristic",
+ "engine":"ripgrep","hits":2,"repos":2,"degraded":null,"partial":false,
+ "truncated":false,"returned":2,"engine_errors":[],
+ "results":[{"repo":"…","path":"…","line":7,"text":"…"}]}
+```
+
+Refusals carry the envelope too, with `refused: true` and the reason — the case
+with no result stream to attach anything to. `hits` is how many exist and
+`returned` how many came back, so a cap is visible without reading a warning.
+stderr is untouched, so `--porcelain` composes with `--quiet`.
+
 ### And `cs engines` reports answer kinds, not just binaries
 
 The contract is expressed in answer kinds; the install is a list of binaries;
@@ -177,6 +205,7 @@ kind's blind spots.
 | `CS_TEXT_ENGINE` | force `rg` or `grep`, so the two can be compared rather than trusted |
 | `CS_EXCLUDE_EXTRA` | directories to skip, added to the built-in list |
 | `CS_EXCLUDE_REMOVE` | directories to **stop** skipping |
+| `CS_JSON` | `1` for one JSON object on stdout instead of result lines (same as `--porcelain`) |
 
 `CS_EXCLUDE_REMOVE` matters more than it looks. The built-in exclusion list is a
 guess about other people's repos, and some entries are wrong for some of them:
@@ -380,7 +409,7 @@ needs `FLEET_ROOT` set — which makes it the right first thing to run, before t
 fleet exists. Simply asking the agent to "verify code-search" also works, and
 avoids the path entirely: the skill resolves it from `CLAUDE_PLUGIN_ROOT`.
 
-**Cost: ~200 tokens always-on**, and the ~7.6k skill body only loads when a
+**Cost: ~200 tokens always-on**, and the ~8.2k skill body only loads when a
 search question actually comes up. `claude plugin details code-search` reports
 both numbers for the version you actually have installed — prefer it to this
 line, which is a snapshot: the always-on figure was ~150 before `cs owns` and
@@ -388,7 +417,7 @@ line, which is a snapshot: the always-on figure was ~150 before `cs owns` and
 
 That split is the argument against exposing this over MCP instead: MCP tool
 schemas sit in context for the whole session whether or not you search, so the
-7.6k would be permanent rather than on demand.
+8.2k would be permanent rather than on demand.
 
 From a plain clone instead, symlink the skill:
 

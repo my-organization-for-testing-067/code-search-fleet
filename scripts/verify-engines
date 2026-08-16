@@ -67,7 +67,12 @@ prev_outcome() { [[ -f $baseline ]] && awk -F'\t' -v e="$1" '$1==e{print $4; exi
 version_of() {
   case "$1" in
     ripgrep)   rg --version 2>/dev/null | head -1 | awk '{print $2}' ;;
-    ctags)     "$($here/cs engines >/dev/null 2>&1; echo)" ;;
+    # Was `"$($here/cs engines >/dev/null 2>&1; echo)"`, which discarded the
+    # output it ran cs for, expanded to the empty string, and then tried to
+    # EXECUTE that as a command. It survived because nothing calls this branch
+    # -- probe_ctags reads the version itself -- but a dead branch that fails
+    # the moment it is used is worse than no branch.
+    ctags)     ctags_bin >/dev/null 2>&1 && "$(ctags_bin)" --version 2>&1 | head -1 | awk '{print $3}' | tr -d , ;;
     ast-grep)  ast-grep --version 2>/dev/null | awk '{print $2}' ;;
     semgrep)   semgrep --version 2>/dev/null | head -1 ;;
     tokensave) tokensave --version 2>/dev/null | awk '{print $2}' ;;
