@@ -69,6 +69,20 @@ test payload in another repo will not have. ai-toolbox's `scripts/verify-contrac
 drives checkout's real `InventoryClient` against this and checks that the
 PROJ-388 introducing commit fails against it.
 
-Port 18080 rather than 8080, so it does not fight with whatever is already
-running; override with `INVENTORY_PORT`. Only this one service is here — a
-broker for the `orders.reserved.v1` side is a separate increment.
+The `events` profile adds a single-node Kafka for the other seam
+(`orders.reserved.v1`), so fulfillment-worker's `ReservationConsumer` can be run
+against a real broker — its own suite never touches it:
+
+```sh
+docker compose -f fixtures/docker-compose.yml --profile events up -d kafka
+```
+
+Ports are 18080 and 19092 rather than 8080 and 9092, so they do not fight with
+whatever is already running; override with `INVENTORY_PORT` and `KAFKA_PORT`.
+
+One thing worth knowing before debugging a stuck consumer: a client killed
+rather than closed leaves a member in the group, and that holds the group in
+`PreparingRebalance` for the rebalance timeout — five minutes by default — so
+the *next* consumer gets no partition assigned and looks broken when it is not.
+`verify-contract` recreates the broker between scenarios rather than trying to
+hand one back clean.

@@ -6,8 +6,10 @@
 # whose InventoryClient does the calling -- so the checkout side is a test that
 # points at this, run by ai-toolbox's scripts/verify-contract.
 #
-# Kafka and the fulfillment worker are deliberately not here. That is a separate
-# increment, and this one pays off on its own.
+# The broker for the other seam (orders.reserved.v1) is behind the `events`
+# profile, so the HTTP check does not pay for starting one:
+#
+#   docker compose --profile events up -d
 services:
   inventory-api:
     build:
@@ -21,3 +23,33 @@ services:
       # The `__` is .NET's section separator; the dots are part of the key.
       features__inventory.reserve.enabled: "true"
       ASPNETCORE_ENVIRONMENT: Development
+
+  # The other seam: checkout publishes orders.reserved.v1, fulfillment-worker
+  # consumes it. Its own test suite never touches the consumer -- pyproject.toml
+  # says so outright, because acme-schemas is not installable here -- so this is
+  # the only way that wiring gets exercised at all.
+  #
+  # Single-node KRaft: no ZooKeeper, and one container is enough for a fixture.
+  kafka:
+    image: apache/kafka:3.7.0
+    profiles: ["events"]
+    ports:
+      - "${KAFKA_PORT:-19092}:19092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:19092
+      # Two listeners on purpose: PLAINTEXT for anything inside the compose
+      # network, HOST for a client on the developer's machine. Advertising only
+      # the internal one is the usual reason a host client connects, gets told
+      # to talk to "kafka:9092", and then hangs.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:${KAFKA_PORT:-19092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      CLUSTER_ID: fixture-fleet-cluster
