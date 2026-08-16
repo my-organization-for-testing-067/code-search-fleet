@@ -1,7 +1,10 @@
-
 .DS_Store
-.idea/
 *.local.*
+
+# Editor state — the whole repo ships to anyone who installs the plugin.
+.idea/
+.vscode/
+
 # .NET build output in fixtures
 bin/
 obj/
