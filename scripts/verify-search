@@ -233,10 +233,21 @@ info "${C_BOLD}history${C_OFF}"
 hist_repo="$FLEET_ROOT/pricing-lib-java"
 hist_file="$hist_repo/src/main/java/com/acme/pricing/DiscountEngine.java"
 if [[ -f "$hist_file" ]]; then
+  # Identity passed explicitly. A CI runner has no user.name/user.email, so
+  # `git commit` failed with status 128, the two probe commits were never made,
+  # and both checks below failed for a reason that had nothing to do with cs --
+  # while `2>/dev/null` hid the only message that said so. build-fixtures got
+  # this right from the start; this did not.
+  hist_git() { git -C "$hist_repo" -c user.name=verify -c user.email=verify@local "$@"; }
+  # Where to rewind to, recorded rather than assumed. `reset --hard HEAD~2`
+  # unwinds two REAL fixture commits when the probe commits did not happen,
+  # quietly corrupting the fleet for every check that follows.
+  hist_base=$(git -C "$hist_repo" rev-parse HEAD 2>/dev/null || echo "")
+
   printf '\n// marker: PARITYSENTINEL added\n' >> "$hist_file"
-  git -C "$hist_repo" commit -aqm 'add sentinel' 2>/dev/null
+  hist_git commit -aqm 'add sentinel' || warn "  probe commit failed; history checks below are not meaningful"
   perl -pi -e 's/PARITYSENTINEL added/PARITYSENTINEL reworded in place/' "$hist_file"
-  git -C "$hist_repo" commit -aqm 'reword sentinel in place' 2>/dev/null
+  hist_git commit -aqm 'reword sentinel in place' || true
 
   h=$("$here/cs" history 'PARITYSENTINEL' 2>&1)
   if printf '%s' "$h" | grep -q 'add sentinel'; then
@@ -254,7 +265,9 @@ if [[ -f "$hist_file" ]]; then
     fail=$((fail + 1)); failed_ids+=("history-escalation")
   fi
 
-  git -C "$hist_repo" reset --hard -q HEAD~2 2>/dev/null
+  if [[ -n "$hist_base" ]]; then
+    git -C "$hist_repo" reset --hard -q "$hist_base" 2>/dev/null
+  fi
 else
   warn "history checks SKIPPED (fixture layout changed)"
 fi
@@ -408,6 +421,28 @@ if [[ ${#excl_bad[@]} -eq 0 ]]; then
 else
   err "CS_EXCLUDE_REMOVE emptying the list broke: ${excl_bad[*]}"
   fail=$((fail + 1)); failed_ids+=("empty-exclusion-list")
+fi
+
+# `cs def` reuses its symbol index for CS_TAGS_TTL seconds, so the second call
+# takes a completely different code path from the first -- and that path read
+# the file's mtime with `stat -f %m`, which means "format" on BSD and
+# "filesystem" on GNU. On Linux it therefore printed a filesystem dump into an
+# arithmetic expression and killed the command, so `cs def` worked once and then
+# failed for the next 60 seconds. Every check that ran a second `cs def` failed
+# with it, and none of them said why.
+#
+# Calling it twice is the whole test. Nothing else exercised the cache hit,
+# which is why a bug affecting every Linux user survived a green macOS run.
+def_first=$("$here/cs" def Reserve --refresh 2>&1)
+def_cached=$("$here/cs" def Reserve 2>&1)
+if printf '%s' "$def_cached" | grep -q 'ReservationController' \
+   && printf '%s' "$def_cached" | grep -q 'cached'; then
+  ok "a second 'cs def' answers from the cache"; pass=$((pass + 1))
+elif printf '%s' "$def_first" | grep -q 'ReservationController'; then
+  err "'cs def' answered once, then failed on the cache-hit path"
+  fail=$((fail + 1)); failed_ids+=("def-cache-hit")
+else
+  err "'cs def' did not answer at all"; fail=$((fail + 1)); failed_ids+=("def-cache-hit")
 fi
 
 # Agents issue tool calls in parallel. `cs def` cached its symbol index at a

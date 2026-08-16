@@ -222,6 +222,30 @@ real_dirs() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Modification time in epoch seconds, or 0 if it cannot be determined.
+#
+# GNU and BSD `stat` share a name and almost nothing else. `-f` is "use this
+# format" on BSD and "report on the FILESYSTEM" on GNU -- so `stat -f %m file`
+# on Linux treats `%m` as a filename, fails with status 1, and *still writes a
+# multi-line filesystem dump to STDOUT*. The obvious `stat -f %m || stat -c %Y`
+# chain therefore captured both the dump and the epoch, and substituting that
+# into $(( )) killed the command with "File: unbound variable".
+#
+# The consequence was not a crash anyone would notice, which is why it survived:
+# only the CACHE-HIT path reads the mtime, so on Linux `cs def` worked the first
+# time and then failed for the next 60 seconds. Hence: try each dialect, and
+# accept the answer only if it is actually a number.
+file_mtime() {
+  local t
+  for t in "$(stat -c %Y "$1" 2>/dev/null)" "$(stat -f %m "$1" 2>/dev/null)"; do
+    case "$t" in
+      ''|*[!0-9]*) ;;
+      *) printf '%s\n' "$t"; return 0 ;;
+    esac
+  done
+  printf '0\n'
+}
+
 # ---- what gets searched ----------------------------------------------------
 # One exclusion list, shared by every text backend. This exists so that the
 # answer does not depend on which engine happens to be installed: ripgrep and
@@ -702,8 +726,8 @@ cmd_def() {
   tags="${TMPDIR:-/tmp}/cs-tags-${fp}.tags"
 
   if [[ $refresh_index -eq 0 && -s "$tags" ]]; then
-    age=$(( $(date +%s) - $(stat -f %m "$tags" 2>/dev/null || stat -c %Y "$tags" 2>/dev/null || echo 0) ))
-    if [[ $age -lt $ttl ]]; then cached="cached ${age}s ago"; fi
+    age=$(( $(date +%s) - $(file_mtime "$tags") ))
+    if [[ $age -ge 0 && $age -lt $ttl ]]; then cached="cached ${age}s ago"; fi
   fi
 
   # Built to a private path and moved into place, never written where a reader
