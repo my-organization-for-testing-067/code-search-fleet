@@ -51,3 +51,24 @@ worktree, and branch operations behave like real repos.
 
 `GROUND-TRUTH.md` lists every planted relation and what a correct answer looks
 like. Read it *after* running a search, not before.
+
+## Running one of them
+
+`docker-compose.yml` brings up **inventory-api** so the HTTP boundary between it
+and checkout can be exercised instead of read:
+
+```sh
+docker compose -f fixtures/docker-compose.yml up -d --build
+curl -X POST http://localhost:18080/api/v1/inventory/reserve \
+  -H 'content-type: application/json' -d '{"sku":"SKU-1","quantity":1}'
+```
+
+The response comes back **indented**, which is the whole point — that is the
+serializer setting the PROJ-388 incident turns on, and the shape a hand-written
+test payload in another repo will not have. ai-toolbox's `scripts/verify-contract`
+drives checkout's real `InventoryClient` against this and checks that the
+PROJ-388 introducing commit fails against it.
+
+Port 18080 rather than 8080, so it does not fight with whatever is already
+running; override with `INVENTORY_PORT`. Only this one service is here — a
+broker for the `orders.reserved.v1` side is a separate increment.

@@ -1,0 +1,23 @@
+# Step 2 of the runnable-fixture plan (docs/repo-fleet.md in ai-toolbox).
+#
+# Brings up the one service that has to be running for the PROJ-388 contract to
+# be exercised instead of read: the HTTP boundary between checkout and
+# inventory. checkout-service-kotlin has no server of its own -- it is a library
+# whose InventoryClient does the calling -- so the checkout side is a test that
+# points at this, run by ai-toolbox's scripts/verify-contract.
+#
+# Kafka and the fulfillment worker are deliberately not here. That is a separate
+# increment, and this one pays off on its own.
+services:
+  inventory-api:
+    build:
+      context: ./repos/inventory-api-dotnet
+    ports:
+      # 18080 rather than 8080: this is a fixture and it must not fight with
+      # whatever the developer already has running. Override with INVENTORY_PORT.
+      - "${INVENTORY_PORT:-18080}:8080"
+    environment:
+      # Flags fail closed since PROJ-489, so reserve returns 503 without this.
+      # The `__` is .NET's section separator; the dots are part of the key.
+      features__inventory.reserve.enabled: "true"
+      ASPNETCORE_ENVIRONMENT: Development
