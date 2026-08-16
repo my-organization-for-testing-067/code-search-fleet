@@ -131,8 +131,11 @@ gives it inline.
 
 Four warnings `cs` emits that you must pass on rather than swallow:
 
-- **`PARTIAL`** — an engine hit its timeout, so the result is a subset, not an
-  answer. Raise `CS_TIMEOUT` and rerun before concluding anything from it.
+- **`PARTIAL`** — the result is a subset, not an answer. Two causes: an engine
+  hit its timeout (raise `CS_TIMEOUT` and rerun), or files could not be read and
+  were skipped. The skipped paths are always named — read them. Two dangling
+  symlinks cannot hide a symbol, so a negative is still worth something; a
+  skipped directory of 400 files is a different matter.
 - **`showing N of M`** — capped at 200 results. The per-repo distribution of all
   M is printed; use it to narrow, or pass `--all`.
 - **`degraded:`** — an engine was missing and `cs` fell back to another with a
@@ -187,6 +190,12 @@ not compile, `ast-grep` rejecting its own pattern, a crashing helper — produce
 empty output that is byte-identical to an honest negative. `cs` checks every
 engine's exit status, so `2` means the search actually ran to completion. If you
 see a refusal naming an engine, report the engine; do not retry with `grep`.
+
+A file that could not be **read** is a different thing and does not refuse —
+ripgrep reports a dangling symlink with the same exit 2 it uses for a broken
+regex, and one such file on a real fleet would otherwise block every negative
+result on it. Those come back as a normal answer carrying `PARTIAL` and the
+skipped paths.
 
 ### `--porcelain` when you want the metadata as data
 

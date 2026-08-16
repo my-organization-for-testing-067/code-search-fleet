@@ -28,7 +28,7 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 63 checks against a throwaway fixture fleet
+scripts/verify-search              # 68 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only
@@ -151,6 +151,16 @@ correctly branching on `2` now gets "the answer is no" from a search that
 crashed. Every engine's status is checked (`ripgrep`, `grep` and `ast-grep`
 share the `0`/`1`/`≥2` convention; `semgrep` and `git` report `0` either way),
 and an empty result from a failed engine refuses.
+
+A file that could not be **read** is deliberately not in that category. ripgrep
+uses exit 2 for "could not open one file out of 84,000" as well as for a broken
+regex, and treating those alike meant a single committed symlink pointing at a
+former colleague's home directory made *every zero-hit query on the fleet
+refuse* — while queries with hits answered normally. `cs` parses the engine's
+stderr, so a per-file error becomes `PARTIAL` with the skipped paths named, and
+only a systemic failure refuses. Recursive `grep` skips such a file silently, so
+`cs` finds it separately on that backend: a negative has to mean the same thing
+whichever engine is installed.
 
 ### And the metadata is available as data
 

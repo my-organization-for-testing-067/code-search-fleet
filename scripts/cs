@@ -269,8 +269,10 @@ cs_emit_porcelain() {
   [[ $porcelain -eq 1 ]] || return 0
   local refused=false
   [[ "$rc" -eq "$CS_EXIT_REFUSED" ]] && refused=true
+  # PARTIAL covers both ways a result can be a subset of the truth: an engine
+  # that ran out of time, and files it could not read.
   local partial=false
-  timed_out && partial=true
+  { timed_out || files_skipped; } && partial=true
   printf '{'
   printf '"cs":1,'
   printf '"subcommand":%s,' "$(json_str "$CS_SUB")"
@@ -302,6 +304,7 @@ cs_emit_porcelain() {
   else printf '"truncated":false,'; fi
   printf '"returned":%s,' "$(printf '%s' "$CS_RESULTS" | grep -c '[^[:space:]]')"
   printf '"engine_errors":%s,' "$(engine_error_lines | json_lines)"
+  printf '"skipped":%s,'       "$(skipped_paths | json_lines)"
   printf '"hints":%s,'         "$(printf '%s' "$CS_HINTS"   | json_lines)"
   printf '"results":%s'        "$(printf '%s' "$CS_RESULTS" | json_results)"
   printf '}\n'
@@ -318,6 +321,8 @@ cleanup_view() {
   # not come back to a rm.
   rm -f "${TMPDIR:-/tmp}"/cs-serena."$$".* "${TMPDIR:-/tmp}"/cs-serena-err."$$".* 2>/dev/null
   [[ -n "${CS_ENGINE_ERR_FLAG:-}" ]] && rm -f "$CS_ENGINE_ERR_FLAG"
+  [[ -n "${CS_SKIPPED_FLAG:-}" ]] && rm -f "$CS_SKIPPED_FLAG"
+  rm -f "${TMPDIR:-/tmp}"/cs-engerr."$$".* "${TMPDIR:-/tmp}"/cs-uses."$$".* 2>/dev/null
   return 0
 }
 # $? is captured first: the porcelain envelope reports the real exit status, and
@@ -559,6 +564,75 @@ engine_error()       { printf '%s\n' "$*" >> "$CS_ENGINE_ERR_FLAG"; }
 engine_failed()      { [[ -s "$CS_ENGINE_ERR_FLAG" ]]; }
 engine_error_lines() { sort -u "$CS_ENGINE_ERR_FLAG" 2>/dev/null; }
 
+# ---- unreadable files are PARTIAL, not broken ------------------------------
+# ripgrep overloads exit 2: from its own docs 0 = match, 1 = no match, 2 =
+# error -- and that one code covers "bad regex", "binary missing", and "could
+# not open one file out of 84,000". Only the first two are systemic. The third
+# is per-file and routine on any real multi-repo checkout: committed symlinks
+# whose targets do not exist on this machine, permission bits, files deleted
+# mid-scan, dangling worktree links.
+#
+# Treating them alike meant one unreadable file anywhere in the fleet made
+# every ZERO-HIT query refuse, while queries with hits answered normally. On a
+# 37-repo fleet with two broken symlinks in someone else's repo, no negative
+# result was obtainable at all -- and "is this dead?" is the question this tool
+# is best at. 84,783 of 84,785 files had been searched to completion.
+#
+# So the two are separated by parsing the stderr cs was already capturing, and
+# a per-file failure becomes PARTIAL -- the vocabulary timeouts already use and
+# that the skill already tells agents to pass on rather than swallow.
+CS_SKIPPED_FLAG="$(mktemp -t cs-skipped.XXXXXX)"
+note_skipped()  { printf '%s\n' "$1" >> "$CS_SKIPPED_FLAG"; }
+files_skipped() { [[ -s "$CS_SKIPPED_FLAG" ]]; }
+skipped_paths() { sed -e "s|^\./||" -e "s|^${view}/||" "$CS_SKIPPED_FLAG" 2>/dev/null | sort -u; }
+skipped_count() { skipped_paths | grep -c ''; }
+
+# A per-file read error, across the three spellings that occur in practice:
+#   rg:    rg: ./path: No such file or directory (os error 2)
+#   grep:  grep: path: Permission denied
+#   ugrep: ugrep: warning: ./path: No such file or directory
+# The trailing errno phrase is what makes this safe to match on. `rg: regex
+# parse error:` and `ugrep: error: error at position 7` both fail it, so a
+# systemic failure cannot be mistaken for a skipped file.
+CS_PERFILE_RE='^[A-Za-z0-9_.+-]+: (warning: )?(.+): (No such file or directory|Permission denied|Is a directory|Not a directory|Too many levels of symbolic links|Operation not permitted|Input/output error|Device not configured|Bad file descriptor)( \(os error [0-9]+\))?$'
+
+# classify_engine_stderr <stderr-file> -> 0 if every line was per-file, 1 if any
+# line was systemic. Systemic lines are passed through to stderr, because an
+# uncompilable regex is exactly the message the caller needs to see; per-file
+# lines are collected and summarised once instead of printed by the hundred.
+classify_engine_stderr() {
+  local ef="$1" line systemic=0
+  [[ -s "$ef" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] || continue
+    if [[ "$line" =~ $CS_PERFILE_RE ]]; then
+      note_skipped "${BASH_REMATCH[2]}"
+    else
+      systemic=1
+      printf '%s\n' "$line" >&2
+    fi
+  done < "$ef"
+  return $systemic
+}
+
+# note_search_result <rc> <stderr-file> <engine> <what it was doing>
+# For the 0/1/>=2 family (ripgrep, grep, ast-grep). An exit >=2 explained
+# entirely by per-file errors is PARTIAL; anything else is a failure.
+note_search_result() {
+  local rc="${1:-0}" ef="$2" eng="$3" what="$4"
+  if classify_engine_stderr "$ef"; then
+    # Every message accounted for as a skipped file. An exit >=2 with NO
+    # explanation at all is still a failure -- silence is not evidence of
+    # health, and that is the case where the engine simply did not run.
+    if [[ "$rc" -ge 2 ]] && ! files_skipped; then
+      engine_error "$eng exited $rc while $what (no diagnostic)"
+    fi
+  else
+    engine_error "$eng exited $rc while $what"
+  fi
+  return 0
+}
+
 # note_grep_status <rc> <engine> <what it was doing>
 # For the 0/1/>=2 family. 1 is a real "no match" and must stay silent.
 note_grep_status() {
@@ -575,6 +649,11 @@ note_run_status() {
 # Called at every zero-hit branch, before the emptiness is reported as an
 # answer. This is the structural-tier twin of serena_answered_or_die.
 engines_ok_or_die() {  # <subcommand>
+  # Only SYSTEMIC failures refuse. A per-file read error has already been
+  # recorded as a skipped path, and a zero-hit result that skipped two dangling
+  # symlinks is still an answer -- refusing there blocked every negative on the
+  # whole fleet over two files that had nothing to do with the query.
+  scan_unreadable_for_grep
   engine_failed || return 0
   die "cs $1: an engine failed, so this empty result is not an answer
 $(engine_error_lines | sed 's/^/  /')
@@ -608,7 +687,11 @@ grep_fleet() {
       regex)   extra="-E" ;;
     esac
   fi
-  local rc=0
+  # Captured rather than discarded (grep) or let through to the terminal (rg):
+  # it is the only thing that separates "could not open one file" from "the
+  # regex does not compile", and both arrive as exit 2.
+  local rc=0 err_f
+  err_f=$(mktemp -t "cs-engerr.$$")
   if [[ "$engine" == ripgrep ]]; then
     # --regexp is ripgrep's default, so pass a harmless flag instead of none.
     [[ "$extra" == "--regexp" ]] && extra="--no-config"
@@ -616,11 +699,11 @@ grep_fleet() {
     for d in ${CS_EXCLUDE_DIRS[@]+"${CS_EXCLUDE_DIRS[@]}"}; do globs+=(--glob "!**/$d/**" --glob "!$d/**"); done
     (cd "$view" && run_timed rg --follow --hidden --no-ignore \
         --no-heading --line-number --color=never \
-        ${globs[@]+"${globs[@]}"} "$extra" -- "$pattern" .)
+        ${globs[@]+"${globs[@]}"} "$extra" -- "$pattern" .) 2>"$err_f"
     rc=$?
-    # 1 is "no match" and must stay silent; 2 is a real failure -- most often an
-    # uncompilable regex, which used to be reported as a confident zero.
-    note_grep_status "$rc" ripgrep "searching for '$pattern'"
+    # 1 is "no match" and must stay silent; 2 is either an uncompilable regex
+    # (systemic, refuse) or an unreadable file (per-file, PARTIAL).
+    note_search_result "$rc" "$err_f" ripgrep "searching for '$pattern'"
   else
     # BSD grep's -R follows a symlink named on the command line but NOT one it
     # meets while recursing, so `grep -R pattern .` silently finds nothing in a
@@ -630,11 +713,37 @@ grep_fleet() {
     local ex=() d
     for d in ${CS_EXCLUDE_DIRS[@]+"${CS_EXCLUDE_DIRS[@]}"}; do ex+=("--exclude-dir=$d"); done
     run_timed grep -Rn --binary-files=without-match \
-        ${ex[@]+"${ex[@]}"} "$extra" -- "$pattern" "$view"/*/ 2>/dev/null
+        ${ex[@]+"${ex[@]}"} "$extra" -- "$pattern" "$view"/*/ 2>"$err_f"
     rc=$?
-    note_grep_status "$rc" grep "searching for '$pattern'"
+    note_search_result "$rc" "$err_f" grep "searching for '$pattern'"
   fi
+  rm -f "$err_f"
   return $rc
+}
+
+# Recursive grep skips a dangling symlink SILENTLY -- it never reports the file
+# ripgrep exits 2 over -- so the same fleet yields a clean negative on one
+# backend and a PARTIAL one on the other. A negative has to mean the same thing
+# whichever engine happens to be installed, which is the property verify-search
+# already asserts for results and did not assert for what was skipped.
+#
+# Only run when it can change what an answer MEANS: on the grep backend, when
+# the query found nothing and grep reported nothing. That is the one case where
+# a silent skip turns into a false "this is dead", and it keeps a whole extra
+# filesystem walk off every query that already has an answer.
+scan_unreadable_for_grep() {
+  [[ "$(text_engine)" == grep ]] || return 0
+  files_skipped && return 0
+  local prune=() d first=1
+  for d in ${CS_EXCLUDE_DIRS[@]+"${CS_EXCLUDE_DIRS[@]}"}; do
+    if [[ $first -eq 1 ]]; then prune+=(-name "$d"); first=0
+    else prune+=(-o -name "$d"); fi
+  done
+  # -L makes find follow symlinks, so one that still reports as -type l is a
+  # symlink whose target does not resolve: exactly the file grep passed over.
+  while IFS= read -r d; do
+    [[ -n "$d" ]] && note_skipped "$d"
+  done < <(find -L "$view"/*/ \( "${prune[@]}" \) -prune -o -type l -print 2>/dev/null)
 }
 ctags_bin() {
   # On macOS, Homebrew's universal-ctags is shadowed by the BSD ctags in
@@ -989,6 +1098,15 @@ report_answer() {
     warn "an engine failed during this query; these results are INCOMPLETE:"
     engine_error_lines | sed 's/^/  /' >&2
   fi
+  # Named, not merely counted. Two broken symlinks cannot hide a symbol; a
+  # skipped directory of 400 files might, and only the paths let a reader tell
+  # those apart. Capped so a fleet with thousands of them stays readable.
+  if files_skipped; then
+    local n; n=$(skipped_count)
+    warn "$n file(s) could not be read and were skipped; this result is PARTIAL:"
+    skipped_paths | head -10 | sed 's/^/  /' >&2
+    [[ "$n" -gt 10 ]] && info "  … and $((n - 10)) more"
+  fi
   [[ $quiet -eq 1 || -z "$CS_KIND" ]] && return 0
   local line="${C_BOLD}answer:${C_OFF} $CS_KIND via $CS_ENGINE"
   [[ -n "$CS_NOTE" ]] && line="$line ($CS_NOTE)"
@@ -1212,19 +1330,23 @@ cmd_uses() {
   # provenance claim the run did not honour -- the exact overstatement the kind
   # labels exist to prevent -- so the note is built from what actually happened.
   unsup_file="$(mktemp -t cs-unsup.XXXXXX)"
-  # pipefail makes this the status of whichever stage failed. grep_fleet's own
-  # 1 ("no match") is legitimate and is filtered out by note_grep_status, which
-  # already ran inside it; what is caught here is filter_code.py dying, which
-  # emptied the stream and left `cs uses` reporting a confident zero while still
-  # claiming "prose filtered" -- a filter that had not run.
-  local filter_rc
-  hits=$(grep_fleet literal "$1" | normalize \
-         | python3 "$lib_dir/filter_code.py" --root "$view" --report-unsupported 2>"$unsup_file")
+  # Two steps rather than one pipeline. Under pipefail the pipeline's status is
+  # whichever stage failed LAST, so ripgrep exiting 2 over an unreadable file
+  # was reported as "filter_code.py exited 2" -- blaming a stage that had run
+  # perfectly. grep_fleet records its own status internally; what is caught
+  # here is filter_code.py actually dying, which empties the stream and leaves
+  # `cs uses` reporting a confident zero while still claiming "prose filtered".
+  local filter_rc raw_hits
+  raw_hits=$(mktemp -t "cs-uses.$$")
+  grep_fleet literal "$1" | normalize > "$raw_hits"
+  hits=$(python3 "$lib_dir/filter_code.py" --root "$view" --report-unsupported \
+         < "$raw_hits" 2>"$unsup_file")
   filter_rc=$?
   unsupported=$(cut -f1 "$unsup_file" | sort -u | tr '\n' ' ' | sed 's/ $//')
   rm -f "$unsup_file"
-  # grep_fleet returns 1 on a legitimate no-match, and the pipeline inherits it.
-  [[ "$filter_rc" -gt 1 ]] && engine_error "filter_code.py exited $filter_rc while removing comments from the hits"
+  # filter_code.py exits 0 on every legitimate outcome, including empty input,
+  # so any non-zero here is the filter itself failing.
+  [[ "$filter_rc" -ne 0 ]] && engine_error "filter_code.py exited $filter_rc while removing comments from the hits"
   if [[ -n "$unsupported" ]]; then
     answer heuristic "$(text_engine)" "literal, prose filtered except: $unsupported"
   else
@@ -1234,7 +1356,9 @@ cmd_uses() {
     engines_ok_or_die uses
     info "no code uses '$1'"
     local prose
-    prose=$(grep_fleet literal "$1" | normalize | python3 "$lib_dir/filter_code.py" --invert --root "$view" 2>/dev/null)
+    # Re-uses the captured hits rather than searching a second time: a repeat
+    # grep_fleet would re-report every unreadable file and double the count.
+    prose=$(python3 "$lib_dir/filter_code.py" --invert --root "$view" < "$raw_hits" 2>/dev/null)
     if [[ -n "$prose" ]]; then
       warn "mentioned only in comments/docs:"
       # stderr, like every other diagnostic. On stdout these lines landed in the
@@ -1244,9 +1368,11 @@ cmd_uses() {
       # answer that correctly excluded it.
       printf '%s\n' "$prose" >&2
     fi
+    rm -f "$raw_hits"
     report_answer 0 0
     return $CS_EXIT_NO_HITS
   fi
+  rm -f "$raw_hits"
   [[ -n "$unsupported" ]] && warn "comments were NOT filtered in: $unsupported — hits in those files may be prose (cs why heuristic)"
   emit_capped "$hits"
   repos=$(printf '%s\n' "$hits" | cut -d/ -f1 | sort -u)
@@ -1518,11 +1644,15 @@ cmd_calls() {
     ast-grep)
       local args=(--follow -p "$pattern")
       [[ -n "$lang" ]] && args+=(-l "$lang")
-      local ag_raw ag_rc
-      ag_raw=$( (cd "$view" && run_timed ast-grep "${args[@]}" 2>/dev/null) ); ag_rc=$?
+      local ag_raw ag_rc ag_err
+      ag_err=$(mktemp -t "cs-engerr.$$")
+      ag_raw=$( (cd "$view" && run_timed ast-grep "${args[@]}") 2>"$ag_err" ); ag_rc=$?
       # ast-grep follows the grep convention, so an unparseable pattern or an
-      # unknown language is >=2 and distinguishable from an honest no-match.
-      note_grep_status "$ag_rc" ast-grep "matching '$pattern'${lang:+ in $lang}"
+      # unknown language is >=2 and distinguishable from an honest no-match --
+      # and, like ripgrep, it reports an unreadable file the same way, which is
+      # a skipped file rather than a broken engine.
+      note_search_result "$ag_rc" "$ag_err" ast-grep "matching '$pattern'${lang:+ in $lang}"
+      rm -f "$ag_err"
       out=$(printf '%s\n' "$ag_raw" | normalize) ;;
     semgrep)
       # semgrep does not follow symlinks, so it is pointed at the real paths.

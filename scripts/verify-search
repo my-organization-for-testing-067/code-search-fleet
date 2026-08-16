@@ -749,6 +749,81 @@ refuses "a crashing deps.py refuses (cs versions)"  "deps.py failed" "$brokenlib
 refuses "a crashing prose filter refuses (cs uses)" "engine failed"  "$brokenlib/cs" uses 'reservationId'
 rm -rf "$brokenlib"
 
+# ---- an unreadable file is PARTIAL, not a broken engine --------------------
+# ripgrep overloads exit 2: bad regex, missing binary, and "could not open one
+# file out of 84,000" are the same code. Treating them alike meant one dangling
+# symlink anywhere in the fleet made every ZERO-HIT query refuse, while queries
+# WITH hits answered normally — so on a real 37-repo fleet with two broken
+# symlinks in someone else's repo, no negative result was obtainable at all.
+#
+# A committed symlink whose target does not exist on this machine is near
+# universal on multi-repo checkouts, which is why it is seeded here rather than
+# left to chance. Seeded and removed in-place, like the .github parity probe:
+# baking it into build-fixtures would attach a PARTIAL warning to every other
+# check in this file.
+info ""
+info "${C_BOLD}unreadable files${C_OFF}"
+dangle_repo="$FLEET_ROOT/inventory-api-dotnet"
+ln -sf /nonexistent/former-employee/notes.md "$dangle_repo/CLAUDE.local.md"
+ln -sf ../../nonexistent/import "$dangle_repo/src/import"
+
+# The headline: a negative must still be obtainable.
+dang_out=$("$here/cs" uses 'cs-absent-probe-dangling-xyzzy' 2>&1); dang_rc=$?
+if [[ $dang_rc -eq 2 ]] && printf '%s' "$dang_out" | grep -q 'PARTIAL'; then
+  ok "a dangling symlink yields a PARTIAL zero-hit answer, not a refusal"
+  pass=$((pass + 1))
+elif [[ $dang_rc -eq 1 ]]; then
+  err "one unreadable file made a zero-hit query refuse (exit 1)"
+  fail=$((fail + 1)); failed_ids+=("unreadable-refuses")
+else
+  err "a dangling symlink produced exit $dang_rc with no PARTIAL warning"
+  fail=$((fail + 1)); failed_ids+=("unreadable-not-partial")
+fi
+
+# Counted is not enough: two broken symlinks cannot hide a symbol, a skipped
+# directory of 400 files might, and only the paths let a reader tell them apart.
+if printf '%s' "$dang_out" | grep -q 'CLAUDE.local.md'; then
+  ok "the skipped paths are named, not merely counted"; pass=$((pass + 1))
+else
+  err "skipped files were counted but not named"
+  fail=$((fail + 1)); failed_ids+=("unreadable-unnamed")
+fi
+
+# A negative has to mean the same thing whichever backend is installed.
+# Recursive grep skips a dangling symlink silently, so cs has to find it.
+if [[ -x "$(command -v rg 2>/dev/null || true)" ]]; then
+  dang_bad=()
+  for eng in ripgrep grep; do
+    o=$(CS_TEXT_ENGINE=$eng "$here/cs" uses 'cs-absent-probe-dangling-xyzzy' 2>&1); r=$?
+    [[ $r -eq 2 ]] || dang_bad+=("$eng:exit$r")
+    printf '%s' "$o" | grep -q 'CLAUDE.local.md' || dang_bad+=("$eng:silent")
+  done
+  if [[ ${#dang_bad[@]} -eq 0 ]]; then
+    ok "both backends report the skipped file on the same fleet"; pass=$((pass + 1))
+  else
+    err "backends disagree about skipped files: ${dang_bad[*]}"
+    fail=$((fail + 1)); failed_ids+=("unreadable-backend-parity")
+  fi
+else
+  warn "skipped-file parity SKIPPED (no ripgrep binary here)"
+fi
+
+# The whole point of the split: this must not weaken the systemic refusals.
+# An uncompilable regex on a fleet that ALSO has unreadable files still refuses.
+refuses "a bad regex still refuses even with unreadable files present" "engine failed\|regex" \
+  "$here/cs" text 'foo['
+
+# And a query that DOES find things still says the answer is incomplete.
+dang_hits=$("$here/cs" seam 'orders.reserved.v1' 2>&1); dang_hrc=$?
+if [[ $dang_hrc -eq 0 ]] && printf '%s' "$dang_hits" | grep -q 'PARTIAL'; then
+  ok "a result with hits still reports the skipped files"; pass=$((pass + 1))
+else
+  err "a partial result with hits did not say it was partial (exit $dang_hrc)"
+  fail=$((fail + 1)); failed_ids+=("unreadable-hits-partial")
+fi
+
+rm -f "$dangle_repo/CLAUDE.local.md" "$dangle_repo/src/import"
+
 # ---- porcelain -------------------------------------------------------------
 # The exit code separated a refusal from an honest zero; everything else needed
 # to weigh an answer — the kind, and the four warnings SKILL.md tells an agent
