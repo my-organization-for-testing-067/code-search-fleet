@@ -256,13 +256,20 @@ CS_EXCLUDE_DIRS=(
 # shellcheck disable=SC2206
 [[ -n "${CS_EXCLUDE_EXTRA:-}" ]] && CS_EXCLUDE_DIRS+=(${CS_EXCLUDE_EXTRA})
 if [[ -n "${CS_EXCLUDE_REMOVE:-}" ]]; then
-  _keep=() _d _r _drop
+  # Separate statements, not `_keep=() _d _r _drop`: outside a function that is
+  # an assignment followed by three COMMANDS, and bash 3.2 duly reported
+  # "_d: command not found" before carrying on with an empty exclusion list.
+  _keep=(); _d=""; _r=""; _drop=0
   for _d in "${CS_EXCLUDE_DIRS[@]}"; do
     _drop=0
     for _r in ${CS_EXCLUDE_REMOVE}; do [[ "$_d" == "$_r" ]] && { _drop=1; break; }; done
     [[ $_drop -eq 0 ]] && _keep+=("$_d")
   done
-  CS_EXCLUDE_DIRS=("${_keep[@]}")
+  # `${a[@]+"${a[@]}"}` rather than `"${a[@]}"`: stock macOS ships bash 3.2,
+  # where expanding an EMPTY array under `set -u` is a fatal "unbound variable".
+  # Removing every entry is a legitimate thing to ask for, and it must not turn
+  # cs into a script that refuses to start.
+  CS_EXCLUDE_DIRS=(${_keep[@]+"${_keep[@]}"})
   unset _keep _d _r _drop
 fi
 
@@ -336,10 +343,10 @@ grep_fleet() {
     # --regexp is ripgrep's default, so pass a harmless flag instead of none.
     [[ "$extra" == "--regexp" ]] && extra="--no-config"
     local globs=() d
-    for d in "${CS_EXCLUDE_DIRS[@]}"; do globs+=(--glob "!**/$d/**" --glob "!$d/**"); done
+    for d in ${CS_EXCLUDE_DIRS[@]+"${CS_EXCLUDE_DIRS[@]}"}; do globs+=(--glob "!**/$d/**" --glob "!$d/**"); done
     (cd "$view" && run_timed rg --follow --hidden --no-ignore \
         --no-heading --line-number --color=never \
-        "${globs[@]}" "$extra" -- "$pattern" .)
+        ${globs[@]+"${globs[@]}"} "$extra" -- "$pattern" .)
   else
     # BSD grep's -R follows a symlink named on the command line but NOT one it
     # meets while recursing, so `grep -R pattern .` silently finds nothing in a
@@ -347,9 +354,9 @@ grep_fleet() {
     # trailing slash works on both BSD and GNU grep and does not depend on
     # symlink-following semantics at all.
     local ex=() d
-    for d in "${CS_EXCLUDE_DIRS[@]}"; do ex+=("--exclude-dir=$d"); done
+    for d in ${CS_EXCLUDE_DIRS[@]+"${CS_EXCLUDE_DIRS[@]}"}; do ex+=("--exclude-dir=$d"); done
     run_timed grep -Rn --binary-files=without-match \
-        "${ex[@]}" "$extra" -- "$pattern" "$view"/*/ 2>/dev/null
+        ${ex[@]+"${ex[@]}"} "$extra" -- "$pattern" "$view"/*/ 2>/dev/null
   fi
 }
 ctags_bin() {
@@ -529,7 +536,7 @@ cmd_engines() {
   fi
   # Printed because every entry here is a place results cannot come from, and a
   # directory excluded by mistake looks exactly like a directory with no hits.
-  printf 'skipping:    %s\n' "$(printf '%s ' "${CS_EXCLUDE_DIRS[@]}")"
+  printf 'skipping:    %s\n' "$(printf '%s ' ${CS_EXCLUDE_DIRS[@]+"${CS_EXCLUDE_DIRS[@]}"})"
   printf '             (CS_EXCLUDE_EXTRA adds, CS_EXCLUDE_REMOVE subtracts)\n'
   [[ $n -gt 0 ]]
 }

@@ -390,6 +390,26 @@ else
   fail=$((fail + 1)); failed_ids+=("stdout-purity")
 fi
 
+# CS_EXCLUDE_REMOVE can legitimately empty the exclusion list, and stock macOS
+# ships bash 3.2, where expanding an EMPTY array under `set -u` is a fatal
+# "unbound variable". The failure was not a crash: cs printed the error to
+# stderr, skipped the search, and reported "no repo mentions '...'" -- a
+# manufactured negative produced by a configuration the flag exists to allow.
+# Both backends are checked, since each builds its own flag array.
+excl_all=$("$here/cs" engines 2>/dev/null | grep '^skipping' | sed 's/^skipping: *//')
+excl_bad=()
+for eng in ripgrep grep; do
+  n=$(CS_EXCLUDE_REMOVE="$excl_all" CS_TEXT_ENGINE="$eng" \
+      "$here/cs" seam 'orders.reserved.v1' --quiet 2>/dev/null | grep -c 'EventPublisher')
+  [[ "$n" -ge 1 ]] || excl_bad+=("$eng")
+done
+if [[ ${#excl_bad[@]} -eq 0 ]]; then
+  ok "an emptied exclusion list still searches (both backends)"; pass=$((pass + 1))
+else
+  err "CS_EXCLUDE_REMOVE emptying the list broke: ${excl_bad[*]}"
+  fail=$((fail + 1)); failed_ids+=("empty-exclusion-list")
+fi
+
 # Agents issue tool calls in parallel. `cs def` cached its symbol index at a
 # path derived from the fleet, so concurrent runs raced on the same file and
 # roughly half returned nothing -- each labelled a normal structural answer.
@@ -463,7 +483,7 @@ if [[ -d "$probe_src" ]]; then
   done
 
   if [[ ${#langs_code[@]} -eq 0 && ${#langs_prose[@]} -eq 0 ]]; then
-    ok "prose filtering holds for ${#langs_ok[@]} languages: ${langs_ok[*]}"
+    ok "prose filtering holds for ${#langs_ok[@]} languages: ${langs_ok[*]:-}"
     pass=$((pass + 1))
   else
     [[ ${#langs_prose[@]} -gt 0 ]] && err "comments counted as code uses in: ${langs_prose[*]}"
