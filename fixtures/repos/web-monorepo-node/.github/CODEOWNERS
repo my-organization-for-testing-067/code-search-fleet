@@ -1,0 +1,5 @@
+# A monorepo, where ownership is per package rather than per repo.
+*                                   @acme/web-platform
+/packages/admin-ui/                 @acme/admin-tools
+/packages/analytics/                @acme/data-team
+/packages/schemas/                  @acme/contracts-team

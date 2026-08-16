@@ -61,6 +61,8 @@ Run `cs which` for this table at any time.
 | What references this symbol (bridges DI) | `cs refs <symbol> <repo> <file>` |
 | Which repo publishes this package | `cs provides <coordinate>` |
 | Which repos depend on which | `cs deps [repo]` |
+| Which version each repo pins, and where they disagree | `cs versions [coordinate]` |
+| Who to ask about this repo or file | `cs owns [repo\|repo/path]` |
 | When a seam appeared, or last changed | `cs history <string> [repo]` |
 | What is actually being searched right now | `cs repos` |
 
@@ -200,6 +202,44 @@ first, then filter:
 ```sh
 cs def DiscountEngine "$(cs provides com.acme:pricing-lib)"
 ```
+
+## The two questions that follow a search result
+
+Both read manifests and CODEOWNERS rather than code, so both are `declared` —
+the strongest kind for a negative, and the one most likely to be repeated to a
+person as fact. Reach for them when a result raises "so who do I tell" or "is
+everyone on the same version".
+
+**`cs owns <repo>/<path>`** — who CODEOWNERS names, applying **last-match-wins**
+as git does, and printing the rule that matched so you can judge whether it was
+meant to cover that file:
+
+```
+inventory-api-dotnet/src/Infrastructure/SqlInventoryStore.cs	@acme/storage-team	.github/CODEOWNERS:4 [/src/Infrastructure/]
+```
+
+`cs owns` with no argument audits the fleet. A repo with **no** CODEOWNERS is
+reported on stderr as a gap, not on stdout as an answer — "nobody owns it" is
+not a conclusion this can reach. Never relay an owner as "the person who knows
+this code": it is who is required to review, which is a different claim, and the
+team named may no longer exist.
+
+**`cs versions [coordinate]`** — which version each repo pins, flagged `AGREED`,
+`DRIFT`, or `UNPINNED`. A shared contract library at two versions across a seam
+is a real bug shape, and it is invisible to every search engine here because the
+evidence is in manifests rather than in code:
+
+```
+acme-schemas	DRIFT	2 version(s)	external
+  fulfillment-worker-python	==2.4.0	pyproject.toml
+  web-monorepo-node	2.5.1	package.json
+```
+
+Versions are compared on the number, not the spelling, so `==2.4.0` and `2.4.0`
+report as `AGREED` rather than as a false drift. It reads **manifests, not
+lockfiles** — two repos agreeing here can still resolve differently at build
+time, so report drift as a declaration mismatch, never as proof of what is
+installed.
 
 ## Known blind spots — do not oversell an answer
 

@@ -28,7 +28,7 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 31 checks against a throwaway fixture fleet
+scripts/verify-search              # 34 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only
@@ -60,6 +60,8 @@ than a wrong one, because nothing reports it. `brew install coreutils` on macOS.
 | What references this symbol (bridges DI) | `cs refs <symbol> <repo> <file>` |
 | Which repo publishes this package | `cs provides <coordinate>` |
 | Which repos depend on which | `cs deps [repo]` |
+| Which version each repo pins, and where they disagree | `cs versions [coordinate]` |
+| Who to ask about this repo or file | `cs owns [repo\|repo/path]` |
 | When a seam appeared, or last changed | `cs history <string> [repo]` |
 | What is actually being searched | `cs repos` |
 | How much to trust an answer | `cs why [kind]` |

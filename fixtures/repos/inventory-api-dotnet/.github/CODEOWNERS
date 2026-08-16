@@ -1,0 +1,6 @@
+# Inventory API — owned by the platform team, with the storage layer split out.
+# Last matching rule wins, which is what makes the two rules below meaningful.
+*                                   @acme/inventory-team
+/src/Infrastructure/                @acme/storage-team
+/src/Controllers/ReservationController.cs  @acme/inventory-team @acme/checkout-team
+*.csproj                            @acme/build-team

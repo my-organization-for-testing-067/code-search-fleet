@@ -15,6 +15,7 @@ Usage:
   deps.py <fleet-root> publishes            list what each repo publishes
   deps.py <fleet-root> provides <coord>     which repo publishes a coordinate
   deps.py <fleet-root> deps [repo]          fleet dependency edges
+  deps.py <fleet-root> versions [coord]     which version each repo pins
 """
 import json
 import pathlib
@@ -106,6 +107,74 @@ def consumes(repo):
     return sorted(set(out))
 
 
+def consumes_versioned(repo):
+    """[(coordinate, version, manifest-relative-path)] this repo declares.
+
+    consumes() deliberately drops the version, because "who depends on what" does
+    not need it. "Is the fleet agreed on a version" is a different question and
+    cannot be answered without it -- and it is the question that catches a repo
+    left behind by an upgrade, which is a real bug shape rather than a tidiness
+    complaint.
+    """
+    out = []
+
+    def rel(p):
+        try:
+            return str(p.relative_to(repo))
+        except ValueError:
+            return p.name
+
+    for gradle in list(repo.glob("build.gradle.kts")) + list(repo.glob("build.gradle")):
+        for m in re.finditer(r'["\']([\w.\-]+:[\w.\-]+):([\w.\-]+)["\']', _read(gradle)):
+            out.append((m.group(1), m.group(2), rel(gradle)))
+
+    for pom in repo.glob("pom.xml"):
+        for dep in re.finditer(
+            r"<dependency>\s*<groupId>([^<]+)</groupId>\s*"
+            r"<artifactId>([^<]+)</artifactId>\s*(?:<version>([^<]+)</version>)?",
+            _read(pom),
+        ):
+            out.append((f"{dep.group(1)}:{dep.group(2)}",
+                        (dep.group(3) or "(inherited)").strip(), rel(pom)))
+
+    for pkg in list(repo.glob("package.json")) + list(repo.glob("*/package.json")):
+        try:
+            data = json.loads(_read(pkg) or "{}")
+        except json.JSONDecodeError:
+            continue
+        for section in ("dependencies", "devDependencies", "peerDependencies"):
+            for name, ver in (data.get(section) or {}).items():
+                out.append((name, str(ver), rel(pkg)))
+
+    for pyproject in repo.glob("pyproject.toml"):
+        block = re.search(r"dependencies\s*=\s*\[(.*?)\]", _read(pyproject), re.S)
+        if block:
+            for m in re.finditer(
+                r'["\']([A-Za-z0-9_.\-]+)\s*([=<>!~^]*\s*[0-9][\w.\-*]*)?', block.group(1)
+            ):
+                out.append((m.group(1), (m.group(2) or "(unpinned)").strip(), rel(pyproject)))
+
+    for csproj in repo.rglob("*.csproj"):
+        for m in re.finditer(
+            r'PackageReference\s+Include="([^"]+)"(?:\s+Version="([^"]+)")?', _read(csproj)
+        ):
+            out.append((m.group(1), m.group(2) or "(inherited)", rel(csproj)))
+
+    return out
+
+
+def normalize_version(v):
+    """Strip a constraint prefix so versions can be compared across ecosystems.
+
+    `==2.4.0` (pip), `^2.4.0` (npm caret), `~2.4.0`, `v2.4.0` and `2.4.0` all
+    name the same release; only the dialect differs. This deliberately does NOT
+    try to interpret range semantics -- `>=2.0` and `2.0` really are different
+    promises -- it only removes the spelling, so that a repo genuinely left
+    behind by an upgrade stands out from four repos agreeing in four syntaxes.
+    """
+    return re.sub(r"^[\s=<>!~^v]+", "", v.strip()).strip()
+
+
 def repos(root):
     return sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
 
@@ -163,6 +232,54 @@ def main():
                     )
                 if owner and owner != repo.name:
                     print(f"{repo.name}\t->\t{owner}\t({coord})")
+        return 0
+
+    if cmd == "versions":
+        want = sys.argv[3] if len(sys.argv) > 3 else None
+        rows = []
+        for repo in repos(root):
+            for coord, ver, manifest in consumes_versioned(repo):
+                if want and coord != want and coord.split(":")[-1] != want:
+                    continue
+                rows.append((repo.name, coord, ver, manifest))
+        if not rows:
+            if want:
+                print(f"no repo in the fleet declares a dependency on '{want}'",
+                      file=sys.stderr)
+            return 1
+        # Grouped by coordinate so the comparison is adjacent; the point of the
+        # command is the disagreement, and a flat list buries it.
+        for coord in sorted({r[1] for r in rows}):
+            mine = [r for r in rows if r[1] == coord]
+            # Compared on the version NUMBER, not the raw declaration. Each
+            # ecosystem spells a pin differently -- `==2.4.0` in pyproject.toml
+            # and `2.4.0` in package.json are the same version -- and reporting
+            # that as drift is a false positive in the one command whose entire
+            # value is that its findings are worth acting on.
+            pinned = {normalize_version(r[2]) for r in mine
+                      if not r[2].startswith("(")}
+            unknown = [r for r in mine if r[2].startswith("(")]
+            spellings = {r[2] for r in mine}
+
+            if len(pinned) > 1:
+                flag, detail = "DRIFT", f"{len(pinned)} version(s)"
+            elif pinned:
+                flag, detail = "AGREED", f"{len(pinned)} version(s)"
+                if len(spellings) > len(pinned):
+                    detail += ", spelled differently per ecosystem"
+            else:
+                flag, detail = "UNPINNED", "no explicit version"
+
+            owner = publisher.get(coord) or next(
+                (o for c, o in publisher.items() if c.split(":")[-1] == coord), None
+            )
+            line = f"{coord}\t{flag}\t{detail}"
+            line += f"\tpublished by {owner}" if owner else "\texternal"
+            if unknown and flag != "UNPINNED":
+                line += f" ({len(unknown)} declaration(s) inherit or float)"
+            print(line)
+            for name, _c, ver, manifest in sorted(mine):
+                print(f"  {name}\t{ver}\t{manifest}")
         return 0
 
     print(f"unknown command: {cmd}", file=sys.stderr)

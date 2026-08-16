@@ -140,7 +140,10 @@ if [[ -x "$(command -v rg 2>/dev/null || true)" ]]; then
     err "the .github/ seam was missed — ripgrep is skipping hidden paths again"
     fail=$((fail + 1)); failed_ids+=("hidden-path-visibility")
   fi
-  rm -rf "$probe_repo/.github"
+  # Only the probe file. `rm -rf "$probe_repo/.github"` also deleted the
+  # fixture's own ci.yml and CODEOWNERS, mutating the fleet for every check
+  # after this one -- a test that quietly damages its own fixture.
+  rm -f "$probe_repo/.github/workflows/parity-probe.yml"
 else
   warn "engine parity SKIPPED (no ripgrep binary here; only the grep backend exists)"
 fi
@@ -163,6 +166,8 @@ prov_check textual    seam 'reservationId'
 prov_check heuristic  uses 'reservationId'
 prov_check structural def Reserve
 prov_check declared   provides com.acme:pricing-lib
+prov_check declared   versions com.acme:pricing-lib
+prov_check declared   owns inventory-api-dotnet
 prov_check historical history 'reservationId'
 command -v ast-grep >/dev/null 2>&1 && prov_check structural calls '$X.IsEnabled($K)'
 
@@ -332,6 +337,61 @@ else
   warn "could not create worktrees; layering untested"
 fi
 rm -rf "$tickets_tmp"
+
+# ---- declared answers ------------------------------------------------------
+# `cs owns` and `cs versions` read manifests and CODEOWNERS rather than code, so
+# nothing in the scored queries touches them. Both answer questions that follow
+# directly from a search result -- who do I talk to, and is the fleet agreed on
+# this version -- and both are the kind of answer most likely to be repeated to
+# a person as fact, which is the argument for testing them precisely.
+info ""
+info "${C_BOLD}declared answers${C_OFF}"
+
+# CODEOWNERS is last-match-wins, and getting that backwards silently names the
+# wrong team: the catch-all `*` at the top would win over every specific rule.
+owns_out=$("$here/cs" owns inventory-api-dotnet/src/Infrastructure/SqlInventoryStore.cs 2>/dev/null)
+if printf '%s' "$owns_out" | grep -q 'storage-team'; then
+  ok "cs owns applies the LAST matching CODEOWNERS rule"; pass=$((pass + 1))
+elif printf '%s' "$owns_out" | grep -q 'inventory-team'; then
+  err "cs owns returned the catch-all rule — first match won, not last"
+  fail=$((fail + 1)); failed_ids+=("owns-last-match")
+else
+  err "cs owns did not resolve an owner at all"; fail=$((fail + 1))
+  failed_ids+=("owns-last-match")
+fi
+
+# An unowned repo is the finding, not an error. It must not be silently absent
+# from the audit, and it must not be reported on stdout as though it were an
+# answer -- "who owns pricing-lib-java" has no answer, and saying so is the point.
+audit_out=$("$here/cs" owns 2>/dev/null)
+audit_err=$("$here/cs" owns 2>&1 >/dev/null)
+if printf '%s' "$audit_err" | grep -q 'pricing-lib-java' \
+   && ! printf '%s' "$audit_out" | grep -q 'pricing-lib-java'; then
+  ok "cs owns reports a repo with no CODEOWNERS as a gap, not a result"
+  pass=$((pass + 1))
+else
+  err "cs owns mishandled the repo that declares no ownership"
+  fail=$((fail + 1)); failed_ids+=("owns-gap")
+fi
+
+# The whole value of a drift report is that its findings are worth acting on, so
+# a false positive is worse than a miss. `==2.4.0` and `2.4.0` are the same
+# version in two ecosystems' dialects and must not be called drift.
+ver_same=$("$here/cs" versions acme-schemas 2>/dev/null)
+pkg_json="$FLEET_ROOT/web-monorepo-node/package.json"
+perl -pi -e 's/"acme-schemas": "2\.4\.0"/"acme-schemas": "2.5.1"/' "$pkg_json" 2>/dev/null
+ver_drift=$("$here/cs" versions acme-schemas 2>/dev/null)
+perl -pi -e 's/"acme-schemas": "2\.5\.1"/"acme-schemas": "2.4.0"/' "$pkg_json" 2>/dev/null
+if printf '%s' "$ver_same" | grep -q 'AGREED' && printf '%s' "$ver_drift" | grep -q 'DRIFT'; then
+  ok "cs versions tells a dialect difference from a real version drift"
+  pass=$((pass + 1))
+elif printf '%s' "$ver_same" | grep -q 'DRIFT'; then
+  err "cs versions called '==2.4.0' vs '2.4.0' a drift — false positive"
+  fail=$((fail + 1)); failed_ids+=("versions-false-drift")
+else
+  err "cs versions missed a real version drift"; fail=$((fail + 1))
+  failed_ids+=("versions-drift")
+fi
 
 # ---- refusals --------------------------------------------------------------
 # Everything above tests that cs ANSWERS. This section tests that it REFUSES.

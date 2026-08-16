@@ -24,6 +24,18 @@ scale.
 Seam 6 is the other honest case: a DI indirection no static tool can resolve,
 there to catch a tool overselling call-graph completeness.
 
+## Ownership
+
+Four of the five repos declare CODEOWNERS, deliberately across two conventional
+locations (`.github/CODEOWNERS` and a root `CODEOWNERS`), with overlapping rules
+so that **last-match-wins** is actually exercised: a catch-all `*` at the top of
+`inventory-api-dotnet` is overridden by `/src/Infrastructure/`, and getting the
+precedence backwards names the wrong team rather than failing.
+
+`pricing-lib-java` declares none, on purpose. A repo with no CODEOWNERS is a
+finding — `cs owns` reports it as a gap on stderr rather than answering "nobody
+owns it" on stdout — and a fixture where every repo is owned could not test that.
+
 ## The blind spot these five repos share
 
 They are written in C#, Kotlin, Python, TypeScript and Java — every one of which

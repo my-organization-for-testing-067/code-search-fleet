@@ -30,6 +30,8 @@
 #   cs def    <symbol> [repo]      where a symbol is defined (optionally one repo)
 #   cs provides <coordinate>       which repo publishes a package coordinate
 #   cs deps   [repo]               fleet dependency edges, from build manifests
+#   cs versions [coordinate]       which version each repo pins, and where they disagree
+#   cs owns   [repo|repo/path]     who CODEOWNERS names for this, across the fleet
 #   cs publishes                   what each repo publishes
 #   cs calls  <pattern> [lang]     structural: call shapes, literal arguments
 #   cs impls  <symbol> <repo>      implementations of an interface (LSP)
@@ -57,7 +59,8 @@
 #                    repo keeps hand-written source there (`cs engines` prints
 #                    the effective list)
 #
-# Requires: python3 (uses, provides, deps, publishes, impls, refs). Everything
+# Requires: python3 (uses, provides, deps, publishes, versions, owns, impls,
+# refs). Everything
 # else is optional -- `cs engines` reports what is present and cs routes around
 # what is not.
 set -uo pipefail
@@ -71,15 +74,24 @@ root="${FLEET_ROOT:-$PWD}"
 # so it is the one that must never be manufactured by a configuration mistake.
 # Before this guard, a fleet root that did not exist produced a `cd` error on
 # stderr and then a perfectly formatted "no code uses X · 0 hit(s) · 0 repo(s)".
-if [[ ! -d "$root" ]]; then
-  die "fleet root does not exist: $root
-  set FLEET_ROOT, or run: fleet-init --config --fleet-root <dir> --tickets-root <dir>"
-fi
-if ! compgen -G "$root/*/.git" >/dev/null; then
-  die "no repositories in the fleet root: $root
+#
+# Applied per-subcommand rather than at load, because the guard used to fire for
+# `cs which`, `cs why` and `cs engines` too -- so the three commands that exist
+# to explain the tool and diagnose the setup were unavailable to exactly the
+# person whose setup was not finished. `cs engines` refusing to run until the
+# fleet is configured is backwards: reporting the root is half its job.
+require_fleet() {
+  if [[ ! -d "$root" ]]; then
+    die "fleet root does not exist: $root
+  set FLEET_ROOT, or run: fleet-init --config --fleet-root <dir> --tickets-root <dir>
+  (cs which, cs why and cs engines work without one)"
+  fi
+  if ! compgen -G "$root/*/.git" >/dev/null; then
+    die "no repositories in the fleet root: $root
   clone some first: fleet-init --clone <owner/repo> ...
   (searching an empty fleet would report 'nothing found' for every query)"
-fi
+  fi
+}
 
 # python3 is NOT an optional engine. The engines below degrade to each other and
 # `cs engines` reports which are missing; python3 is different, because four
@@ -440,6 +452,15 @@ Cannot see: dependencies injected by a parent build file, a BOM, or a plugin
 rather than declared in the manifest; vendored code with no coordinate at all;
 version ranges resolved at build time. States what the manifest says, which is
 not always what is on the classpath.
+
+For `cs versions`: a lockfile, not the manifest, decides what is actually
+installed, and two repos agreeing in the manifest can still resolve differently.
+Ranges are compared by their written form, not by what they resolve to.
+
+For `cs owns`: CODEOWNERS names who is REQUIRED TO REVIEW, which is not who
+wrote the code, who understands it, or who is still at the company. A repo with
+no CODEOWNERS produces no answer rather than "nobody owns it", and the rule that
+matched is printed so you can judge whether it was meant to cover your file.
 X
 ;;
     structural) cat <<'X'
@@ -621,6 +642,8 @@ What implements this interface?                  cs impls <symbol> <repo>
 What references this symbol (bridges DI)?        cs refs <symbol> <repo> <file>
 Which repo publishes this package?               cs provides <coordinate>
 Which repos depend on which?                     cs deps [repo]
+Which version does each repo pin?                cs versions [coordinate]
+Who owns this repo, or this file?                cs owns [repo|repo/path]
 When did this seam appear, or last change?       cs history <string> [repo]
 What am I actually searching right now?           cs repos
 How much should I trust this answer?             cs why [kind]
@@ -819,6 +842,75 @@ cmd_publishes() {
   require_python3 publishes "reading the build manifests the graph is built from"
   answer declared "build manifests" "publish declarations"
   python3 "$lib_dir/deps.py" "$view" publishes
+  report_answer
+}
+
+# "Is the fleet agreed on a version of this?" -- `cs deps` deliberately drops
+# versions, because "who depends on what" does not need them. This is the other
+# question, and it is the one that finds a repo left behind by an upgrade: a
+# shared contract library at two versions across a seam is a real bug shape,
+# and it is invisible to every search engine here because the evidence is in
+# manifests rather than in code.
+cmd_versions() {
+  require_python3 versions "reading the version each build manifest pins"
+  answer declared "build manifests" "${1:+$1, }version declarations"
+  local out err_file
+  err_file=$(mktemp -t cs-versions.XXXXXX)
+  out=$(python3 "$lib_dir/deps.py" "$view" versions "${1:-}" 2>"$err_file")
+  if [[ -s "$err_file" ]]; then cat "$err_file" >&2; fi
+  rm -f "$err_file"
+  if [[ -z "$out" ]]; then
+    report_answer 0 0
+    hint "cs deps               (the coordinate may be spelled differently in the manifest)" \
+         "cs provides '${1:-<coordinate>}'   (confirm a fleet repo publishes it at all)" \
+         "cs versions           (with no argument: every coordinate the fleet declares)"
+    return 1
+  fi
+  printf '%s\n' "$out"
+  # DRIFT is the finding; say so rather than leaving it in the table. A version
+  # spread the caller did not notice is the same class of miss as a caller in a
+  # repo they did not search.
+  local drift
+  drift=$(printf '%s\n' "$out" | grep -c '	DRIFT	' || true)
+  [[ "$drift" -gt 0 ]] && warn "$drift coordinate(s) declared at more than one version — see DRIFT above"
+  report_answer
+}
+
+# Who to ask about a result. Every other subcommand answers WHERE something is,
+# and the next question is always who owns it -- which in a single repo is a
+# `cat CODEOWNERS` away and across a fleet is not, because the file lives in a
+# repo you have never opened.
+cmd_owns() {
+  require_python3 owns "parsing CODEOWNERS and matching its patterns"
+  local mode="file" arg="${1:-}"
+  if [[ -z "$arg" ]]; then
+    mode="audit"
+  elif [[ "$arg" != */* ]]; then
+    # A bare name is a repo, a name with a slash is a path inside one.
+    mode="repo"
+  fi
+  answer declared "CODEOWNERS" "$mode"
+  # Captured separately, not with 2>&1. owners.py writes the GAPS to stderr on
+  # purpose -- a repo with no CODEOWNERS is a finding, not an owner -- and
+  # merging the streams put "no CODEOWNERS" on stdout as though it answered the
+  # question. stdout is the result stream; that is a contract, not a preference.
+  local out rc err_file
+  err_file=$(mktemp -t cs-owns.XXXXXX)
+  out=$(python3 "$lib_dir/owners.py" "$view" "$mode" ${arg:+"$arg"} 2>"$err_file"); rc=$?
+  if [[ -s "$err_file" ]]; then cat "$err_file" >&2; fi
+  rm -f "$err_file"
+  if [[ $rc -ne 0 || -z "$out" ]]; then
+    report_answer 0 0
+    hint "cs owns               (which repos declare ownership at all)" \
+         "cs owns <repo>        (every rule in one repo)" \
+         "cs repos              (the exact repo names in view)"
+    return 1
+  fi
+  printf '%s\n' "$out"
+  # Stated every time, because a CODEOWNERS answer is the one most likely to be
+  # repeated to a person as fact. It says who the file names, which is not the
+  # same as who will review the change or who understands the code.
+  warn "CODEOWNERS is a declaration, not a fact about who knows this code — it can name a team that no longer exists, and it says nothing about repos with no file at all"
   report_answer
 }
 
@@ -1078,6 +1170,15 @@ set -- "${args[@]:-}"
 
 [[ $# -ge 1 && -n "${1:-}" ]] || usage 1
 sub="$1"; shift
+# Everything that reads the fleet must have one; the four that only explain the
+# tool must not require it, or the setup you are trying to diagnose blocks the
+# diagnosis. `cs engines` is deliberately in the exempt list and prints the root
+# it would have used.
+case "$sub" in
+  which|why|-h|--help|help) ;;
+  engines) [[ -d "$root" ]] || warn "fleet root does not exist yet: $root" ;;
+  *) require_fleet ;;
+esac
 build_view
 case "$sub" in engines|which|why|repos|-h|--help|help) ;; *) announce_view ;; esac
 case "$sub" in
@@ -1088,6 +1189,8 @@ case "$sub" in
   provides) cmd_provides "$@" ;;
   deps)    cmd_deps "$@" ;;
   publishes) cmd_publishes ;;
+  versions) cmd_versions "$@" ;;
+  owns)    cmd_owns "$@" ;;
   calls)   cmd_calls "$@" ;;
   impls)   cmd_impls "$@" ;;
   refs)    cmd_refs "$@" ;;

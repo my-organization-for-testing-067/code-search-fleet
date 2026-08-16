@@ -1,0 +1,3 @@
+# Root CODEOWNERS, the other conventional location.
+*                                   @acme/checkout-team
+/src/main/kotlin/com/acme/checkout/InventoryClient.kt  @acme/checkout-team @acme/inventory-team
