@@ -1,6 +1,7 @@
-.DS_Store
-*.local.*
 
+.DS_Store
+.idea/
+*.local.*
 # .NET build output in fixtures
 bin/
 obj/
