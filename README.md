@@ -38,10 +38,10 @@ Every *engine* is optional; `cs engines` reports what is present and `cs` routes
 around what is missing rather than failing silently.
 
 **`python3` is the one hard requirement** — `uses`, `provides`, `deps`,
-`publishes`, `impls` and `refs` all run through it. It is separate from the
-engines because it does not degrade: those commands refuse rather than answer
-without it. Nothing installs it for you (a system python is the OS's business),
-but `bootstrap` and `cs engines` both report it.
+`publishes`, `versions`, `owns`, `impls` and `refs` all run through it. It is
+separate from the engines because it does not degrade: those commands refuse
+rather than answer without it. Nothing installs it for you (a system python is
+the OS's business), but `bootstrap` and `cs engines` both report it.
 
 `timeout(1)` is worth having too. Without it a hung language server hangs `cs`
 with no upper bound, and a search that never returns is the one outcome worse
@@ -278,10 +278,49 @@ Then set the one thing it cannot guess:
 export FLEET_ROOT=~/code/fleet     # the directory holding your repos
 ```
 
+### Updating
+
+```sh
+claude plugin marketplace update repo-fleet
+claude plugin update code-search@repo-fleet
+```
+
+Both lines are load-bearing. The first refreshes the catalog so it knows a newer
+version exists; running only the second updates against a stale catalog and
+reports nothing to do. And the plugin **must** be named `code-search@repo-fleet`
+— the bare `code-search` fails with `Plugin "code-search" not found`, which
+reads like the plugin is not installed rather than like the id is incomplete.
+
+Restart Claude Code afterwards; the CLI says so, and the previously loaded skill
+stays in the session until you do.
+
+### Running the scripts from a terminal
+
 The whole repo ships with the plugin — the `cs` CLI, all five engines' glue, the
 fixture fleet, and the verification suite — so `verify-search` runs from the
 installed copy and answers "is this working *here*" rather than "did it work
 where it was built".
+
+`CLAUDE_PLUGIN_ROOT` is set **only inside a Claude Code session**, so the
+`"$CLAUDE_PLUGIN_ROOT/scripts/…"` form used throughout `SKILL.md` expands to
+`/scripts/…` in an ordinary shell and fails. Resolve the installed copy instead:
+
+```sh
+CS_ROOT=$(ls -d ~/.claude/plugins/cache/repo-fleet/code-search/*/ | tail -1)
+
+"$CS_ROOT/scripts/bootstrap"        # install the engines (--check to only report)
+"$CS_ROOT/scripts/verify-search"    # the full suite, against a throwaway fixture fleet
+"$CS_ROOT/scripts/cs" which         # the decision table
+```
+
+`tail -1` picks the highest version, which matters because an update leaves the
+previous version's directory in place. Substitute the marketplace you installed
+from if it was not `repo-fleet`.
+
+`verify-search` builds its own fixture repos, so it neither touches your code nor
+needs `FLEET_ROOT` set — which makes it the right first thing to run, before the
+fleet exists. Simply asking the agent to "verify code-search" also works, and
+avoids the path entirely: the skill resolves it from `CLAUDE_PLUGIN_ROOT`.
 
 **Cost: ~200 tokens always-on**, and the ~6.6k skill body only loads when a
 search question actually comes up. `claude plugin details code-search` reports
