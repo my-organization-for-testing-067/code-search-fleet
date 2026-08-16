@@ -389,6 +389,7 @@ build_view() {
   local n_ticket=0 n_fleet=0 d name
   for d in "$ticket_root"/*/; do
     [[ -d "$d" ]] || continue
+    is_repo "${d%/}" || continue
     name=$(basename "$d")
     ln -s "${d%/}" "$view/$name" && n_ticket=$((n_ticket + 1))
   done
@@ -400,6 +401,7 @@ build_view() {
   fi
   for d in "$root"/*/; do
     [[ -d "$d" ]] || continue
+    is_repo "${d%/}" || continue
     name=$(basename "$d")
     [[ -e "$view/$name" ]] && continue
     ln -s "${d%/}" "$view/$name" && n_fleet=$((n_fleet + 1))
@@ -417,11 +419,39 @@ real_dirs() {
   if [[ -n "$view_tmp" ]]; then
     for d in "$view"/*; do [[ -e "$d" ]] && readlink "$d"; done
   else
-    for d in "$root"/*/; do [[ -d "$d" ]] && echo "${d%/}"; done
+    for d in "$root"/*/; do [[ -d "$d" ]] && is_repo "${d%/}" && echo "${d%/}"; done
   fi
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Evidence that an entry IS a repository, rather than merely that it exists.
+#
+# A fleet root grows housekeeping -- a README, an update-all.sh, an update.log,
+# a folder of scratch notes -- and every enumeration site here used a different
+# filter. `cs repos` used a bare glob and listed all of it, reporting 40 repos
+# on a fleet of 37. That count is load-bearing: it is the denominator for
+# `cs seam`'s orphan warning, and it is what the `searching:` line reports --
+# the one instrument the skill explicitly tells an agent to read before trusting
+# a layered answer.
+#
+# -e rather than -d: a git worktree's .git is a FILE holding a gitdir pointer,
+# so a -d test would silently exclude every worktree, which is precisely the
+# ticket-workspace layout this whole tool is built around. A plain directory of
+# scratch files passes a -d test too; only the .git check rejects it.
+is_repo() { [[ -e "$1/.git" ]]; }
+
+# Entries in the fleet root that are not repositories, named rather than
+# silently dropped -- the same reasoning as the `skipping:` line in cs engines.
+# Every one is a place results cannot come from.
+non_repo_entries() {
+  local d
+  for d in "$root"/*; do
+    [[ -e "$d" ]] || continue
+    is_repo "$d" && continue
+    basename "$d"
+  done
+}
 
 # Modification time in epoch seconds, or 0 if it cannot be determined.
 #
@@ -1945,15 +1975,26 @@ cmd_history() {
 # What is actually being searched, and whether each repo came from the ticket or
 # the fleet. An agent that cannot see the view cannot judge a negative result.
 cmd_repos() {
-  local d name target kind
+  local d name target kind n=0
   printf '%-32s %-8s %s\n' "REPO" "LAYER" "PATH"
   for d in "$view"/*; do
     [[ -e "$d" ]] || continue
-    name=$(basename "$d")
     if [[ -L "$d" ]]; then target=$(readlink "$d"); else target="$d"; fi
+    # When a ticket is layered the view holds only repos already, but an
+    # unlayered view IS the fleet root, files and all.
+    is_repo "$target" || continue
+    name=$(basename "$d")
     if [[ -n "$ticket_root" && "$target" == "$ticket_root"/* ]]; then kind="ticket"; else kind="fleet"; fi
     printf '%-32s %-8s %s\n' "$name" "$kind" "$target"
+    n=$((n + 1))
   done
+  printf '\n%s repositor%s\n' "$n" "$([[ $n -eq 1 ]] && echo y || echo ies)"
+  # Named, so a repo missing because it was never cloned is distinguishable
+  # from one missing because cs did not consider it a repo at all.
+  local skipped_entries
+  skipped_entries=$(non_repo_entries | tr '\n' ' ' | sed 's/ $//')
+  [[ -n "$skipped_entries" ]] && warn "not repositories, so not searched: $skipped_entries"
+  return 0
 }
 
 cmd_why() {

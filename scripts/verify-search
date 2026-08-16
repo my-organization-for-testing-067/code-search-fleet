@@ -884,6 +884,81 @@ fi
 
 rm -f "$dangle_repo/CLAUDE.local.md" "$dangle_repo/src/import"
 
+# ---- what counts as a repository -------------------------------------------
+# A fleet root grows housekeeping — a README, an update script, a log, a folder
+# of scratch notes — and `cs repos` listed all of it, reporting 40 repos on a
+# fleet of 37. The count is load-bearing twice over: it is the denominator for
+# `cs seam`'s orphan warning, and it is what the `searching:` line reports —
+# the one instrument the skill explicitly tells an agent to read before trusting
+# a layered answer.
+info ""
+info "${C_BOLD}what counts as a repository${C_OFF}"
+printf '# fleet notes\n'      > "$FLEET_ROOT/CLAUDE.md"
+printf '#!/bin/sh\necho hi\n' > "$FLEET_ROOT/update-all.sh"
+printf 'ran at 09:00\n'       > "$FLEET_ROOT/update.log"
+mkdir -p "$FLEET_ROOT/scratch-notes"          # the harder case: passes a -d test
+printf 'jottings\n' > "$FLEET_ROOT/scratch-notes/a.txt"
+
+real_n=$(compgen -G "$FLEET_ROOT/*/.git" | grep -c '')
+repos_out=$("$here/cs" repos 2>/dev/null)
+listed=$(printf '%s\n' "$repos_out" | grep -c ' fleet \| ticket ')
+if [[ "$listed" -eq "$real_n" ]]; then
+  ok "cs repos lists only repositories ($real_n), not stray files or folders"
+  pass=$((pass + 1))
+else
+  err "cs repos listed $listed entries for $real_n repositories"
+  fail=$((fail + 1)); failed_ids+=("repos-counts-non-repos")
+fi
+
+# Silently dropping them would trade one invisible error for another: a repo
+# missing because it was never cloned must be distinguishable from an entry cs
+# did not consider a repo at all.
+if "$here/cs" repos 2>&1 >/dev/null | grep -q 'update.log'; then
+  ok "the non-repository entries are named, not silently dropped"; pass=$((pass + 1))
+else
+  err "non-repository entries were dropped without saying so"
+  fail=$((fail + 1)); failed_ids+=("repos-silent-drop")
+fi
+
+# The counts have to agree, which is the actual bug: `cs seam`'s orphan warning
+# keys on repo count, and inflating the denominator suppresses it.
+seam_reported=$("$here/cs" seam 'orders.reserved.v1' 2>&1 >/dev/null \
+                | grep -o '[0-9][0-9]* repo(s):' | head -1 | awk '{print $1}')
+seam_actual=$("$here/cs" seam 'orders.reserved.v1' --quiet --all 2>/dev/null \
+              | cut -d/ -f1 | sort -u | grep -c '[^[:space:]]')
+if [[ "${seam_reported:-0}" -eq "$seam_actual" ]]; then
+  ok "cs seam's repo count agrees with the repos it actually searched"
+  pass=$((pass + 1))
+else
+  err "cs seam reported ${seam_reported:-?} repo(s) but hit $seam_actual"
+  fail=$((fail + 1)); failed_ids+=("repos-count-disagreement")
+fi
+
+# A worktree's .git is a FILE, so a -d test would silently exclude every one of
+# them — which is exactly the ticket-workspace layout this tool is built around.
+wt_tmp=$(mktemp -d)
+mkdir -p "$wt_tmp/WT-1"
+if git -C "$FLEET_ROOT/inventory-api-dotnet" worktree add --quiet \
+     "$wt_tmp/WT-1/inventory-api-dotnet" -b verify/is-repo >/dev/null 2>&1; then
+  printf 'stray\n' > "$wt_tmp/WT-1/notes.md"    # a stray file in the workspace too
+  wt_out=$(cd "$wt_tmp/WT-1" && TICKETS_ROOT="$wt_tmp" "$here/cs" repos 2>/dev/null)
+  if printf '%s' "$wt_out" | grep -q 'inventory-api-dotnet *ticket' \
+     && ! printf '%s' "$wt_out" | grep -q 'notes.md'; then
+    ok "a worktree (.git is a file) still counts as a repository"; pass=$((pass + 1))
+  else
+    err "a worktree was not recognised as a repository, or a stray file was"
+    fail=$((fail + 1)); failed_ids+=("repos-worktree")
+  fi
+  git -C "$FLEET_ROOT/inventory-api-dotnet" worktree remove --force \
+      "$wt_tmp/WT-1/inventory-api-dotnet" >/dev/null 2>&1 || true
+  git -C "$FLEET_ROOT/inventory-api-dotnet" branch -D verify/is-repo >/dev/null 2>&1 || true
+else
+  skip "worktree recognition" "could not create a git worktree here"
+fi
+rm -rf "$wt_tmp"
+rm -rf "$FLEET_ROOT/CLAUDE.md" "$FLEET_ROOT/update-all.sh" \
+       "$FLEET_ROOT/update.log" "$FLEET_ROOT/scratch-notes"
+
 # ---- the symbol index's cache key ------------------------------------------
 # `cs def` caches its index at a path derived from a hash of the view. The hash
 # chain was `md5 -q || md5sum` — and `md5` lives in /sbin on macOS while
