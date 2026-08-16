@@ -23,6 +23,7 @@ _explicit_fleet_root="${FLEET_ROOT:-}"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root_dir="$(cd "$here/.." && pwd)"
 keep=0
 [[ "${1:-}" == "--keep" ]] && keep=1
 
@@ -190,7 +191,16 @@ fi
 # about to change. Engines run in subshells, so the timeout has to survive a
 # process boundary to be reported at all -- which is why this is tested rather
 # than assumed. The LSP path is used because it is reliably slower than 1s.
-if command -v uvx >/dev/null 2>&1 && ("$here/cs" engines 2>/dev/null | grep -q '^timeout: *[0-9]'); then
+#
+# The precondition is computed from a captured string rather than piped into
+# `grep -q`. Under `set -o pipefail` that pipeline reports failure whenever grep
+# exits on its first match before `cs engines` has finished writing -- SIGPIPE,
+# not a missing timeout(1) -- so merely APPENDING a line to `cs engines` output
+# turned this check into a silent SKIP. A check that downgrades itself when an
+# unrelated thing changes is worse than no check, because the run still says
+# "0 failed".
+_engines_out=$("$here/cs" engines 2>/dev/null || true)
+if command -v uvx >/dev/null 2>&1 && printf '%s\n' "$_engines_out" | grep -q '^timeout: *[0-9]'; then
   to=$(CS_TIMEOUT=1 "$here/cs" refs IInventoryStore inventory-api-dotnet \
         src/Domain/IInventoryStore.cs 2>&1 >/dev/null | grep -c 'PARTIAL')
   if [[ "$to" -ge 1 ]]; then
@@ -309,6 +319,159 @@ else
   warn "could not create worktrees; layering untested"
 fi
 rm -rf "$tickets_tmp"
+
+# ---- refusals --------------------------------------------------------------
+# Everything above tests that cs ANSWERS. This section tests that it REFUSES.
+#
+# The two are not the same property, and only the second one protects the claim
+# this tool actually makes. A broken engine, a missing interpreter, a typo'd
+# workspace and two questions asked at once all used to produce the same thing:
+# a well-formatted, correctly-labelled, entirely empty answer. "No code uses
+# this" is what makes deleting a live endpoint look safe, so a zero-hit result
+# that is really a malfunction is the one bug class worth a suite of its own.
+#
+# Each check below reproduces a real defect found by probing rather than by
+# reading -- which is the argument for the section: none of them failed a single
+# scored query.
+info ""
+info "${C_BOLD}refusals — a malfunction must not look like a negative result${C_OFF}"
+
+refuses() {  # refuses <name> <expected-message-fragment> <command...>
+  local name="$1" want="$2"; shift 2
+  local out rc
+  out=$("$@" 2>&1); rc=$?
+  if [[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi -- "$want"; then
+    ok "$name"; pass=$((pass + 1))
+  elif [[ $rc -eq 0 ]]; then
+    err "$name — exited 0 and answered instead of refusing"; fail=$((fail + 1))
+    failed_ids+=("$name")
+  else
+    err "$name — failed, but not with the reason a caller can act on"; fail=$((fail + 1))
+    failed_ids+=("$name")
+  fi
+}
+
+# python3 is a hard dependency of `uses`, `provides`, `deps` and `publishes`,
+# not an optional engine. Without it the pipe produced nothing and every one of
+# them reported a confident zero-hit answer -- `uses` still claiming "prose
+# filtered", a filter that had not run.
+nopy=$(mktemp -d); printf '#!/bin/sh\nexit 127\n' > "$nopy/python3"; chmod +x "$nopy/python3"
+refuses "cs uses without python3 refuses"     "python3" \
+  env PATH="$nopy:$PATH" "$here/cs" uses '/api/v1/inventory/reserve'
+refuses "cs provides without python3 refuses" "python3" \
+  env PATH="$nopy:$PATH" "$here/cs" provides 'com.acme:pricing-lib'
+rm -rf "$nopy"
+
+# Asking for a named workspace and being handed the fleet is the inverse of the
+# mistake the layering exists to prevent: the caller wanted their branch state
+# and silently got main, with no `searching:` line to reveal the substitution.
+refuses "--ticket with an unknown id refuses" "no such workspace" \
+  env TICKETS_ROOT="$(mktemp -d)" "$here/cs" --ticket=NO-SUCH-TICKET uses 'orders.reserved.v1'
+# common.sh defaults TICKETS_ROOT, so an unset one resolves against ~/tickets
+# rather than failing outright -- the refusal must still say WHERE it looked, or
+# a wrong TICKETS_ROOT and a typo'd id are indistinguishable from the message.
+refuses "--ticket refusal names the root it searched" "TICKETS_ROOT is" \
+  env -u TICKETS_ROOT "$here/cs" --ticket=NO-SUCH-TICKET uses 'orders.reserved.v1'
+
+# An empty fleet root answers "nothing found" for every question ever asked.
+refuses "an empty fleet root refuses" "no repositories" \
+  env FLEET_ROOT="$(mktemp -d)" "$here/cs" uses 'orders.reserved.v1'
+
+# stdout is the scoreable result stream and nothing else. A zero-hit `cs uses`
+# still prints the comment-only mentions it excluded, which is useful context
+# and NOT a result -- on stdout those lines were indistinguishable from hits, so
+# a docstring decoy could be scored against the answer that correctly excluded
+# it. Every diagnostic belongs on stderr; this asserts the separation holds.
+zero_stdout=$("$here/cs" uses '/api/v1/inventory/release' 2>/dev/null)
+if [[ -z "$zero_stdout" ]]; then
+  ok "a zero-hit answer writes nothing to stdout"; pass=$((pass + 1))
+else
+  err "a zero-hit answer leaked $(printf '%s\n' "$zero_stdout" | grep -c '') line(s) onto stdout"
+  fail=$((fail + 1)); failed_ids+=("stdout-purity")
+fi
+
+# Agents issue tool calls in parallel. `cs def` cached its symbol index at a
+# path derived from the fleet, so concurrent runs raced on the same file and
+# roughly half returned nothing -- each labelled a normal structural answer.
+conc_tmp=$(mktemp -d); conc_n=6
+for i in $(seq 1 $conc_n); do
+  ( "$here/cs" def Reserve 2>/dev/null > "$conc_tmp/$i" ) &
+done
+wait
+conc_bad=0
+for i in $(seq 1 $conc_n); do
+  grep -q 'ReservationController' "$conc_tmp/$i" 2>/dev/null || conc_bad=$((conc_bad + 1))
+done
+if [[ $conc_bad -eq 0 ]]; then
+  ok "$conc_n concurrent 'cs def' runs all agree"; pass=$((pass + 1))
+else
+  err "$conc_bad of $conc_n concurrent 'cs def' runs returned nothing (index race)"
+  fail=$((fail + 1)); failed_ids+=("concurrent-def")
+fi
+rm -rf "$conc_tmp"
+
+# The prose filter covers a fixed set of languages. One it does not know is
+# passed through unfiltered, which is defensible -- claiming "prose filtered"
+# over it is not. The claim has to name the exception.
+unsup_repo="$FLEET_ROOT/checkout-service-kotlin"
+if [[ -d "$unsup_repo" ]]; then
+  mkdir -p "$unsup_repo/unfiltered"
+  printf ';; only a comment, in a language the filter cannot parse: cs-unsupported-probe\n' \
+    > "$unsup_repo/unfiltered/probe.unknownlang"
+  unsup_out=$("$here/cs" uses 'cs-unsupported-probe' 2>&1)
+  if printf '%s' "$unsup_out" | grep -q 'NOT filtered'; then
+    ok "an unfilterable language is named, not silently claimed as filtered"
+    pass=$((pass + 1))
+  else
+    err "a hit in an unknown language was reported as 'prose filtered'"
+    fail=$((fail + 1)); failed_ids+=("unsupported-language-claim")
+  fi
+  rm -rf "$unsup_repo/unfiltered"
+fi
+
+# Per-language prose filtering. The filter recognises comments by extension, so
+# its coverage is a table and the only way to know the table is right is to try
+# every entry. The five fixture repos cannot do this: they are all written in
+# languages the filter supported from the start, which is precisely why C++
+# comments were being counted as call sites and nothing noticed.
+#
+# Each probe file carries a -CODE token in executable code and a -PROSE token in
+# comments only. Both halves are asserted: demanding only that -PROSE is absent
+# would pass just as happily if `cs uses` returned nothing at all.
+probe_src="$repo_root_dir/fixtures/prose-probes"
+if [[ -d "$probe_src" ]]; then
+  probe_repo="$FLEET_ROOT/prose-probe-repo"
+  mkdir -p "$probe_repo"
+  cp "$probe_src"/probe.* "$probe_src"/Dockerfile "$probe_repo/" 2>/dev/null || true
+  git -C "$probe_repo" init -q 2>/dev/null || true
+
+  langs_ok=(); langs_prose=(); langs_code=()
+  for f in "$probe_repo"/*; do
+    [[ -f "$f" ]] || continue
+    b=$(basename "$f")
+    [[ "$b" == "README.md" ]] && continue
+    # The token names are carried in the files, so adding a language needs no
+    # change here -- drop in probe.<ext> and it is covered.
+    tok=$(grep -o 'cs-probe-[a-z]*-CODE' "$f" | head -1)
+    [[ -n "$tok" ]] || continue
+    lang="${tok#cs-probe-}"; lang="${lang%-CODE}"
+    n_code=$("$here/cs" uses "cs-probe-$lang-CODE" 2>/dev/null | grep -c "$b")
+    n_prose=$("$here/cs" uses "cs-probe-$lang-PROSE" 2>/dev/null | grep -c "$b")
+    if [[ "$n_code" -ge 1 && "$n_prose" -eq 0 ]]; then langs_ok+=("$lang")
+    elif [[ "$n_code" -eq 0 ]]; then langs_code+=("$lang")
+    else langs_prose+=("$lang"); fi
+  done
+
+  if [[ ${#langs_code[@]} -eq 0 && ${#langs_prose[@]} -eq 0 ]]; then
+    ok "prose filtering holds for ${#langs_ok[@]} languages: ${langs_ok[*]}"
+    pass=$((pass + 1))
+  else
+    [[ ${#langs_prose[@]} -gt 0 ]] && err "comments counted as code uses in: ${langs_prose[*]}"
+    [[ ${#langs_code[@]} -gt 0 ]] && err "real code uses were dropped in: ${langs_code[*]}"
+    fail=$((fail + 1)); failed_ids+=("prose-filter-languages")
+  fi
+  rm -rf "$probe_repo"
+fi
 
 info ""
 info "${C_BOLD}$pass passed, $fail failed${C_OFF}"

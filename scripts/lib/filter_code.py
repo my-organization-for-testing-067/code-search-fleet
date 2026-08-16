@@ -9,37 +9,125 @@ cannot see the string literal that is the real call site.
 Line-leading markers are not enough -- a docstring's middle line carries no
 marker at all -- so this tracks block state by scanning each file once.
 
-Usage: filter_code.py [--invert] [--root DIR]
+A file whose language is not in the tables below cannot be filtered, and the
+honest thing to do with it is say so: `--report-unsupported` writes the
+extensions it had to pass through unfiltered to stderr, so `cs uses` can
+qualify its "prose filtered" claim instead of overstating it.
+
+Usage: filter_code.py [--invert] [--root DIR] [--report-unsupported]
 """
 import sys
 import pathlib
 import argparse
 from functools import lru_cache
 
+# Three families cover almost everything in use: `//`, `#`, and `/* */`. An
+# extension absent from these tables gets an EMPTY comment set, which means
+# every one of its lines counts as code -- `cs uses` silently degrades to
+# `cs seam` for that language while still reporting "prose filtered". That is a
+# provenance claim the filter did not honour, and it is invisible to anyone
+# whose fleet is written in the languages already covered. So the tables are
+# deliberately broad, and whatever is still missing is reported rather than
+# quietly passed through.
+_SLASH = ("//",)
+_HASH = ("#",)
+_C_BLOCK = [("/*", "*/")]
+_XML_BLOCK = [("<!--", "-->")]
+
 LINE_COMMENT = {
-    ".py": ("#",), ".rb": ("#",), ".sh": ("#",), ".yml": ("#",), ".yaml": ("#",),
-    ".cs": ("//",), ".kt": ("//",), ".kts": ("//",), ".java": ("//",),
-    ".ts": ("//",), ".tsx": ("//",), ".js": ("//",), ".jsx": ("//",),
-    ".go": ("//",), ".rs": ("//",),
+    # hash family
+    ".py": _HASH, ".rb": _HASH, ".sh": _HASH, ".bash": _HASH, ".zsh": _HASH,
+    ".fish": _HASH, ".yml": _HASH, ".yaml": _HASH, ".toml": _HASH,
+    ".tf": _HASH, ".tfvars": _HASH, ".hcl": _HASH, ".nix": _HASH,
+    ".pl": _HASH, ".pm": _HASH, ".r": _HASH, ".jl": _HASH, ".cr": _HASH,
+    ".ex": _HASH, ".exs": _HASH, ".cmake": _HASH, ".mk": _HASH,
+    ".rake": _HASH, ".gemspec": _HASH, ".ps1": _HASH, ".psm1": _HASH,
+    ".properties": _HASH, ".env": _HASH, ".ini": _HASH + (";",),
+    # slash family
+    ".cs": _SLASH, ".kt": _SLASH, ".kts": _SLASH, ".java": _SLASH,
+    ".ts": _SLASH, ".tsx": _SLASH, ".js": _SLASH, ".jsx": _SLASH,
+    ".mjs": _SLASH, ".cjs": _SLASH, ".mts": _SLASH, ".cts": _SLASH,
+    ".go": _SLASH, ".rs": _SLASH, ".swift": _SLASH, ".scala": _SLASH,
+    ".sc": _SLASH, ".groovy": _SLASH, ".gradle": _SLASH, ".dart": _SLASH,
+    ".c": _SLASH, ".h": _SLASH, ".cc": _SLASH, ".cpp": _SLASH, ".cxx": _SLASH,
+    ".hpp": _SLASH, ".hh": _SLASH, ".hxx": _SLASH, ".ino": _SLASH,
+    ".m": _SLASH, ".mm": _SLASH, ".proto": _SLASH, ".thrift": _SLASH,
+    ".vue": _SLASH, ".svelte": _SLASH, ".zig": _SLASH, ".sol": _SLASH,
+    ".php": _SLASH + _HASH, ".fs": _SLASH, ".fsx": _SLASH,
+    # everything else
+    ".sql": ("--",), ".lua": ("--",), ".hs": ("--",), ".elm": ("--",),
+    ".ada": ("--",), ".clj": (";",), ".cljs": (";",), ".cljc": (";",),
+    ".edn": (";",), ".el": (";",), ".lisp": (";",), ".scm": (";",),
+    ".vb": ("'",), ".bas": ("'",), ".erl": ("%",), ".hrl": ("%",),
+    ".tex": ("%",), ".f90": ("!",), ".f95": ("!",),
 }
 BLOCK = {
-    ".cs": [("/*", "*/")], ".kt": [("/*", "*/")], ".kts": [("/*", "*/")],
-    ".java": [("/*", "*/")], ".ts": [("/*", "*/")], ".tsx": [("/*", "*/")],
-    ".js": [("/*", "*/")], ".jsx": [("/*", "*/")], ".go": [("/*", "*/")],
-    ".rs": [("/*", "*/")],
+    ".cs": _C_BLOCK, ".kt": _C_BLOCK, ".kts": _C_BLOCK, ".java": _C_BLOCK,
+    ".ts": _C_BLOCK, ".tsx": _C_BLOCK, ".js": _C_BLOCK, ".jsx": _C_BLOCK,
+    ".mjs": _C_BLOCK, ".cjs": _C_BLOCK, ".mts": _C_BLOCK, ".cts": _C_BLOCK,
+    ".go": _C_BLOCK, ".rs": _C_BLOCK, ".swift": _C_BLOCK, ".scala": _C_BLOCK,
+    ".sc": _C_BLOCK, ".groovy": _C_BLOCK, ".gradle": _C_BLOCK, ".dart": _C_BLOCK,
+    ".c": _C_BLOCK, ".h": _C_BLOCK, ".cc": _C_BLOCK, ".cpp": _C_BLOCK,
+    ".cxx": _C_BLOCK, ".hpp": _C_BLOCK, ".hh": _C_BLOCK, ".hxx": _C_BLOCK,
+    ".ino": _C_BLOCK, ".m": _C_BLOCK, ".mm": _C_BLOCK, ".php": _C_BLOCK,
+    ".proto": _C_BLOCK, ".thrift": _C_BLOCK, ".vue": _C_BLOCK,
+    ".svelte": _C_BLOCK, ".zig": _C_BLOCK, ".sol": _C_BLOCK,
+    ".css": _C_BLOCK, ".scss": _C_BLOCK, ".less": _C_BLOCK,
+    ".sql": _C_BLOCK, ".lua": [("--[[", "]]")],
+    ".hs": [("{-", "-}")], ".elm": [("{-", "-}")],
+    ".fs": [("(*", "*)")], ".fsx": [("(*", "*)")],
     ".py": [('"""', '"""'), ("'''", "'''")],
+    ".html": _XML_BLOCK, ".htm": _XML_BLOCK, ".xml": _XML_BLOCK,
+    ".xhtml": _XML_BLOCK, ".xsd": _XML_BLOCK, ".md": _XML_BLOCK,
+    ".cshtml": _XML_BLOCK, ".razor": _XML_BLOCK,
 }
+
+# Files with no extension whose *name* identifies the language. Common enough
+# in a fleet (a Dockerfile mentioning a config key, a Makefile calling a route)
+# that treating them as unsupported would be a needless gap.
+BY_NAME = {
+    "Dockerfile": (_HASH, []), "Containerfile": (_HASH, []),
+    "Makefile": (_HASH, []), "GNUmakefile": (_HASH, []),
+    "Rakefile": (_HASH, []), "Gemfile": (_HASH, []), "Brewfile": (_HASH, []),
+    "Vagrantfile": (_HASH, []), "Procfile": (_HASH, []),
+    "BUILD": (_HASH, []), "WORKSPACE": (_HASH, []), "Justfile": (_HASH, []),
+    "Jenkinsfile": (_SLASH, _C_BLOCK),
+}
+
+# Extensions that are data, not code, and have no comment syntax at all. They
+# are "supported" in the sense that nothing needs filtering -- distinguishing
+# them from genuinely unknown ones keeps the unsupported report meaningful.
+NO_COMMENT_SYNTAX = {".json", ".txt", ".csv", ".tsv", ".lock", ".log", ".rst"}
+
+
+def markers_for(path):
+    """(line_markers, block_pairs) for a path, or None when unsupported."""
+    ext = path.suffix.lower()
+    if ext in LINE_COMMENT or ext in BLOCK:
+        return LINE_COMMENT.get(ext, ()), BLOCK.get(ext, [])
+    if path.name in BY_NAME:
+        return BY_NAME[path.name]
+    if ext in NO_COMMENT_SYNTAX:
+        return (), []
+    return None
 
 
 @lru_cache(maxsize=512)
 def comment_lines(path_str):
-    """Return the set of 1-based line numbers that are comment or docstring."""
+    """1-based line numbers that are comment or docstring.
+
+    Returns None -- distinct from an empty set -- when the language is unknown,
+    so the caller can tell "nothing to filter here" from "could not filter".
+    """
     path = pathlib.Path(path_str)
-    ext = path.suffix
+    markers = markers_for(path)
+    if markers is None:
+        return None
+    line_markers, blocks = markers
     try:
         text = path.read_text(errors="replace")
     except OSError:
-        return frozenset()
+        return None
 
     out = set()
     open_marker = None
@@ -52,7 +140,7 @@ def comment_lines(path_str):
                 open_marker = None
             continue
 
-        for start, end in BLOCK.get(ext, []):
+        for start, end in blocks:
             pos = raw.find(start)
             if pos == -1:
                 continue
@@ -63,7 +151,7 @@ def comment_lines(path_str):
                 open_marker = (start, end)
             break
         else:
-            for marker in LINE_COMMENT.get(ext, ()):
+            for marker in line_markers:
                 if line.startswith(marker):
                     out.add(idx)
                     break
@@ -75,6 +163,8 @@ def main():
     ap.add_argument("--invert", action="store_true",
                     help="keep only the comment matches instead")
     ap.add_argument("--root", default=".")
+    ap.add_argument("--report-unsupported", action="store_true",
+                    help="write unfilterable extensions to stderr, one per line")
     ap.add_argument("-h", "--help", action="store_true")
     args = ap.parse_args()
     if args.help:
@@ -82,6 +172,7 @@ def main():
         return 0
 
     root = pathlib.Path(args.root)
+    unsupported = {}
     for raw in sys.stdin:
         line = raw.rstrip("\n")
         parts = line.split(":", 2)
@@ -89,9 +180,23 @@ def main():
             print(line)          # not a match line; pass through untouched
             continue
         rel, num = parts[0], int(parts[1])
-        in_comment = num in comment_lines(str(root / rel))
-        if in_comment == args.invert:
+        marked = comment_lines(str(root / rel))
+        if marked is None:
+            # Unfilterable. Kept on the code side rather than dropped: a real
+            # call site missed is worse than a comment counted, and the caller
+            # is told the claim is qualified.
+            p = pathlib.Path(rel)
+            key = p.suffix.lower() or p.name
+            unsupported[key] = unsupported.get(key, 0) + 1
+            if not args.invert:
+                print(line)
+            continue
+        if (num in marked) == args.invert:
             print(line)
+
+    if args.report_unsupported and unsupported:
+        for ext, n in sorted(unsupported.items(), key=lambda kv: -kv[1]):
+            print("{}\t{}".format(ext, n), file=sys.stderr)
     return 0
 
 

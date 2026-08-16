@@ -130,7 +130,13 @@ probe_text() {
   else
     engine=grep; ver=$(grep --version 2>/dev/null | head -1 | awk '{print $NF}')
   fi
-  if (cd "$F" && grep -rn --exclude-dir=.git -F 'orders.reserved.v1' . 2>/dev/null) | grep -q EventPublisher; then
+  # Captured, not piped straight into `grep -q`: under `set -o pipefail` the
+  # recursive grep is killed by SIGPIPE as soon as the second grep matches, and
+  # the probe then reports FAIL for a capability that works. Same shape as the
+  # bug that silently turned verify-search's timeout check into a SKIP.
+  local hits
+  hits=$( (cd "$F" && grep -rn --exclude-dir=.git -F 'orders.reserved.v1' . 2>/dev/null) || true )
+  if printf '%s\n' "$hits" | grep -q EventPublisher; then
     record "$engine" "$ver" capability PASS "literal text across repos"
   else
     record "$engine" "$ver" capability FAIL "missed a known literal"

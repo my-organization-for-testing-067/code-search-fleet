@@ -52,6 +52,14 @@
 #   CS_MAX_RESULTS   result cap, default 200 (0 = unlimited)
 #   CS_TIMEOUT       per-engine timeout in seconds, default 120 (0 = none)
 #   CS_TAGS_TTL      how long `cs def` reuses its symbol index, default 60s
+#   CS_EXCLUDE_EXTRA directories to skip, in addition to the built-in list
+#   CS_EXCLUDE_REMOVE directories to STOP skipping, e.g. "bin vendor" when a
+#                    repo keeps hand-written source there (`cs engines` prints
+#                    the effective list)
+#
+# Requires: python3 (uses, provides, deps, publishes, impls, refs). Everything
+# else is optional -- `cs engines` reports what is present and cs routes around
+# what is not.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
@@ -73,6 +81,31 @@ if ! compgen -G "$root/*/.git" >/dev/null; then
   (searching an empty fleet would report 'nothing found' for every query)"
 fi
 
+# python3 is NOT an optional engine. The engines below degrade to each other and
+# `cs engines` reports which are missing; python3 is different, because four
+# subcommands pipe THROUGH it -- `uses` through filter_code.py, `provides`,
+# `deps` and `publishes` through deps.py. Without it the pipe fails and the
+# stage produces nothing, which every one of those subcommands then reports as
+# a perfectly formatted zero-hit answer, still labelled "prose filtered". That
+# is the same manufactured negative the fleet-root guards above exist to
+# prevent, arriving by a different route, so it is checked the same way: at the
+# top, once, by dying rather than answering.
+have_python3() { python3 -c 'import sys' >/dev/null 2>&1; }
+require_python3() {  # require_python3 <subcommand> <what it is needed for>
+  have_python3 && return 0
+  local why
+  if command -v python3 >/dev/null 2>&1; then
+    why="python3 is on PATH but failed to run"
+  else
+    why="python3 is not on PATH"
+  fi
+  die "cs $1 needs python3, and $why
+  it is needed for: $2
+  without it this command would report zero hits rather than fail, and a
+  manufactured negative is the one answer that must never be produced
+  alternative: cs seam '<string>' answers without python3, but counts comments too"
+}
+
 # ---- layered view ----------------------------------------------------------
 # Work happens in a ticket workspace holding only the repos being changed, but
 # the questions that matter are fleet-wide: "who calls this endpoint" must see
@@ -87,14 +120,22 @@ fi
 view="$root"
 view_tmp=""
 ticket_root="${TICKET_ROOT:-}"
+# The raw --ticket=<id>, kept unresolved until build_view so that a bad one can
+# be reported as "no such workspace" rather than quietly becoming a fleet search.
+ticket_id=""
 layer_note=""
 
 cleanup_view() {
   [[ -n "$view_tmp" && -d "$view_tmp" ]] && rm -rf "$view_tmp"
   [[ -n "${CS_TIMEOUT_FLAG:-}" ]] && rm -f "$CS_TIMEOUT_FLAG"
+  # A half-built symbol index, if ctags was interrupted. Named per-process, so
+  # this only ever removes our own.
+  rm -f "${TMPDIR:-/tmp}"/cs-tags-*."$$".building 2>/dev/null
   return 0
 }
-trap cleanup_view EXIT
+# INT and TERM as well as EXIT: bash does not run an EXIT trap for an
+# uncaught signal, and being ^C'd mid-index is the likeliest way to leak one.
+trap cleanup_view EXIT INT TERM
 
 detect_ticket() {
   [[ -n "$ticket_root" ]] && return 0
@@ -110,8 +151,35 @@ detect_ticket() {
   [[ -n "$ticket_root" ]]
 }
 
+# Resolve an explicit --ticket=<id>. Asking for a ticket by name and being given
+# the fleet instead is the inverse of the mistake this whole layering exists to
+# prevent: the caller wanted THEIR branch state and silently got main, with no
+# `searching:` line to reveal it. A typo'd id, or one passed with TICKETS_ROOT
+# unset, used to do exactly that. So an explicit request that cannot be honoured
+# is fatal, while auto-detection from $PWD stays best-effort.
+resolve_explicit_ticket() {
+  [[ -n "$ticket_id" ]] || return 0
+  # common.sh always leaves TICKETS_ROOT with a default, so the failure a caller
+  # actually hits is "looked there, found nothing" rather than "not configured".
+  # Naming the root is what separates a typo'd id from a wrong TICKETS_ROOT --
+  # both otherwise present as an unexplained missing workspace.
+  local troot="${TICKETS_ROOT:-}"
+  [[ -n "$troot" ]] || die \
+"--ticket=$ticket_id was requested but TICKETS_ROOT is not set
+  there is nowhere to look for the workspace, and searching the fleet instead
+  would answer from main while you asked for your branch
+  set TICKETS_ROOT, or run: fleet-init --config --fleet-root <dir> --tickets-root <dir>"
+  ticket_root="$troot/$ticket_id"
+  [[ -d "$ticket_root" ]] || die \
+"--ticket=$ticket_id was requested but no such workspace: $ticket_root
+  searching the fleet instead would answer from main while you asked for your branch
+  TICKETS_ROOT is $troot; workspaces there: $(ls -1 "$troot" 2>/dev/null | tr '\n' ' ' || echo '(none — is TICKETS_ROOT right?)')
+  use --fleet if you meant to search the fleet only"
+}
+
 build_view() {
   [[ $fleet_only -eq 1 ]] && { layer_note="fleet only"; return; }
+  resolve_explicit_ticket
   detect_ticket || return 0
   [[ -d "$ticket_root" ]] || return 0
 
@@ -123,6 +191,12 @@ build_view() {
     name=$(basename "$d")
     ln -s "${d%/}" "$view/$name" && n_ticket=$((n_ticket + 1))
   done
+  # A workspace holding no repos layers nothing, so every answer comes from the
+  # fleet. That is a legitimate state (a workspace just created, or torn down
+  # mid-flight) but it is not what the caller asked for, so it is said out loud.
+  if [[ $n_ticket -eq 0 ]]; then
+    warn "ticket workspace $(basename "$ticket_root") holds no repos — answering from the fleet (main) only"
+  fi
   for d in "$root"/*/; do
     [[ -d "$d" ]] || continue
     name=$(basename "$d")
@@ -164,6 +238,13 @@ have() { command -v "$1" >/dev/null 2>&1; }
 #     .github/, .circleci/ and .env are invisible to it and visible to grep.
 #     Config keys and CI wiring live in exactly those files, and a config key
 #     that a service reads but a chart no longer writes is a seam worth finding.
+#
+# The list is a guess about other people's repos, and some entries are wrong for
+# some of them: `bin` and `build` are generated in most layouts and hand-written
+# source in others, and a Go fleet keeps real dependencies in `vendor`. An
+# excluded directory produces a silent false negative -- the hit simply is not
+# there -- so removing an entry has to be as easy as adding one. It was not:
+# CS_EXCLUDE_EXTRA only ever appended. CS_EXCLUDE_REMOVE subtracts.
 CS_EXCLUDE_DIRS=(
   .git .origins .hg .svn
   node_modules bower_components vendor Pods DerivedData
@@ -174,6 +255,16 @@ CS_EXCLUDE_DIRS=(
 )
 # shellcheck disable=SC2206
 [[ -n "${CS_EXCLUDE_EXTRA:-}" ]] && CS_EXCLUDE_DIRS+=(${CS_EXCLUDE_EXTRA})
+if [[ -n "${CS_EXCLUDE_REMOVE:-}" ]]; then
+  _keep=() _d _r _drop
+  for _d in "${CS_EXCLUDE_DIRS[@]}"; do
+    _drop=0
+    for _r in ${CS_EXCLUDE_REMOVE}; do [[ "$_d" == "$_r" ]] && { _drop=1; break; }; done
+    [[ $_drop -eq 0 ]] && _keep+=("$_d")
+  done
+  CS_EXCLUDE_DIRS=("${_keep[@]}")
+  unset _keep _d _r _drop
+fi
 
 # `rg` may exist only as a shell function (Claude Code proxies its bundled
 # ripgrep that way), which a script cannot call. Require a real binary, and
@@ -409,6 +500,12 @@ usage() {
 cmd_engines() {
   local n=0
   printf '%-12s %s\n' "ENGINE" "STATUS"
+  # Listed first, and separately from the optional engines below, because it is
+  # the only REQUIRED one: the others degrade to each other, python3 does not.
+  # Its absence used to be invisible here, which is why `cs uses` on a machine
+  # without it looked like a working search that found nothing.
+  if have_python3; then printf '%-12s %s\n' "python3" "ok (REQUIRED by: uses, provides, deps, publishes)"
+  else printf '%-12s %s\n' "python3" "MISSING — REQUIRED: uses/provides/deps/publishes cannot run"; fi
   if have_rg_binary; then printf '%-12s %s\n' "ripgrep" "ok"; n=$((n+1))
   else printf '%-12s %s\n' "ripgrep" "absent - using POSIX grep fallback"; fi
   for e in ast-grep semgrep; do
@@ -430,6 +527,10 @@ cmd_engines() {
   else
     printf 'timeout:     %s\n' "NONE — no timeout(1) on this machine, so a hung engine hangs cs (brew install coreutils)"
   fi
+  # Printed because every entry here is a place results cannot come from, and a
+  # directory excluded by mistake looks exactly like a directory with no hits.
+  printf 'skipping:    %s\n' "$(printf '%s ' "${CS_EXCLUDE_DIRS[@]}")"
+  printf '             (CS_EXCLUDE_EXTRA adds, CS_EXCLUDE_REMOVE subtracts)\n'
   [[ $n -gt 0 ]]
 }
 
@@ -519,20 +620,39 @@ TABLE
 # literal that is the real call site.
 cmd_uses() {
   [[ $# -ge 1 ]] || die "cs uses <string>"
-  answer heuristic "$(text_engine)" "literal, prose filtered"
-  local hits repos
-  hits=$(grep_fleet literal "$1" | normalize | python3 "$lib_dir/filter_code.py" --root "$view")
+  require_python3 uses "excluding comments and docstrings from the hits"
+  local hits repos unsupported unsup_file
+  # The filter cannot cover every language, and a hit in one it does not know is
+  # passed through unfiltered. Saying "prose filtered" over those anyway is a
+  # provenance claim the run did not honour -- the exact overstatement the kind
+  # labels exist to prevent -- so the note is built from what actually happened.
+  unsup_file="$(mktemp -t cs-unsup.XXXXXX)"
+  hits=$(grep_fleet literal "$1" | normalize \
+         | python3 "$lib_dir/filter_code.py" --root "$view" --report-unsupported 2>"$unsup_file")
+  unsupported=$(cut -f1 "$unsup_file" | sort -u | tr '\n' ' ' | sed 's/ $//')
+  rm -f "$unsup_file"
+  if [[ -n "$unsupported" ]]; then
+    answer heuristic "$(text_engine)" "literal, prose filtered except: $unsupported"
+  else
+    answer heuristic "$(text_engine)" "literal, prose filtered"
+  fi
   if [[ -z "$hits" ]]; then
     info "no code uses '$1'"
     local prose
-    prose=$(grep_fleet literal "$1" | normalize | python3 "$lib_dir/filter_code.py" --invert --root "$view")
+    prose=$(grep_fleet literal "$1" | normalize | python3 "$lib_dir/filter_code.py" --invert --root "$view" 2>/dev/null)
     if [[ -n "$prose" ]]; then
       warn "mentioned only in comments/docs:"
-      printf '%s\n' "$prose"
+      # stderr, like every other diagnostic. On stdout these lines landed in the
+      # scoreable result stream of a query that had just reported ZERO hits, so
+      # a caller piping cs saw comment matches presented as results -- and a
+      # decoy planted in a docstring could be scored as a hit against the very
+      # answer that correctly excluded it.
+      printf '%s\n' "$prose" >&2
     fi
     report_answer 0 0
     return 1
   fi
+  [[ -n "$unsupported" ]] && warn "comments were NOT filtered in: $unsupported — hits in those files may be prose (cs why heuristic)"
   emit_capped "$hits"
   repos=$(printf '%s\n' "$hits" | cut -d/ -f1 | sort -u)
   info ""
@@ -579,29 +699,55 @@ cmd_def() {
     if [[ $age -lt $ttl ]]; then cached="cached ${age}s ago"; fi
   fi
 
+  # Built to a private path and moved into place, never written where a reader
+  # can see it half-finished. The cache path is shared by construction -- it is
+  # keyed on the fleet, so every concurrent `cs def` computes the SAME name --
+  # and agents issue tool calls in parallel by default. Writing $tags directly
+  # meant six simultaneous runs returned: three answers and three empty results,
+  # each labelled a normal `structural via ctags` answer. A false negative
+  # produced by nothing worse than being asked two questions at once.
+  #
+  # rename(2) is atomic within a filesystem, so a reader sees either the old
+  # complete index or the new one. Whoever finishes last wins, and since every
+  # writer is building the same content from the same fingerprint, that is fine.
   if [[ -z "$cached" ]]; then
-    run_timed "$ct" -R --links=yes --fields=+n -f "$tags" "$view"/*/ 2>/dev/null
+    # The key includes each repo's commit, so every fleet refresh or branch
+    # switch strands the previous index. On a large fleet these are tens of MB
+    # each and nothing ever removed them. Swept on rebuild, which is the only
+    # moment a new one is created; -mmin +1440 keeps today's other checkouts.
+    find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'cs-tags-*.tags' -mmin +1440 -delete 2>/dev/null
+    local tmp_tags="$tags.$$.building"
+    run_timed "$ct" -R --links=yes --fields=+n -f "$tmp_tags" "$view"/*/ 2>/dev/null
+    if [[ ! -s "$tmp_tags" ]]; then
+      rm -f "$tmp_tags"
+      die "ctags produced no index under $root"
+    fi
+    mv -f "$tmp_tags" "$tags" 2>/dev/null || { rm -f "$tmp_tags"; die "could not install the symbol index at $tags"; }
     answer structural "ctags" "fleet-wide symbol index, rebuilt now"
   else
     answer structural "ctags" "fleet-wide symbol index, $cached — uncommitted edits within ${ttl}s may be missing (--refresh)"
   fi
-  if [[ ! -s "$tags" ]]; then rm -f "$tags"; die "ctags produced no index under $root"; fi
-  awk -F'\t' -v want="$1" '$1 == want {
+  # A concurrent --refresh can replace the file between the check above and the
+  # read below; both are complete indexes, so re-checking is enough.
+  if [[ ! -s "$tags" ]]; then die "the symbol index at $tags vanished or is empty"; fi
+  # Per-process, because the result file was previously shared too: one run
+  # deleted $tags.out while another was still reading it, which is the other
+  # half of the same empty-answer bug.
+  local out
+  out=$(awk -F'\t' -v want="$1" '$1 == want {
       line = "?"; kind = "?";
       for (i = 4; i <= NF; i++) {
         if ($i ~ /^line:/) { line = substr($i, 6) }
         else if (length($i) <= 2) { kind = $i }
       }
       printf "%s:%s: [%s] %s\n", $2, line, kind, want
-  }' "$tags" | normalize | sort -u | { if [[ -n "$only" ]]; then grep "^$only/" || true; else cat; fi; } > "$tags.out"
-  if [[ ! -s "$tags.out" ]]; then
-    rm -f "$tags.out"
+  }' "$tags" | normalize | sort -u | { if [[ -n "$only" ]]; then grep "^$only/" || true; else cat; fi; })
+  if [[ -z "$out" ]]; then
     report_answer 0 0
     hint "cs text '$1'           (ctags misses symbols built dynamically)" \
          "cs refs $1 <repo> <file>  (for a precise, LSP-backed answer)"
     return 1
   fi
-  local out; out=$(cat "$tags.out"); rm -f "$tags.out"
   emit_capped "$out"
   # Two repos defining the same name is the failure mode this cannot resolve:
   # ctags matches spelling, so it cannot tell you which one your caller means.
@@ -616,19 +762,30 @@ cmd_def() {
 # on, and that lives in build manifests, not in code.
 cmd_provides() {
   [[ $# -ge 1 ]] || die "cs provides <coordinate>"
+  require_python3 provides "reading the build manifests that declare it"
   answer declared "build manifests" "publish declarations"
   local out; out=$(python3 "$lib_dir/deps.py" "$view" provides "$1")
+  # A bare `printf '%s\n' ""` emits a blank line, which reads as an answer and
+  # is what `cs def X "$(cs provides …)"` silently turns into "every repo".
+  if [[ -z "$out" ]]; then
+    report_answer 0 0
+    hint "cs publishes           (what every repo declares that it publishes)" \
+         "cs seam '$1'           (the coordinate may be referenced but not declared here)"
+    return 1
+  fi
   printf '%s\n' "$out"
   report_answer
 }
 
 cmd_deps() {
+  require_python3 deps "reading the build manifests the graph is built from"
   answer declared "build manifests" "dependency declarations"
   python3 "$lib_dir/deps.py" "$view" deps "${1:-}"
   report_answer
 }
 
 cmd_publishes() {
+  require_python3 publishes "reading the build manifests the graph is built from"
   answer declared "build manifests" "publish declarations"
   python3 "$lib_dir/deps.py" "$view" publishes
   report_answer
@@ -685,6 +842,7 @@ cmd_calls() {
 cmd_impls() {
   [[ $# -ge 2 ]] || die "cs impls <symbol> <repo> [file]"
   have uvx || die "serena needs uv installed"
+  require_python3 impls "driving the language server and formatting its answer"
   local repo_dir="$view/$2" file="${3:-}"
   [[ -d "$repo_dir" ]] || die "no such repo: $2"
   answer resolved "serena (LSP)" "scoped to $2"
@@ -718,20 +876,42 @@ if pick:
     return 1
   fi
 
-  run_timed python3 "$lib_dir/serena_call.py" "$repo_dir" find_implementations \
-    "{\"name_path\":\"$name_path\",\"relative_path\":\"$rel\"}"
-  report_answer
+  # Formatted and capped like every other subcommand. Raw Serena JSON was both
+  # unscoreable and uncapped, so the one engine whose answers are strongest was
+  # also the one whose output could flood a context window unannounced.
+  local out
+  out=$(run_timed python3 "$lib_dir/serena_call.py" "$repo_dir" find_implementations \
+        "{\"name_path\":\"$name_path\",\"relative_path\":\"$rel\"}" \
+        | python3 "$lib_dir/serena_fmt.py" "$2")
+  if [[ -z "$out" ]]; then
+    report_answer 0 0
+    hint "cs def $1              (confirm the symbol is spelled as the server sees it)" \
+         "cs calls '<pattern>'   (an implementation the server could not load is invisible here)"
+    return 1
+  fi
+  emit_capped "$out"
+  report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
 }
 
 cmd_refs() {
   [[ $# -ge 3 ]] || die "cs refs <symbol> <repo> <file-relative-to-repo>"
   have uvx || die "serena needs uv installed"
+  require_python3 refs "driving the language server and formatting its answer"
   local repo_dir="$view/$2"
   [[ -d "$repo_dir" ]] || die "no such repo: $2"
   answer resolved "serena (LSP)" "scoped to $2"
-  run_timed python3 "$lib_dir/serena_call.py" "$repo_dir" find_referencing_symbols \
-    "{\"name_path\":\"$1\",\"relative_path\":\"$3\"}"
-  report_answer
+  local out
+  out=$(run_timed python3 "$lib_dir/serena_call.py" "$repo_dir" find_referencing_symbols \
+        "{\"name_path\":\"$1\",\"relative_path\":\"$3\"}" \
+        | python3 "$lib_dir/serena_fmt.py" "$2")
+  if [[ -z "$out" ]]; then
+    report_answer 0 0
+    hint "cs def $1 $2            (confirm the symbol and file are right)" \
+         "cs uses '$1'           (a reference across a repo boundary is a string, not a symbol)"
+    return 1
+  fi
+  emit_capped "$out"
+  report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
 }
 
 # ---- history ---------------------------------------------------------------
@@ -847,7 +1027,8 @@ args=()
 for a in "$@"; do
   case "$a" in
     --fleet) fleet_only=1 ;;
-    --ticket=*) ticket_root="${TICKETS_ROOT:-}/${a#--ticket=}" ;;
+    --ticket=*) ticket_id="${a#--ticket=}"
+                [[ -n "$ticket_id" ]] || die "--ticket= needs a workspace id, e.g. --ticket=PROJ-123" ;;
     --why) show_why=1 ;;
     --quiet|-q) quiet=1 ;;
     --all) CS_MAX_RESULTS=0 ;;

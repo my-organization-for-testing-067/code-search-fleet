@@ -51,6 +51,34 @@ info "${C_BOLD}package manager:${C_OFF} $PM"
 info ""
 
 missing=0
+
+# Checked first and separately, because it is the one REQUIRED dependency. The
+# engines below degrade to each other and cs routes around whichever is absent;
+# `uses`, `provides`, `deps` and `publishes` pipe THROUGH python3. Not installed
+# here -- a system python is the OS's business, not a search tool's -- but
+# reported, because its absence used to be invisible until a query came back
+# empty and looked like a real "nothing uses this".
+if python3 -c 'import sys' >/dev/null 2>&1; then
+  ok "python3 — REQUIRED: cs uses / provides / deps / publishes run through it"
+else
+  err "python3 MISSING — REQUIRED; cs now refuses those four commands rather than answering empty"
+  info "    install it from your OS (macOS: xcode-select --install)"
+  missing=$((missing + 1))
+fi
+
+# Not an engine either, but without it a hung language server hangs cs with no
+# upper bound, and a search that never returns is worse than a wrong one
+# because nothing reports it.
+if ! have timeout && ! have gtimeout; then
+  warn "timeout(1) missing — a hung engine will hang cs with no limit"
+  case "$PM" in
+    brew)    info "    fix: brew install coreutils" ;;
+    apt|dnf) info "    fix: install coreutils" ;;
+  esac
+  missing=$((missing + 1))
+fi
+info ""
+
 for entry in "${ENGINES[@]}"; do
   IFS='|' read -r name probe brew_pkg apt_pkg why <<< "$entry"
   if have "$probe"; then
