@@ -369,7 +369,14 @@ installed.
   answer names the interface and says the implementation is resolved at runtime.
 - **`cs def` uses ctags**, which indexes declarations, not semantics. It will
   not find a symbol assembled at runtime, and it does not distinguish
-  overloads. `cs refs` is the precise-but-slow alternative.
+  overloads. `cs refs` is the precise-but-slow alternative. Where universal-ctags
+  is not installed, `cs def` falls back to any tokensave graphs in the view, and
+  `--engine=tokensave` asks for them deliberately. Read the coverage warning
+  when it does: ctags indexes the whole view in one pass, while graphs are
+  **per-repo**, so a definition living in a repo with no graph is reported as
+  absent. `cs` names those repos — treat that list as the boundary of the
+  answer. The two engines agree on the defining file but can differ by a line,
+  since a graph includes a decorator or attribute in the symbol's range.
 - **`cs def` reuses its index for 60 seconds.** The key is the commit each repo
   is on, so a fleet refresh or a branch change invalidates it — but *uncommitted*
   edits do not. The answer line says how old the index is; pass `--refresh` after

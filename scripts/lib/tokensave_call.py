@@ -25,9 +25,9 @@ Three traps, all reproduced against tokensave 7.9.0 rather than taken on trust:
      here that can be confidently WRONG rather than merely blind. Staleness is
      surfaced by the caller; see `cs engines`.
 
-Usage: tokensave_call.py <repo-dir> <repo-name> <symbol>
-Exit:  0 found, 1 no implementors (an honest negative), 3 symbol not resolvable,
-       4 the tool itself failed.
+Usage: tokensave_call.py <impls|def> <repo-dir> <repo-name> <symbol>
+Exit:  0 found, 1 nothing found (an honest negative), 3 symbol not resolvable
+       as a type (impls only), 4 the tool itself failed.
 """
 import json
 import re
@@ -38,6 +38,12 @@ import sys
 ROW = re.compile(r"^\|-\s+(\w+)\s+(.+?)\s+\((\w+)\)\s+--\s+(.+):(\d+)\s*$")
 
 TYPE_KINDS = ("interface", "class", "trait", "struct", "enum", "record", "type")
+
+# `search` is a RANKED, fuzzy match, so `Reserve` also returns ReserveAsync,
+# ReservationController and ReserveRequest. cs def answers "where is this symbol
+# defined", so only an exact name counts -- and these kinds are references or
+# containers rather than definitions, which ctags would not report either.
+NOT_A_DEFINITION = ("use", "annotation_usage", "file")
 
 
 def _run(args):
@@ -50,11 +56,52 @@ def _run(args):
     return p.stdout, None
 
 
+def _search(project, symbol, limit):
+    out, err = _run(["tokensave", "tool", "search", symbol,
+                     "--project", project, "--limit", str(limit)])
+    if out is None:
+        print(f"tokensave search failed: {err}", file=sys.stderr)
+        return None
+    try:
+        rows = json.loads(out)
+    except json.JSONDecodeError:
+        print("tokensave search returned no parseable JSON", file=sys.stderr)
+        return None
+    if not isinstance(rows, list):
+        rows = rows.get("results", []) if isinstance(rows, dict) else []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def defs(project, repo, symbol):
+    """Where a symbol is DEFINED, as a cross-repo alternative to the ctags index."""
+    rows = _search(project, symbol, 100)
+    if rows is None:
+        return 4
+    found = 0
+    for r in rows:
+        if r.get("name") != symbol:
+            continue
+        kind = r.get("kind", "?")
+        if kind in NOT_A_DEFINITION:
+            continue
+        if not r.get("file"):
+            continue
+        print(f"{repo}/{r['file']}:{r.get('line', '?')}: [{kind}] {symbol}")
+        found += 1
+    return 0 if found else 1
+
+
 def main():
-    if len(sys.argv) < 4:
+    if len(sys.argv) < 5:
         print(__doc__, file=sys.stderr)
         return 4
-    project, repo, symbol = sys.argv[1], sys.argv[2], sys.argv[3]
+    mode, project, repo, symbol = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+    if mode == "def":
+        return defs(project, repo, symbol)
+    if mode != "impls":
+        print(f"unknown mode: {mode}", file=sys.stderr)
+        return 4
 
     # Step 1: resolve the name to a graph node id.
     out, err = _run(["tokensave", "tool", "search", symbol, "--project", project])

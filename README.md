@@ -28,7 +28,7 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 106 checks against a throwaway fixture fleet
+scripts/verify-search              # 112 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only
@@ -224,6 +224,20 @@ remains the only thing here that bridges a DI registration. The query is
 `fixtures/BASELINE.md`). `cs engines` reports graph age alongside the binaries,
 since a graph is the one engine that can be confidently *wrong* rather than
 merely blind.
+
+`cs def` gets the same fallback: with no universal-ctags installed it reads the
+graphs instead, and `--engine=tokensave` asks for them deliberately. The
+trade-off is coverage — the ctags index spans the whole view in one pass, while
+graphs are **per-repo** — so `cs` names the repos it could not cover:
+
+```
+! no tokensave graph, so NOT searched: pricing-lib-java web-monorepo-node …
+  — a definition in those repos cannot be found this way
+```
+
+Without that line a definition living in an unindexed repo would look exactly
+like a symbol that does not exist, which is the failure this whole project is
+organised against.
 
 ## Tuning it for your repos
 

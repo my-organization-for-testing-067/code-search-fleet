@@ -992,6 +992,74 @@ else
     else
       ok "with no toolchain and no graph, cs impls still refuses"; pass=$((pass + 1))
     fi
+    # ---- cs def, the cross-repo graph alternative to the ctags index --------
+    # ctags indexes the whole view in one pass; graphs are per-repo, so coverage
+    # is whatever has been indexed. That gap has to be DISCLOSED — a repo with
+    # no graph is a place results cannot come from, the same hazard as an
+    # excluded directory, and a definition living there looks exactly like a
+    # symbol that does not exist.
+    def_ts=$(PATH="$ts_nodot:$PATH" "$here/cs" def Reserve --engine=tokensave 2>&1); def_rc=$?
+    if [[ $def_rc -eq 0 ]] && printf '%s' "$def_ts" | grep -q 'ReservationController.cs'; then
+      ok "cs def --engine=tokensave answers from the graph"; pass=$((pass + 1))
+    else
+      err "cs def could not read the graph (exit $def_rc)"
+      fail=$((fail + 1)); failed_ids+=("def-graph-no-answer")
+    fi
+
+    # The repos with no graph must be NAMED, not silently omitted.
+    if printf '%s' "$def_ts" | grep -q 'NOT searched'; then
+      ok "cs def names the repos its graphs do not cover"; pass=$((pass + 1))
+    else
+      err "cs def searched a partial set of repos without saying so"
+      fail=$((fail + 1)); failed_ids+=("def-graph-coverage-silent")
+    fi
+
+    # A symbol that exists only in an ungraphed repo must come back as a zero
+    # WITH that warning attached — a false negative that announces itself.
+    def_miss=$("$here/cs" def DiscountEngine --engine=tokensave 2>&1); def_mrc=$?
+    if [[ $def_mrc -eq 2 ]] && printf '%s' "$def_miss" | grep -q 'NOT searched'; then
+      ok "a definition outside graph coverage is a disclosed zero, not a silent one"
+      pass=$((pass + 1))
+    else
+      err "an out-of-coverage definition was reported without disclosure (exit $def_mrc)"
+      fail=$((fail + 1)); failed_ids+=("def-graph-silent-miss")
+    fi
+
+    # ctags must still win by default: the graph is a fallback, not a
+    # replacement, and it covers less of the fleet.
+    if [[ -n "$(command -v ctags 2>/dev/null)" ]]; then
+      def_default=$("$here/cs" def Reserve 2>&1 || true)
+      if printf '%s' "$def_default" | grep -q 'answer:.*via ctags'; then
+        ok "cs def still prefers the ctags index when it exists"; pass=$((pass + 1))
+      else
+        err "the graph displaced the ctags index by default"
+        fail=$((fail + 1)); failed_ids+=("def-graph-displaced-ctags")
+      fi
+    fi
+
+    # Both engines must agree on WHICH FILE defines the symbol. They differ on
+    # the line by design — tokensave includes a C# attribute in the symbol's
+    # source range, ctags anchors the declaration below it — so the file is the
+    # invariant worth pinning, not the line.
+    f_ctags=$("$here/cs" def Reserve --quiet 2>/dev/null | cut -d: -f1 | sort -u)
+    f_graph=$("$here/cs" def Reserve --engine=tokensave --quiet 2>/dev/null | cut -d: -f1 | sort -u)
+    if [[ -n "$f_graph" && "$f_ctags" == *"$f_graph"* ]]; then
+      ok "ctags and the graph agree on which file defines the symbol"; pass=$((pass + 1))
+    else
+      err "engines disagree on the defining file (ctags='$f_ctags' graph='$f_graph')"
+      fail=$((fail + 1)); failed_ids+=("def-engine-disagreement")
+    fi
+
+    # And --engine=tokensave with no graph anywhere refuses, rather than
+    # reporting that nothing is defined in the fleet.
+    if PATH="$ts_nodot:$PATH" FLEET_ROOT="$ts_nograph/fleet" \
+       "$here/cs" def Reserve --engine=tokensave >/dev/null 2>&1; then
+      err "cs def answered with no graph in view"
+      fail=$((fail + 1)); failed_ids+=("def-graph-absent-no-refusal")
+    else
+      ok "cs def --engine=tokensave with no graph refuses"; pass=$((pass + 1))
+    fi
+
     rm -rf "$ts_nodot" "$ts_nograph"
   fi
 fi

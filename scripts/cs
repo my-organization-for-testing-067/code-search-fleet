@@ -48,6 +48,8 @@
 #   --quiet          suppress the provenance line (stdout is unaffected either way)
 #   --all            no result cap for this query
 #   --engine=<name>  force one engine and fail rather than fall back
+#                    (--engine=tokensave makes cs def read a per-repo graph
+#                    instead of the fleet-wide ctags index)
 #   --refresh        rebuild the cached symbol index instead of reusing it
 #   --porcelain      one JSON object on stdout instead of result lines
 #                    (CS_JSON=1 does the same; stderr is unaffected)
@@ -1691,10 +1693,70 @@ view_fingerprint() {
   return 1
 }
 
+# The cross-repo graph alternative to the ctags index. Unlike ctags -- which
+# indexes the whole view in one pass -- graphs are per-repo, so coverage is
+# whatever has been indexed. That gap is DISCLOSED rather than assumed away: a
+# repo without a graph is a place results cannot come from, which is the same
+# hazard as an excluded directory.
+def_via_tokensave() {  # <symbol> [only-repo]
+  local sym="$1" only="${2:-}" d name out="" rc n_graph=0 no_graph="" oldest="" age
+  for d in $(real_dirs); do
+    name=$(basename "$d")
+    [[ -n "$only" && "$name" != "$only" ]] && continue
+    if ! tokensave_graph_at "$d"; then no_graph="$no_graph $name"; continue; fi
+    n_graph=$((n_graph + 1))
+    age=$(tokensave_graph_age_days "$d") || age=""
+    if [[ -n "$age" && ( -z "$oldest" || "$age" -gt "$oldest" ) ]]; then oldest="$age"; fi
+    local one
+    one=$(python3 "$lib_dir/tokensave_call.py" def "$d" "$name" "$sym"); rc=$?
+    [[ $rc -eq 4 ]] && die "cs def: the tokensave graph for $name could not be queried
+  nothing was read there, so nothing was ruled out
+  check: cs engines   (graph presence and age)"
+    [[ -n "$one" ]] && out="${out:+$out
+}$one"
+  done
+  [[ $n_graph -gt 0 ]] || die "cs def: no repo in view has a tokensave graph
+  build one with: cd <repo> && tokensave init
+  or install universal-ctags, which indexes the whole view in one pass"
+  answer structural "tokensave (graph)" "$n_graph repo graph(s), no ctags index"
+  [[ -n "$oldest" ]] && warn "answered from graph(s) last synced up to ${oldest} day(s) ago — changes made since are invisible (tokensave sync)"
+  # The uncovered repos, named. A symbol defined in one of them looks exactly
+  # like a symbol that does not exist.
+  [[ -n "$no_graph" ]] && warn "no tokensave graph, so NOT searched:$no_graph — a definition in those repos cannot be found this way"
+  if [[ -z "$out" ]]; then
+    report_answer 0 0
+    hint "cs text '$sym'          (the graph indexes declarations, not every spelling)" \
+         "cs uses '$sym'          (a cross-repo reference is a string, not a symbol)"
+    return $CS_EXIT_NO_HITS
+  fi
+  emit_capped "$out"
+  report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
+}
+
 cmd_def() {
   [[ $# -ge 1 ]] || die "cs def <symbol> [repo]"
   local only="${2:-}"
-  local ct; ct=$(ctags_bin) || die "universal-ctags not installed"
+  # --engine=tokensave asks for the graph deliberately; otherwise it is the
+  # fallback for a machine with no universal-ctags, where cs def had no answer
+  # at all rather than a weaker one.
+  if [[ "${force_engine:-}" == tokensave ]]; then
+    have_tokensave || die "--engine=tokensave requested but tokensave is not installed"
+    def_via_tokensave "$1" "$only"
+    return $?
+  fi
+  local ct
+  if ! ct=$(ctags_bin); then
+    if have_tokensave; then
+      local _d
+      for _d in $(real_dirs); do
+        if tokensave_graph_at "$_d"; then def_via_tokensave "$1" "$only"; return $?; fi
+      done
+    fi
+    die "universal-ctags not installed
+  install it: brew install universal-ctags
+  or build a tokensave graph, which cs def can read instead:
+    cd <repo> && tokensave init"
+  fi
 
   # The index was originally rebuilt on every query, on the grounds that it is
   # cheap and therefore never stale. That held at 0.07s on a five-file fixture
@@ -2063,7 +2125,7 @@ serena_answered_or_die() {  # <rc> <raw-file> <stderr-file> <subcommand> <symbol
 impls_via_tokensave() {  # <symbol> <repo-name> <repo-dir> <missing-toolchain>
   local sym="$1" repo="$2" dir="$3" tc="$4" out rc age
   answer structural "tokensave (graph)" "scoped to $repo; no $tc here, so no language server"
-  out=$(python3 "$lib_dir/tokensave_call.py" "$dir" "$repo" "$sym"); rc=$?
+  out=$(python3 "$lib_dir/tokensave_call.py" impls "$dir" "$repo" "$sym"); rc=$?
   case "$rc" in
     3) die "cs impls: '$sym' is not a type in $repo's graph
   the graph was never asked the question, so this is not 'nothing implements it'
