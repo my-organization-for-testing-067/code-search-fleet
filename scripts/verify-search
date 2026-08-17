@@ -884,6 +884,88 @@ fi
 
 rm -f "$dangle_repo/CLAUDE.local.md" "$dangle_repo/src/import"
 
+# ---- cs deps: the outlier of the declared family ---------------------------
+# It neither validated its repo argument nor followed the zero-hit contract, so
+# a real repo with no edges and a repo that does not exist were byte-identical:
+# exit 0, one blank line, no count, no message. A typo was answered as "no
+# dependencies" — a manufactured negative of exactly the kind the rest of this
+# tool refuses to produce.
+info ""
+info "${C_BOLD}cs deps${C_OFF}"
+refuses "cs deps with a bogus repo refuses" "no such repo" \
+  "$here/cs" deps totally-bogus-repo-xyz
+finds_nothing "cs deps with no edges exits 2" "$here/cs" deps inventory-api-dotnet
+
+# stdout is the result stream and nothing else, so an empty result is 0 bytes.
+# `printf '%s\n' ""` wrote one, making `cs deps | wc -l` report 1 for no results.
+deps_bytes=$("$here/cs" deps inventory-api-dotnet 2>/dev/null | wc -c | tr -d ' ')
+if [[ "$deps_bytes" -eq 0 ]]; then
+  ok "a zero-hit cs deps writes 0 bytes to stdout"; pass=$((pass + 1))
+else
+  err "a zero-hit cs deps wrote $deps_bytes byte(s) to stdout"
+  fail=$((fail + 1)); failed_ids+=("deps-blank-line")
+fi
+
+# An empty dependency graph is a substantive claim, not silence — a fleet can
+# have no intra-fleet edges while every repo publishes something. It needs a
+# count, like every other subcommand.
+_deps_err=$("$here/cs" deps inventory-api-dotnet 2>&1 >/dev/null || true)
+if printf '%s' "$_deps_err" | grep -q '0 hit(s)'; then
+  ok "cs deps reports a hit count on an empty result"; pass=$((pass + 1))
+else
+  err "cs deps gave no hit count, so 'parsed nothing' looks like 'no edges'"
+  fail=$((fail + 1)); failed_ids+=("deps-no-count")
+fi
+
+# A repo that DOES have edges must be unchanged.
+_deps_out=$("$here/cs" deps checkout-service-kotlin 2>/dev/null || true)
+if printf '%s' "$_deps_out" | grep -q 'pricing-lib-java'; then
+  ok "cs deps on a repo with dependencies is unchanged"; pass=$((pass + 1))
+else
+  err "cs deps lost a real dependency edge"
+  fail=$((fail + 1)); failed_ids+=("deps-regression")
+fi
+
+# ---- a non-default exclusion list must announce itself ---------------------
+# CS_EXCLUDE_EXTRA changes which files are searched and nothing said so: the
+# answer line was identical in shape, only the count moved. It is an environment
+# variable, so setting it once in a shell profile narrows every query in every
+# later session, with no per-query signal and no expiry.
+info ""
+info "${C_BOLD}exclusion disclosure${C_OFF}"
+_ex_extra=$(CS_EXCLUDE_EXTRA=src "$here/cs" seam 'orders.reserved.v1' 2>&1 >/dev/null || true)
+if printf '%s' "$_ex_extra" | grep -qi 'non-default exclusion'; then
+  ok "CS_EXCLUDE_EXTRA is disclosed on the answer"; pass=$((pass + 1))
+else
+  err "CS_EXCLUDE_EXTRA narrowed the search with no disclosure"
+  fail=$((fail + 1)); failed_ids+=("exclusion-extra-silent")
+fi
+_ex_rm=$(CS_EXCLUDE_REMOVE=bin "$here/cs" seam 'orders.reserved.v1' 2>&1 >/dev/null || true)
+if printf '%s' "$_ex_rm" | grep -qi 'non-default exclusion'; then
+  ok "CS_EXCLUDE_REMOVE is disclosed too"; pass=$((pass + 1))
+else
+  err "CS_EXCLUDE_REMOVE widened the search with no disclosure"
+  fail=$((fail + 1)); failed_ids+=("exclusion-remove-silent")
+fi
+# A warning that fires on every run is noise and gets ignored, so a default run
+# must stay quiet — that is what makes the warning mean something.
+if [[ "$("$here/cs" seam 'orders.reserved.v1' 2>&1 >/dev/null | grep -ci 'non-default exclusion')" -eq 0 ]]; then
+  ok "a default run says nothing about exclusions"; pass=$((pass + 1))
+else
+  err "the exclusion warning fires without a non-default list"
+  fail=$((fail + 1)); failed_ids+=("exclusion-false-warning")
+fi
+# A programmatic caller has to be able to tell a narrowed search from a whole one.
+if CS_EXCLUDE_EXTRA=src "$here/cs" seam 'orders.reserved.v1' --porcelain 2>/dev/null \
+   | python3 -c 'import json,sys; d=json.load(sys.stdin); raise SystemExit(0 if d["exclusions"] and "src" in d["exclusions"] else 1)' 2>/dev/null \
+   && "$here/cs" seam 'orders.reserved.v1' --porcelain 2>/dev/null \
+   | python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin)["exclusions"] is None else 1)' 2>/dev/null; then
+  ok "porcelain exposes the active exclusion, and null without one"; pass=$((pass + 1))
+else
+  err "porcelain did not expose the exclusion state"
+  fail=$((fail + 1)); failed_ids+=("exclusion-porcelain")
+fi
+
 # ---- whole-identifier matching ---------------------------------------------
 # `cs seam`'s orphan warning is this tool's dead-code detector, and a SUBSTRING
 # match in an unrelated repo silently removed it: a queue handler named

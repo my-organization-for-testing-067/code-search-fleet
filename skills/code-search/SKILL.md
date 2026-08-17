@@ -129,7 +129,7 @@ change look safe.
 `cs why <kind>` prints exactly what that kind cannot see; `--why` on any query
 gives it inline.
 
-Four warnings `cs` emits that you must pass on rather than swallow:
+Five warnings `cs` emits that you must pass on rather than swallow:
 
 - **`PARTIAL`** — the result is a subset, not an answer. Two causes: an engine
   hit its timeout (raise `CS_TIMEOUT` and rerun), or files could not be read and
@@ -143,6 +143,13 @@ Four warnings `cs` emits that you must pass on rather than swallow:
 - **`prose filtered except: <extensions>`** — `cs uses` met files in a language
   its comment filter does not know, and passed them through unfiltered. Hits in
   those files may be comments. Treat them as `cs seam` hits, not `cs uses` hits.
+- **`non-default exclusion list`** — `CS_EXCLUDE_EXTRA` or `CS_EXCLUDE_REMOVE`
+  is set, so the search was narrowed or widened relative to the default. `EXTRA`
+  is the dangerous direction: it can hide the very declaration you are looking
+  for while leaving incidental mentions, so the result is not merely smaller but
+  can be inverted in character. These are environment variables, so one set in a
+  shell profile silently narrows every later session — if you see this warning
+  and did not expect it, say so before trusting a negative.
 
 ## When cs refuses, it is protecting you from a false negative
 

@@ -59,7 +59,19 @@ F="$FLEET_ROOT"
 declare -a ROWS=()
 
 # record <engine> <version> <probe-kind> <outcome> <note>
-record() { ROWS+=("$1	$2	$3	$4	$5"); }
+#
+# No field may be empty. The rows are split with `IFS=$'\t' read`, and tab is
+# whitespace-IFS, so bash COLLAPSES a run of them -- an engine that failed
+# before it could report a version emitted "semgrep\t\tcapability\tFAIL\t…",
+# which read back shifted one column: outcome landed in `note`, matched no case
+# in the report loop, and the failure was never counted. A genuinely broken
+# engine therefore reported FAIL on screen and still exited 0.
+record() {
+  local e="$1" v="${2:-}" k="$3" o="$4" n="${5:-}"
+  [[ -n "$v" ]] || v="?"
+  [[ -n "$n" ]] || n="-"
+  ROWS+=("$e	$v	$k	$o	$n")
+}
 
 prev_version() { [[ -f $baseline ]] && awk -F'\t' -v e="$1" '$1==e{print $2; exit}' "$baseline"; }
 prev_outcome() { [[ -f $baseline ]] && awk -F'\t' -v e="$1" '$1==e{print $4; exit}' "$baseline"; }
@@ -148,8 +160,28 @@ probe_text() {
   fi
 }
 
+# Serena's C# probe needs a .NET SDK, not just uv. Without one the language
+# server loads nothing and the probe reported FAIL — "REGRESSION since last
+# verified run — lost C# find_implementations" — about a machine where the
+# probe simply could not run. The script already knew: the `dotnet` row two
+# lines below says so. It just was not consulted.
+#
+# Probed by RUNNING it, for the same reason cs does: macOS ships a /usr/bin/java
+# stub that exists and then reports no runtime.
+toolchain_runs() {
+  command -v "$1" >/dev/null 2>&1 || return 1
+  case "$1" in
+    java) java -version >/dev/null 2>&1 ;;
+    *)    "$1" --version >/dev/null 2>&1 ;;
+  esac
+}
+
 probe_serena() {
   have uvx || { record serena "-" capability MISSING "uv not installed"; return; }
+  toolchain_runs dotnet || {
+    record serena "-" capability SKIP "no .NET SDK here; the C# probe cannot run (see the dotnet row)"
+    return
+  }
   local ver; ver=$(version_of serena)
   local out
   out=$(python3 "$here/lib/serena_call.py" "$F/inventory-api-dotnet" find_implementations \
@@ -259,7 +291,8 @@ probe_toolchains
 
 # ---- report -----------------------------------------------------------------
 printf '\n%-12s %-14s %-16s %-10s %s\n' ENGINE VERSION KIND OUTCOME NOTE
-regressions=0; changes=0; improvements=0
+regressions=0; changes=0; improvements=0; skips=0; absent_here=0
+skip_why=()
 
 for row in "${ROWS[@]}"; do
   IFS=$'\t' read -r engine version kind outcome note <<< "$row"
@@ -273,9 +306,13 @@ for row in "${ROWS[@]}"; do
     PASS|CONFIRMED) colour="$C_GREEN" ;;
     IMPROVED)       colour="$C_YELLOW"; improvements=$((improvements + 1)) ;;
     FAIL)           colour="$C_RED"; regressions=$((regressions + 1)) ;;
+    SKIP)           colour="$C_YELLOW"; skips=$((skips + 1)); skip_why+=("$engine: $note") ;;
+    MISSING)        colour="$C_YELLOW"; [[ -n "$local_prev_v" && "$local_prev_v" != "-" ]] && absent_here=$((absent_here + 1)) ;;
     *)              colour="$C_YELLOW" ;;
   esac
-  # A probe that used to pass and now does not is the headline case.
+  # Reserved for a probe whose OUTCOME moved PASS -> FAIL with its prerequisite
+  # still satisfied. A probe that can no longer run has not regressed, and
+  # saying it has is the wrong claim rather than merely an unhelpful one.
   if [[ "$local_prev_o" == "PASS" && "$outcome" == "FAIL" ]]; then
     note="REGRESSION since last verified run — $note"
   fi
@@ -284,12 +321,30 @@ for row in "${ROWS[@]}"; do
 done
 
 info ""
-[[ $changes -gt 0 ]] && warn "$changes engine version(s) changed since the last verified run"
+# "changed since the last verified run" silently means "compared to whichever
+# machine last ran --update". A baseline carrying dotnet 10.0.400 on a machine
+# that never had dotnet is not a change over time, it is a different computer —
+# and calling it a change sends a reader hunting for a code difference that does
+# not exist. Presence deltas are separated from genuine version movement.
+[[ $changes -gt 0 ]] && warn "$changes engine version(s) differ from the recorded baseline (which may have been recorded on another machine — not necessarily a change over time)"
+# Reported separately rather than as "of those": an engine absent here has no
+# version to differ, so it is not counted among the version deltas above.
+[[ $absent_here -gt 0 ]] && warn "$absent_here engine(s) in the baseline are not installed here — absent, not changed"
 [[ $improvements -gt 0 ]] && warn "$improvements known limitation(s) no longer apply — revisit the routing in docs/repo-fleet.md"
+if [[ $skips -gt 0 ]]; then
+  warn "$skips probe(s) SKIPPED — a skip is not a pass:"
+  for s in "${skip_why[@]:-}"; do [[ -n "$s" ]] && info "    $s"; done
+fi
+# Exit 1 is reserved for a probe that RAN and produced a wrong answer. An
+# absent optional engine and an unmet prerequisite are facts about the machine.
 if [[ $regressions -gt 0 ]]; then
   err "$regressions engine(s) failed their capability probe"
 else
-  ok "all capability probes passed"
+  if [[ $skips -gt 0 ]]; then
+    ok "all capability probes that could run passed ($skips skipped)"
+  else
+    ok "all capability probes passed"
+  fi
 fi
 
 if [[ $update -eq 1 ]]; then

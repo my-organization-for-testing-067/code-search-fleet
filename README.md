@@ -28,7 +28,7 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 82 checks against a throwaway fixture fleet
+scripts/verify-search              # 91 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only
@@ -229,7 +229,18 @@ CS_EXCLUDE_REMOVE="bin vendor" cs uses "/api/v1/orders"
 ```
 
 `cs engines` prints the effective list, because a directory excluded by mistake
-looks exactly like a directory with no hits.
+looks exactly like a directory with no hits. And because that only helps if you
+think to run it, any query with a non-default exclusion list now says so on the
+answer:
+
+```
+! searching with a NON-DEFAULT exclusion list: +app (CS_EXCLUDE_EXTRA) — files
+  under those directories were not searched, so this result may be narrower…
+```
+
+`EXTRA` gets the louder wording because it is the direction that manufactures
+false negatives, and because these are environment variables: set one for a
+single investigation and every later session is narrowed with no expiry.
 
 ## Two levels
 

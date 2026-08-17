@@ -309,6 +309,11 @@ cs_emit_porcelain() {
   printf '"returned":%s,' "$(printf '%s' "$CS_RESULTS" | grep -c '[^[:space:]]')"
   printf '"engine_errors":%s,' "$(engine_error_lines | json_lines)"
   printf '"skipped":%s,'       "$(skipped_paths | json_lines)"
+  if [[ -n "$CS_EXCLUSION_NOTE" ]]; then
+    printf '"exclusions":%s,' "$(json_str "$CS_EXCLUSION_NOTE")"
+  else
+    printf '"exclusions":null,'
+  fi
   printf '"hints":%s,'         "$(printf '%s' "$CS_HINTS"   | json_lines)"
   printf '"results":%s'        "$(printf '%s' "$CS_RESULTS" | json_results)"
   printf '}\n'
@@ -530,6 +535,35 @@ if [[ -n "${CS_EXCLUDE_REMOVE:-}" ]]; then
   # cs into a script that refuses to start.
   CS_EXCLUDE_DIRS=(${_keep[@]+"${_keep[@]}"})
   unset _keep _d _r _drop
+fi
+
+# A non-default exclusion list changes which files are searched, and nothing
+# said so. The answer line was identical in shape either way -- only the hit
+# count moved, and a reader has nothing to compare it against.
+#
+# `cs engines` already names the hazard ("a directory excluded by mistake looks
+# exactly like a directory with no hits"), but only if you run `cs engines`, not
+# when it matters. And the delivery mechanism makes it durable: set
+# CS_EXCLUDE_EXTRA once in a shell profile for one investigation and every query
+# in every later session is narrowed, with no per-query signal and no expiry.
+# `app`, `src`, `lib`, `test` are all plausible one-off exclusions and
+# disastrous left set -- excluding `app` hid an endpoint's own @router
+# declaration while leaving its config mentions and tests, so the result was not
+# merely smaller but inverted in character.
+#
+# The two directions carry opposite risk and are reported separately: EXTRA
+# narrows and manufactures false negatives; REMOVE widens and merely adds noise.
+CS_EXCLUSION_NOTE=""
+if [[ -n "${CS_EXCLUDE_EXTRA:-}" ]]; then
+  # sed, not tr: tr maps character-to-character and cannot expand one space
+  # into " +", so `-bin vendor` came out unprefixed on the second entry.
+  CS_EXCLUSION_NOTE="+$(printf '%s' "${CS_EXCLUDE_EXTRA}" | sed -e 's/^  *//' -e 's/  *$//' -e 's/  */ +/g') (CS_EXCLUDE_EXTRA)"
+fi
+if [[ -n "${CS_EXCLUDE_REMOVE:-}" ]]; then
+  _rm="-$(printf '%s' "${CS_EXCLUDE_REMOVE}" | sed -e 's/^  *//' -e 's/  *$//' -e 's/  */ -/g') (CS_EXCLUDE_REMOVE)"
+  if [[ -n "$CS_EXCLUSION_NOTE" ]]; then CS_EXCLUSION_NOTE="$CS_EXCLUSION_NOTE, $_rm"
+  else CS_EXCLUSION_NOTE="$_rm"; fi
+  unset _rm
 fi
 
 # `rg` may exist only as a shell function (Claude Code proxies its bundled
@@ -1151,6 +1185,16 @@ report_answer() {
   # An engine that failed but still produced output means the results are a
   # subset of the truth, exactly like a timeout. Said out loud rather than left
   # to look complete; the empty case refuses instead, via engines_ok_or_die.
+  # Only when it differs from the default: a warning that fires on every run is
+  # noise and gets ignored, so this one has to mean "something unusual is in
+  # force". EXTRA is the dangerous direction and is called out as such.
+  if [[ -n "$CS_EXCLUSION_NOTE" ]]; then
+    if [[ -n "${CS_EXCLUDE_EXTRA:-}" ]]; then
+      warn "searching with a NON-DEFAULT exclusion list: $CS_EXCLUSION_NOTE — files under those directories were not searched, so this result may be narrower than the fleet"
+    else
+      warn "searching with a non-default exclusion list: $CS_EXCLUSION_NOTE"
+    fi
+  fi
   if engine_failed; then
     warn "an engine failed during this query; these results are INCOMPLETE:"
     engine_error_lines | sed 's/^/  /' >&2
@@ -1207,6 +1251,10 @@ emit_capped() {
 # JSON envelope instead of printed, so that stdout carries exactly one object
 # and no subcommand has to know which mode it is running in.
 emit_plain() {
+  # stdout is the result stream, one hit per line and nothing else -- so an
+  # empty result writes ZERO bytes, not a bare newline. `printf '%s\n' ""`
+  # emitted one byte, which made `cs deps | wc -l` report 1 for no results.
+  [[ -n "$1" ]] || return 0
   if [[ $porcelain -eq 1 ]]; then
     if [[ -n "$CS_RESULTS" ]]; then CS_RESULTS="$CS_RESULTS
 $1"; else CS_RESULTS="$1"; fi
@@ -1704,13 +1752,42 @@ cmd_provides() {
   report_answer
 }
 
+# The outlier of the declared family: it neither validated its repo argument nor
+# followed the zero-hit contract, so `cs deps <real-repo-with-no-edges>` and
+# `cs deps <repo-that-does-not-exist>` were byte-identical -- exit 0, a single
+# blank line, no count, no message. A typo in a repo name was answered as "no
+# dependencies", which is a manufactured negative of exactly the kind the rest
+# of this tool refuses to produce. `cs provides` is the same code path one
+# function over and gets every part of this right.
 cmd_deps() {
   require_python3 deps "reading the build manifests the graph is built from"
+  local only="${1:-}"
+  # `cs impls` proves the check is cheap and already written elsewhere.
+  if [[ -n "$only" ]]; then
+    if [[ ! -d "$view/$only" ]] || ! is_repo "$view/$only"; then
+      die "no such repo: $only
+  answering 'no dependencies' for a name that is not a repo would be a
+  manufactured negative, so this refuses instead
+  cs repos   lists the repositories actually in view"
+    fi
+  fi
   answer declared "build manifests" "dependency declarations"
-  local out rc; out=$(python3 "$lib_dir/deps.py" "$view" deps "${1:-}"); rc=$?
+  local out rc; out=$(python3 "$lib_dir/deps.py" "$view" deps "$only"); rc=$?
   manifest_ok_or_die "$rc" deps deps.py "building the fleet dependency graph"
+  if [[ -z "$out" ]]; then
+    # An empty dependency graph is a substantive claim, not silence: a fleet can
+    # genuinely have no intra-fleet edges while every repo publishes something.
+    # Said with a count and a code, like every other subcommand.
+    report_answer 0 0
+    hint "cs publishes           (what each repo declares it publishes)" \
+         "cs versions            (which coordinates the fleet shares at all)" \
+         "cs provides <coord>    (whether a specific coordinate is published here)"
+    return $CS_EXIT_NO_HITS
+  fi
   emit_plain "$out"
-  report_answer
+  # Edges, and the repos they span: the row is `consumer -> producer (coord)`.
+  report_answer "$(n_hits_in "$out")" \
+                "$(printf '%s\n' "$out" | cut -f1,3 | tr '\t' '\n' | sort -u | grep -c '[^[:space:]]')"
 }
 
 cmd_publishes() {
