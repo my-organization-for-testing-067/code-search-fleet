@@ -35,6 +35,20 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 # After sourcing, so neither the inherited environment nor the config file can
 # reach `cs` or any check through the ambient value.
 unset FLEET_ROOT TICKETS_ROOT
+# CS_LOG is unset for the same reason, and for one more: the suite asserts that
+# the query log is OFF unless asked for, and an ambient CS_LOG -- which the
+# README now tells people to export -- would make that check fail on exactly
+# the machines that adopted the feature.
+unset CS_LOG CS_LOG_QUERY
+# And the cache root is redirected into a directory this run owns. The log's
+# default path is under XDG_CACHE_HOME/HOME, so ANY check that turns logging on
+# -- correctly, by mistake, or because someone is deliberately breaking the code
+# to prove a check works -- writes into the suite's own scratch space rather
+# than into the user's real ~/.cache. This is the same rule as the fleet root
+# above: the harness owns its scope. It was added after a sabotage run intended
+# to prove the off-by-default check worked deposited 214 lines in the real one.
+_verify_cache=$(mktemp -d)
+export XDG_CACHE_HOME="$_verify_cache"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root_dir="$(cd "$here/.." && pwd)"
@@ -2164,6 +2178,164 @@ else
   fail=$((fail + 1)); failed_ids+=("mcp-stdout-clean")
 fi
 
+# ---- query log -------------------------------------------------------------
+# An opt-in JSONL line per query, recording the outcome. Two of the properties
+# below are not "does the feature work" but "does it fail safe", and they are
+# the reason this section is longer than the feature: a log that writes when
+# nobody asked it to is a privacy incident, and a log that records the query
+# text when asked not to is the same incident with an extra step.
+info ""
+info "${C_BOLD}query log${C_OFF}"
+
+qlog_dir=$(mktemp -d)
+
+# OFF unless asked for. Checked by running the ordinary documented invocation
+# and asserting that NOTHING appeared -- not by reading the default, which is
+# the thing that would be wrong.
+qlog_default="$qlog_dir/should-never-exist.jsonl"
+HOME="$qlog_dir/home" XDG_CACHE_HOME="$qlog_dir/cache" \
+  "$here/cs" uses 'reservationId' >/dev/null 2>&1
+if [[ ! -e "$qlog_default" ]] && [[ -z "$(find "$qlog_dir" -name '*.jsonl' 2>/dev/null)" ]]; then
+  ok "the query log writes nothing at all unless CS_LOG is set"; pass=$((pass + 1))
+else
+  err "a query log was written without being asked for"
+  fail=$((fail + 1)); failed_ids+=("qlog-off-by-default")
+fi
+
+# One line per query, parseable, with the fields the log exists to carry.
+qlog="$qlog_dir/q.jsonl"
+CS_LOG="$qlog" "$here/cs" uses 'reservationId'      >/dev/null 2>&1
+CS_LOG="$qlog" "$here/cs" uses 'zzz-no-such-token'  >/dev/null 2>&1
+CS_LOG="$qlog" env FLEET_ROOT="/nonexistent/$$/fleet" "$here/cs" uses 'x' >/dev/null 2>&1
+if [[ "$(grep -c '' "$qlog" 2>/dev/null)" -eq 3 ]] && python3 -c '
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1])]
+need = {"ts","v","sub","query","layer","kind","engine","outcome",
+        "refusal","hits","repos","ms","ms_res","partial","warnings"}
+for r in rows:
+    missing = need - set(r)
+    assert not missing, "missing fields: %s" % sorted(missing)
+    assert r["sub"] == "uses", r["sub"]
+    assert isinstance(r["warnings"], list), "warnings must be a list"
+' "$qlog" 2>/dev/null; then
+  ok "one parseable JSONL line per query, carrying the outcome fields"
+  pass=$((pass + 1))
+else
+  err "the query log did not produce three well-formed lines"
+  fail=$((fail + 1)); failed_ids+=("qlog-line-shape")
+fi
+
+# The headline number. A fail-closed tool needs its refusal rate to be
+# countable, and that requires refused / zero / hits to stay three values
+# rather than collapsing into "no results".
+if python3 -c '
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1])]
+got = [r["outcome"] for r in rows]
+assert got == ["hits", "zero", "refused"], got
+assert rows[2]["refusal"] == "no-fleet-root", rows[2]["refusal"]
+assert rows[0]["refusal"] == "none", "a non-refusal must not carry a refusal class"
+assert rows[2]["kind"] is None, "a refusal has no answer kind"
+assert rows[0]["hits"] and rows[0]["hits"] > 0, "a hit row lost its count"
+assert rows[1]["hits"] == 0, "a zero row should record zero, not null"
+' "$qlog" 2>/dev/null; then
+  ok "the log tells hits, an honest zero, and a refusal apart — with a reason"
+  pass=$((pass + 1))
+else
+  err "the query log collapsed the hits/zero/refusal distinction"
+  fail=$((fail + 1)); failed_ids+=("qlog-outcome")
+fi
+
+# The privacy property, and the one worth being paranoid about: by DEFAULT the
+# literal query must not reach the file. Asserted against the raw bytes rather
+# than against the parsed field, because the point is that the string is not on
+# disk anywhere in that line.
+qlog_secret="$qlog_dir/secret.jsonl"
+CS_LOG="$qlog_secret" "$here/cs" uses 'reservationId' >/dev/null 2>&1
+qlog_plain="$qlog_dir/plain.jsonl"
+CS_LOG="$qlog_plain" CS_LOG_QUERY=plain "$here/cs" uses 'reservationId' >/dev/null 2>&1
+qlog_omit="$qlog_dir/omit.jsonl"
+CS_LOG="$qlog_omit" CS_LOG_QUERY=omit "$here/cs" uses 'reservationId' >/dev/null 2>&1
+if ! grep -q 'reservationId' "$qlog_secret" \
+   && grep -q '"query":"h:' "$qlog_secret" \
+   && grep -q 'reservationId' "$qlog_plain" \
+   && ! grep -q 'reservationId' "$qlog_omit" \
+   && grep -q '"query":null' "$qlog_omit"; then
+  ok "the query string is hashed by default, and omitted or kept on request"
+  pass=$((pass + 1))
+else
+  err "CS_LOG_QUERY did not control the query text independently"
+  fail=$((fail + 1)); failed_ids+=("qlog-query-privacy")
+fi
+
+# The same query must hash to the same thing, or "this search ran 40 times" is
+# not a question the log can answer and the hash mode is worth nothing.
+qlog_h2="$qlog_dir/h2.jsonl"
+CS_LOG="$qlog_h2" "$here/cs" uses 'reservationId' >/dev/null 2>&1
+if [[ -n "$(sed -n 's/.*"query":"\(h:[^"]*\)".*/\1/p' "$qlog_secret")" ]] \
+   && [[ "$(sed -n 's/.*"query":"\(h:[^"]*\)".*/\1/p' "$qlog_secret")" \
+      == "$(sed -n 's/.*"query":"\(h:[^"]*\)".*/\1/p' "$qlog_h2")" ]]; then
+  ok "the same query hashes the same way, so repeats stay countable"
+  pass=$((pass + 1))
+else
+  err "the query hash is not stable across invocations"
+  fail=$((fail + 1)); failed_ids+=("qlog-hash-stable")
+fi
+
+# Why this is JSONL and not SQLite. Agent sessions fan out, so the concurrent
+# case is the NORMAL case -- and it is the one a single-session test suite
+# passes clean while production interleaves. Run for real, in parallel.
+qlog_conc="$qlog_dir/conc.jsonl"
+for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+  CS_LOG="$qlog_conc" "$here/cs" seam 'reserve' >/dev/null 2>&1 &
+done
+wait
+if [[ "$(grep -c '' "$qlog_conc" 2>/dev/null)" -eq 16 ]] && python3 -c '
+import json, sys
+n = 0
+for line in open(sys.argv[1]):
+    json.loads(line)          # a torn write fails here
+    n += 1
+assert n == 16, "expected 16 lines, got %d" % n
+' "$qlog_conc" 2>/dev/null; then
+  ok "16 concurrent queries append 16 intact lines, with no locking"
+  pass=$((pass + 1))
+else
+  err "concurrent appends tore the query log"
+  fail=$((fail + 1)); failed_ids+=("qlog-concurrent")
+fi
+
+# Logging is instrumentation, and instrumentation that can break the tool it
+# measures is worse than none. An unwritable path must cost the query nothing
+# -- and must still say so, because believing you are collecting data and
+# silently not is how a measurement window turns out empty.
+qlog_out=$(CS_LOG="/nonexistent-root-$$/nope/q.jsonl" "$here/cs" seam 'reserve' 2>"$qlog_dir/err")
+qlog_rc=$?
+if [[ $qlog_rc -eq 0 ]] && [[ -n "$qlog_out" ]] \
+   && grep -q 'could not be written' "$qlog_dir/err"; then
+  ok "an unwritable query log warns, and does not cost the query its answer"
+  pass=$((pass + 1))
+else
+  err "an unwritable query log changed the outcome of the query (rc=$qlog_rc)"
+  fail=$((fail + 1)); failed_ids+=("qlog-write-failure")
+fi
+
+# cs which/why/engines/scopes/repos cannot hit, miss or refuse. Logging them
+# would dilute every rate in the file, refusal rate most of all.
+qlog_meta="$qlog_dir/meta.jsonl"
+for _s in which why engines scopes repos; do
+  CS_LOG="$qlog_meta" "$here/cs" "$_s" >/dev/null 2>&1
+done
+if [[ ! -s "$qlog_meta" ]]; then
+  ok "the subcommands that explain the tool are not counted as queries"
+  pass=$((pass + 1))
+else
+  err "a non-query subcommand was written to the query log"
+  fail=$((fail + 1)); failed_ids+=("qlog-meta-excluded")
+fi
+
+rm -rf "$qlog_dir"
+
 info ""
 if [[ $skipped -gt 0 ]]; then
   info "${C_BOLD}$pass passed, $fail failed, $skipped skipped${C_OFF}"
@@ -2176,6 +2348,8 @@ fi
 for f in "${failed_ids[@]:-}"; do
   [[ -n "$f" ]] && info "  re-run one: $here/score-seams $f -"
 done
+
+rm -rf "$_verify_cache"
 
 if [[ $owned_fleet -eq 1 && $keep -eq 0 ]]; then
   rm -rf "$(dirname "$FLEET_ROOT")"

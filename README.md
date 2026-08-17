@@ -309,6 +309,75 @@ have been handed main, with no `searching:` line to reveal the substitution.
 there is to choose between — which is what anything calling `cs` without a
 working directory to stand in has to do first.
 
+## Measuring what it actually did — opt-in, off by default
+
+Two of this tool's claims are, in principle, falsifiable: that every answer is
+labelled with **how** it was obtained, and that it **fails closed** rather than
+reporting a broken engine's empty output as a clean negative. Neither is
+measurable from the outside, and the second has a failure mode in the other
+direction — a tool that refuses too often teaches its callers to route around
+it. Two committed broken symlinks in one repo once made *every* zero-hit query
+refuse, so for a stretch no negative result was obtainable at all; that was
+caught only because someone happened to be evaluating at the time. As a refusal
+rate it would have been a step change on a graph.
+
+`CS_LOG` appends one JSON line per query recording the **outcome**:
+
+```sh
+export CS_LOG=1          # -> ~/.cache/cs-queries.jsonl; any other value is a path
+```
+```json
+{"ts":"2026-08-17T12:00:00Z","v":"1.10.0","sub":"seam","query":"h:fa2c3cc2058d",
+ "layer":"ticket+fleet","kind":"textual","engine":"ripgrep","outcome":"hits",
+ "refusal":"none","hits":7,"repos":2,"ms":3512,"ms_res":"ms","partial":false,
+ "warnings":["truncated"]}
+```
+
+`outcome` is `hits` / `zero` / `refused`, and a refusal carries a coarse
+`refusal` class (`no-fleet-root`, `empty-fleet`, `no-python3`, `no-workspace`,
+`engine-failed`, `bad-args`, `other`) — the refusal *messages* carry paths and
+query strings and are deliberately not written down. Only the subcommands that
+ask the code something are logged; `cs which`, `why`, `engines`, `scopes` and
+`repos` cannot hit, miss or refuse, and counting them would dilute every rate
+in the file.
+
+**The query string is controlled separately from everything else.** Outcome,
+kind, engine, hit count and latency are the analytically valuable fields and
+none of them are sensitive; the query is the part that is proprietary in a
+private fleet — internal route names, queue names, config keys, symbol names.
+
+| `CS_LOG_QUERY` | writes | for |
+|---|---|---|
+| `hash` (default) | `"h:fa2c3cc2058d"` | repeat queries stay countable, the identifier is never on disk |
+| `omit` | `null` | no query column at all |
+| `plain` | the literal string | a fleet that wants it |
+
+The hash is not a security boundary — a short internal identifier does not
+survive a dictionary attack by anyone who already has the fleet. It exists so
+that "this search ran 40 times this week" stays answerable without writing the
+search down.
+
+`ms_res` is `ms` or `s`, because the resolution is not the same everywhere:
+`EPOCHREALTIME` needs bash 5 (macOS ships 3.2) and `date +%s%N` is GNU-only, so
+the floor is the shell's whole-second counter. A latency graph built on
+second-granularity data *without knowing that* is worse than no graph, so the
+resolution is recorded next to the number rather than left to be inferred.
+
+**JSONL rather than SQLite, deliberately.** The callers here are agent sessions
+and several run at once, so the concurrent case is the normal one. One
+`O_APPEND` write of one short line needs no locking, no schema migration, and
+cannot be locked out under a fan-out of parallel queries; every field is
+bounded so the line cannot grow to a size at which a single write may be split.
+`verify-search` runs 16 real queries in parallel and requires 16 intact lines.
+It also stays greppable, and anyone who wants SQL can load the JSONL.
+
+The log is instrumentation, so it never costs the query anything: an unwritable
+path warns on stderr and the search still answers. `cs engines` reports whether
+the log is on and where — in both directions, since a log nobody knows is
+running is the problem the opt-in default exists to avoid, and a log somebody
+believes is running when it is not is how a measurement window turns out empty.
+Rotation is left to you; it is an ordinary append-only file.
+
 ## Verifying
 
 ```sh

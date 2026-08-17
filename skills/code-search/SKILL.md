@@ -227,6 +227,18 @@ cs uses '/api/v1/inventory/reserve' --porcelain
 resolved to (or `"fleet"`) — so a caller that asked for a named workspace can
 check it got that one rather than main.
 
+### `CS_LOG` if the user wants outcomes measured over time
+
+Off by default. `export CS_LOG=1` appends one JSON line per query to
+`~/.cache/cs-queries.jsonl` recording `outcome` (`hits`/`zero`/`refused`),
+answer kind, engine, hit count and latency — which is how a refusal rate or an
+answer-kind mix becomes answerable over a window longer than this session.
+
+Only enable it if asked. In a private fleet the query string is the proprietary
+part, so it is hashed by default; `CS_LOG_QUERY=omit` drops it entirely and
+`plain` keeps it. Tell the user which of those they are getting rather than
+turning it on quietly.
+
 Refusals emit the envelope too, with `refused: true` and the reason — that is
 the case with no result stream to attach anything to, and the one you most need
 to detect. `hits` is how many exist and `returned` how many are in `results`;

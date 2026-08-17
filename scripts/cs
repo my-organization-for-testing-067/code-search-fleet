@@ -70,6 +70,13 @@
 #   CS_CTAGS_BIN     use exactly this universal-ctags, and treat ctags as absent
 #                    if it does not validate (cs def then falls back to a
 #                    tokensave graph, or refuses)
+#   CS_LOG           OFF by default. 1 logs query OUTCOMES as JSONL to
+#                    ~/.cache/cs-queries.jsonl; any other value is the path to
+#                    write. One appended line per query, for refusal rate and
+#                    answer-kind mix over a longer window than a transcript.
+#   CS_LOG_QUERY     what to record of the query STRING, independently of the
+#                    rest: hash (default, repeat queries stay countable),
+#                    omit (no query column), plain (the literal text)
 #
 # Exit codes:
 #   0  the query ran and found at least one hit
@@ -103,6 +110,16 @@
 # refs). Everything else is optional -- `cs engines` reports what is present,
 # and cs routes around what is not.
 set -uo pipefail
+# Before anything else runs, so the measured duration is the whole invocation
+# rather than whatever is left after setup. EPOCHREALTIME is bash 5; the
+# fallbacks are in cs_log_ms below, and the resolution actually achieved is
+# recorded next to the number rather than assumed.
+CS_T0="${EPOCHREALTIME:-}"
+# The GNU-date route needs its baseline taken the same way it will be read.
+# BSD date prints a literal "N" for %N, which is not digits and is discarded
+# here rather than turned into a nonsense duration later.
+CS_T0_NS=$(date +%s%N 2>/dev/null)
+case "$CS_T0_NS" in *[!0-9]*|'') CS_T0_NS="" ;; esac
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/lib" && pwd)"
@@ -354,6 +371,220 @@ cs_emit_porcelain() {
   printf '}\n'
 }
 
+# ---- query log -------------------------------------------------------------
+# One appended JSONL line per invocation, recording the OUTCOME of a query
+# rather than the fact of one. Usage is the weaker half: a client that calls cs
+# over MCP already records what it called and when. What nothing else can see
+# is what the engines did -- and two of this tool's load-bearing claims are
+# only claims until someone measures them:
+#
+#   1. every answer is labelled with HOW it was obtained
+#   2. it fails closed, refusing rather than reporting a broken engine's empty
+#      output as a clean negative
+#
+# (2) has a failure mode in the other direction that is invisible from inside:
+# a tool that refuses too often teaches its callers to route around it. Two
+# committed broken symlinks in one repo once made EVERY zero-hit query refuse,
+# so no negative result was obtainable at all, and that was caught only because
+# somebody happened to be evaluating at the time. As a refusal rate it would
+# have been a step change on a graph.
+#
+# OPT-IN, and off by default. In a private fleet the query string IS the
+# proprietary part -- internal route names, queue names, config keys, symbol
+# names -- and a file quietly accumulating every internal identifier a company
+# searched for is a thing some users cannot have on disk at any price.
+#
+#   CS_LOG           unset/0/false/no -> off. 1/true/yes -> the default path
+#                    below. Anything else is taken as the path to write.
+#   CS_LOG_QUERY     hash (default) | omit | plain
+#
+# The query text is controlled SEPARATELY from the rest, because outcome,
+# kind, engine, hit count and latency are the analytically valuable fields and
+# none of them are sensitive. Defaulting to a hash keeps repeat queries
+# countable -- "the same search ran 40 times this week" is a real signal --
+# without ever writing the identifier down. `plain` is there for a fleet that
+# wants it; `omit` for one that wants no query column at all.
+#
+# JSONL rather than SQLite, deliberately. The callers here are agent sessions
+# and several run at once; the one logging component in this family that used
+# SQLite failed exactly that way, with an 18-case suite passing clean because
+# every case was a single session against a seeded file. An O_APPEND write of
+# one short line has no locking, no schema migration and nothing to be locked
+# out of, and it stays greppable for a userbase that already lives in rg.
+CS_LOG_PATH=""
+CS_LOG_QUERY="${CS_LOG_QUERY:-hash}"
+case "${CS_LOG:-}" in
+  ''|0|false|no|off) CS_LOG_PATH="" ;;
+  1|true|yes|on)     CS_LOG_PATH="${XDG_CACHE_HOME:-$HOME/.cache}/cs-queries.jsonl" ;;
+  *)                 CS_LOG_PATH="$CS_LOG" ;;
+esac
+
+# Only the subcommands that ASK THE CODE something. cs which/why/engines/scopes
+# explain the tool and cs repos describes the view; none of them can hit, miss
+# or refuse, so counting them would dilute every rate this log exists to
+# measure -- most of all the refusal rate, which is the headline number.
+cs_log_applies() {
+  case "$1" in
+    text|seam|uses|def|provides|deps|publishes|versions|owns|calls|impls|refs|history) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Elapsed milliseconds, and the resolution actually achieved. Four routes,
+# because none of them is everywhere: EPOCHREALTIME is bash 5 (macOS ships
+# 3.2), date +%s%N is GNU (BSD date prints a literal N), and perl is common but
+# not a dependency this tool is willing to acquire. SECONDS is the floor and is
+# always right, just coarse -- so the resolution is REPORTED rather than left
+# for an analyst to infer from suspiciously round numbers. A latency graph
+# built on second-granularity data without knowing it is worse than no graph.
+cs_log_ms() {  # -> "<ms> <resolution>"
+  local now
+  if [[ -n "$CS_T0" && -n "${EPOCHREALTIME:-}" ]]; then
+    now="$EPOCHREALTIME"
+    # "1755440000.123456" in both, subtracted as integer microseconds so no
+    # floating point (and no bc) is involved.
+    local a="${CS_T0/./}" b="${now/./}"
+    printf '%s ms' "$(( (10#${b:0:16} - 10#${a:0:16}) / 1000 ))"
+    return 0
+  fi
+  if [[ -n "${CS_T0_NS:-}" ]]; then
+    now=$(date +%s%N 2>/dev/null)
+    case "$now" in
+      *[!0-9]*|'') ;;
+      *) printf '%s ms' "$(( (now - CS_T0_NS) / 1000000 ))"; return 0 ;;
+    esac
+  fi
+  printf '%s s' "$(( SECONDS * 1000 ))"
+}
+
+# Hoisted out of cs_log_write: a function that redefines a function on every
+# call is a surprise waiting for whoever reads the trap next.
+cs_log_add_warn() {
+  if [[ -n "$CS_LOG_WARNS" ]]; then CS_LOG_WARNS="$CS_LOG_WARNS,\"$1\""
+  else CS_LOG_WARNS="\"$1\""; fi
+}
+CS_LOG_WARNS=""
+
+# A refusal is only actionable if you know WHICH refusal. The messages are free
+# text carrying paths and query strings, so they are not logged; they are
+# classified into a small closed set instead, which is both safe to write down
+# and what a rate is actually computed over.
+cs_log_refusal_class() {
+  case "$CS_REFUSAL" in
+    *"fleet root does not exist"*)        printf 'no-fleet-root' ;;
+    *"no repositories in the fleet root"*) printf 'empty-fleet' ;;
+    *"needs python3"*)                    printf 'no-python3' ;;
+    *"no such workspace"*|*"TICKETS_ROOT is not set"*) printf 'no-workspace' ;;
+    *"an engine failed"*|*"engine"*)      printf 'engine-failed' ;;
+    *"unknown"*|*"usage"*|*"needs a"*)    printf 'bad-args' ;;
+    '')                                   printf 'none' ;;
+    *)                                    printf 'other' ;;
+  esac
+}
+
+# The same fallback chain as view_fingerprint, and for the same reason: a weak
+# hash is a perfectly good IDENTITY for "was this the same query as last time",
+# which is the only thing it is asked to be. It is not a security boundary --
+# a short internal identifier does not survive a dictionary attack by anyone
+# who already has the fleet -- and the README says so rather than implying that
+# hashing makes the query unrecoverable.
+cs_log_hash() {
+  local h out
+  for h in "md5 -q" "md5sum" "shasum -a 1" "cksum"; do
+    out=$(printf '%s' "$1" | $h 2>/dev/null | head -1 | awk '{print $1}')
+    [[ -n "$out" ]] && { printf '%s' "${out:0:12}"; return 0; }
+  done
+  printf 'nohash'
+}
+
+cs_log_version() {
+  local f="$(dirname "${BASH_SOURCE[0]}")/../.claude-plugin/plugin.json"
+  [[ -f "$f" ]] || { printf 'unknown'; return 0; }
+  # sed rather than python3: half the subcommands run without python3, and a
+  # log line that only appears when python3 is installed would skew every rate
+  # in it towards the machines that have it.
+  sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -1
+}
+
+# Resolved once rather than per line -- it is a file read and a sed, and the
+# answer cannot change within one invocation. Skipped entirely when logging is
+# off, so a disabled log costs nothing at all.
+CS_LOG_VERSION=""
+[[ -n "$CS_LOG_PATH" ]] && CS_LOG_VERSION=$(cs_log_version)
+
+cs_log_write() {  # cs_log_write <exit-code>
+  local rc="$1"
+  [[ -n "$CS_LOG_PATH" ]] || return 0
+  cs_log_applies "$CS_SUB" || return 0
+
+  local outcome
+  case "$rc" in
+    "$CS_EXIT_REFUSED") outcome=refused ;;
+    "$CS_EXIT_NO_HITS") outcome=zero ;;
+    0)                  outcome=hits ;;
+    *)                  outcome=other ;;
+  esac
+
+  # Codes, not sentences. The sentences carry paths and identifiers and would
+  # put back exactly what CS_LOG_QUERY exists to keep out.
+  CS_LOG_WARNS=""
+  timed_out     && cs_log_add_warn timeout
+  files_skipped && cs_log_add_warn skipped-files
+  engine_failed && cs_log_add_warn engine-error
+  [[ -n "$CS_DEGRADED" ]]       && cs_log_add_warn degraded
+  [[ -n "$CS_TRUNCATED" ]]      && cs_log_add_warn truncated
+  [[ -n "$CS_EXCLUSION_NOTE" ]] && cs_log_add_warn exclusions
+
+  local q
+  case "$CS_LOG_QUERY" in
+    omit)  q='null' ;;
+    plain) q="$(json_str "${CS_QUERY:0:200}")" ;;      # bounded: see the write below
+    *)     q="$(json_str "h:$(cs_log_hash "$CS_QUERY")")" ;;
+  esac
+
+  # The ticket workspace id is an internal identifier like any other, and the
+  # questions this log answers are all about outcome, kind and engine -- none of
+  # which need to know WHICH ticket. So the SHAPE of the view is recorded and
+  # the name is not.
+  local layer=fleet
+  [[ -n "$CS_SCOPE" && "$CS_SCOPE" != "fleet" ]] && layer=ticket+fleet
+
+  local ms_pair ms res
+  ms_pair=$(cs_log_ms); ms="${ms_pair%% *}"; res="${ms_pair##* }"
+
+  local partial=false
+  { timed_out || files_skipped; } && partial=true
+
+  local line
+  line=$(printf '{"ts":%s,"v":%s,"sub":%s,"query":%s,"layer":%s,"kind":%s,"engine":%s,"outcome":%s,"refusal":%s,"hits":%s,"repos":%s,"ms":%s,"ms_res":%s,"partial":%s,"warnings":[%s]}' \
+    "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")" \
+    "$(json_str "$CS_LOG_VERSION")" \
+    "$(json_str "$CS_SUB")" \
+    "$q" \
+    "$(json_str "$layer")" \
+    "$([[ -n "$CS_KIND" ]] && json_str "$CS_KIND" || printf 'null')" \
+    "$([[ -n "$CS_ENGINE" ]] && json_str "$CS_ENGINE" || printf 'null')" \
+    "$(json_str "$outcome")" \
+    "$(json_str "$(cs_log_refusal_class)")" \
+    "$(json_num "$CS_HITS")" \
+    "$(json_num "$CS_REPOS")" \
+    "$ms" "$(json_str "$res")" "$partial" "$CS_LOG_WARNS")
+
+  # One printf, one O_APPEND write, one line -- which is what makes concurrent
+  # sessions safe without a lock. Every field above is bounded (the query is
+  # capped at 200 chars, warnings are a closed set of codes), so the line
+  # cannot grow past the size at which a single write may be split.
+  local dir="${CS_LOG_PATH%/*}"
+  [[ "$dir" != "$CS_LOG_PATH" && ! -d "$dir" ]] && mkdir -p "$dir" 2>/dev/null
+  if ! printf '%s\n' "$line" >> "$CS_LOG_PATH" 2>/dev/null; then
+    # Said out loud, once. Believing you are collecting data and silently not
+    # is the same shape of mistake as a manufactured negative: you find out
+    # when you go to answer a question and the window is empty.
+    warn "CS_LOG is set but the log could not be written: $CS_LOG_PATH"
+  fi
+  return 0
+}
+
 cleanup_view() {
   [[ -n "$view_tmp" && -d "$view_tmp" ]] && rm -rf "$view_tmp"
   [[ -n "${CS_TIMEOUT_FLAG:-}" ]] && rm -f "$CS_TIMEOUT_FLAG"
@@ -375,6 +606,12 @@ cleanup_view() {
 cs_on_exit() {
   local rc=$?
   cs_emit_porcelain "$rc"
+  # After the envelope, so a bug in logging can never cost a caller its answer,
+  # and before cleanup, so it still sees the timeout/skipped flag files. The
+  # trap is also the only place that runs on EVERY path -- including die(),
+  # which does not come back, and which is precisely the refusal this log
+  # exists to count.
+  cs_log_write "$rc"
   cleanup_view
   return 0
 }
@@ -1549,6 +1786,14 @@ cmd_engines() {
   # directory excluded by mistake looks exactly like a directory with no hits.
   printf 'skipping:    %s\n' "$(printf '%s ' ${CS_EXCLUDE_DIRS[@]+"${CS_EXCLUDE_DIRS[@]}"})"
   printf '             (CS_EXCLUDE_EXTRA adds, CS_EXCLUDE_REMOVE subtracts)\n'
+  # Reported in both directions. A log nobody knows is running is the privacy
+  # problem the opt-in default exists to avoid, and a log somebody believes is
+  # running when it is not is how a measurement window turns out empty.
+  if [[ -n "$CS_LOG_PATH" ]]; then
+    printf 'query log:   %s (query text: %s)\n' "$CS_LOG_PATH" "$CS_LOG_QUERY"
+  else
+    printf 'query log:   off (CS_LOG unset)\n'
+  fi
   # Exits 0 whatever it found. Under the exit-code contract, 1 means "the query
   # did not run" -- and a diagnostic that ran, printed a full report, and then
   # claimed to have refused is exactly the confusion the codes exist to remove.
