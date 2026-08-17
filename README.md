@@ -28,7 +28,7 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 97 checks against a throwaway fixture fleet
+scripts/verify-search              # 100 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only
@@ -427,7 +427,12 @@ from if it was not `repo-fleet`.
 
 `verify-search` builds its own fixture repos, so it neither touches your code nor
 needs `FLEET_ROOT` set — which makes it the right first thing to run, before the
-fleet exists. Simply asking the agent to "verify code-search" also works, and
+fleet exists. It **ignores** an exported `FLEET_ROOT` rather than honouring it:
+every check asserts fixture content, and the suite seeds probe files into the
+fleet it runs against, so aiming it at a real one could only produce failures
+that are not real while writing into repos it does not own. `--fleet <dir>`
+overrides deliberately, and refuses a tree that is not a fixture fleet. The same
+applies to `verify-engines`. Simply asking the agent to "verify code-search" also works, and
 avoids the path entirely: the skill resolves it from `CLAUDE_PLUGIN_ROOT`.
 
 **Cost: ~200 tokens always-on**, and the ~8.2k skill body only loads when a

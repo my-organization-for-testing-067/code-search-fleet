@@ -12,37 +12,60 @@
 # Usage: verify-search [--keep]
 set -uo pipefail
 
-# Captured BEFORE common.sh, which fills FLEET_ROOT in from ~/.config/repo-fleet
-# or a built-in default. Only an explicit environment value means "score against
-# this fleet instead of the fixture" -- a configured root is just where the user
-# happens to work, and scoring the suite against it silently reports failures
-# that are not real. Reading $FLEET_ROOT after sourcing cannot tell the two
-# apart, which is what happened the day cs started honouring the config file.
-_explicit_fleet_root="${FLEET_ROOT:-}"
+# The harness OWNS its fleet scope; it does not inherit one.
+#
+# This used to treat an exported FLEET_ROOT as "score against this fleet". Every
+# check here asserts FIXTURE content, so that could only ever report failures
+# that are not real -- and exporting FLEET_ROOT is the documented setup, not an
+# unusual one.
+#
+# It is worse here than in verify-engines, because this suite does not merely
+# READ the fleet it is pointed at. It writes a parity probe into
+# .github/workflows/, plants dangling symlinks, drops AccessionUpdateIn.cs,
+# CLAUDE.md, update-all.sh, update.log and a scratch-notes/ directory into the
+# root, creates a prose-probe-repo, and makes two probe commits in
+# pricing-lib-java before resetting them. Aimed at a real fleet that is writing
+# into someone's actual repositories.
+#
+# A deliberate override is still available, but as a FLAG -- an argument is an
+# act, an exported variable is ambient.
+_fleet_override=""
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+# After sourcing, so neither the inherited environment nor the config file can
+# reach `cs` or any check through the ambient value.
+unset FLEET_ROOT TICKETS_ROOT
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root_dir="$(cd "$here/.." && pwd)"
 keep=0
-[[ "${1:-}" == "--keep" ]] && keep=1
+for _a in "$@"; do
+  case "$_a" in
+    --keep) keep=1 ;;
+    --fleet=*) _fleet_override="${_a#--fleet=}" ;;
+    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown option: $_a" ;;
+  esac
+done
 
 owned_fleet=0
-# An explicit root still has to hold repos; an empty directory would score every
-# query as "nothing found" and report a broken search stack.
-if [[ -n "$_explicit_fleet_root" ]] && ! compgen -G "$_explicit_fleet_root/*/.git" >/dev/null; then
-  warn "FLEET_ROOT is set but holds no repositories: $_explicit_fleet_root"
-  warn "using a throwaway fixture fleet instead"
-  _explicit_fleet_root=""
-fi
-FLEET_ROOT="$_explicit_fleet_root"
+FLEET_ROOT="$_fleet_override"
 if [[ -z "$FLEET_ROOT" || ! -d "$FLEET_ROOT" ]]; then
+  [[ -n "$FLEET_ROOT" ]] && warn "--fleet $FLEET_ROOT does not exist; building a throwaway fixture fleet instead"
   FLEET_ROOT="$(mktemp -d)/fleet"
-  export FLEET_ROOT
   owned_fleet=1
   info "building a throwaway fixture fleet…"
   "$here/build-fixtures" "$FLEET_ROOT" >/dev/null 2>&1 || die "could not build fixtures"
 fi
+export FLEET_ROOT
+# Every check below asserts fixture content AND seeds probe files into the
+# fleet. Refusing early is what keeps a mis-aimed run from writing into repos it
+# does not own, and turns a wrong verdict into one accurate message.
+[[ -d "$FLEET_ROOT/inventory-api-dotnet" && -d "$FLEET_ROOT/pricing-lib-java" ]] || die \
+"$FLEET_ROOT is not a fixture fleet (inventory-api-dotnet / pricing-lib-java missing)
+  this suite asserts fixture-specific content and SEEDS probe files into the
+  fleet it runs against, so it will not touch a tree it did not build
+  run without --fleet to build a throwaway fixture fleet"
 
 info "${C_BOLD}fleet:${C_OFF} $FLEET_ROOT"
 info ""
@@ -883,6 +906,60 @@ else
 fi
 
 rm -f "$dangle_repo/CLAUDE.local.md" "$dangle_repo/src/import"
+
+# ---- the harness owns its fleet scope --------------------------------------
+# Both harnesses used to treat an exported FLEET_ROOT as "run against this
+# fleet". Every check asserts FIXTURE content, so that could only report
+# failures that are not real — and exporting FLEET_ROOT is the documented setup,
+# not an unusual one, so it fired for essentially every real user. In
+# verify-engines it produced three "REGRESSION since last verified run" verdicts
+# and a tokensave finding that silently reversed the #6 correction, measured on
+# a tree it had never read.
+#
+# Worse here: this suite WRITES into the fleet it is aimed at — a parity probe
+# in .github/workflows/, dangling symlinks, stray files in the root, a
+# prose-probe-repo, and two probe commits in pricing-lib-java.
+info ""
+info "${C_BOLD}fleet scope${C_OFF}"
+
+# A directory that is a plausible fleet (repos with .git) but not the fixture.
+scope_tmp=$(mktemp -d)
+mkdir -p "$scope_tmp/fleet/some-real-repo"
+git -C "$scope_tmp/fleet/some-real-repo" init -q 2>/dev/null || true
+printf 'untouched\n' > "$scope_tmp/fleet/some-real-repo/README.md"
+scope_before=$(find "$scope_tmp/fleet" | sort | md5 -q 2>/dev/null || find "$scope_tmp/fleet" | sort | md5sum | cut -d' ' -f1)
+
+# An inherited FLEET_ROOT must be ignored entirely: the run builds its own
+# fixture and the pointed-at tree is not read, written, or reported on.
+scope_out=$(FLEET_ROOT="$scope_tmp/fleet" "$here/verify-engines" --quiet 2>&1 || true)
+scope_after=$(find "$scope_tmp/fleet" | sort | md5 -q 2>/dev/null || find "$scope_tmp/fleet" | sort | md5sum | cut -d' ' -f1)
+if [[ "$scope_before" == "$scope_after" ]] \
+   && ! printf '%s' "$scope_out" | grep -q "$scope_tmp"; then
+  ok "an inherited FLEET_ROOT is ignored, and that tree is left untouched"
+  pass=$((pass + 1))
+else
+  err "verify-engines leaked into an inherited FLEET_ROOT"
+  fail=$((fail + 1)); failed_ids+=("fleet-scope-leak")
+fi
+
+# The probed path is printed on every run — its absence was the visible tell
+# that the scope had leaked.
+if printf '%s' "$scope_out" | grep -q 'probing engines against'; then
+  ok "verify-engines announces the fleet it probes"; pass=$((pass + 1))
+else
+  err "verify-engines did not print the fleet it probed"
+  fail=$((fail + 1)); failed_ids+=("fleet-scope-unannounced")
+fi
+
+# And an explicit --fleet at a non-fixture tree aborts with ONE clear message
+# rather than degrading into engine verdicts.
+if "$here/verify-engines" --fleet="$scope_tmp/fleet" >/dev/null 2>&1; then
+  err "verify-engines probed a tree with no fixture repos in it"
+  fail=$((fail + 1)); failed_ids+=("fleet-scope-no-guard")
+else
+  ok "a --fleet without the fixture repos aborts instead of probing"; pass=$((pass + 1))
+fi
+rm -rf "$scope_tmp"
 
 # ---- package-name normalization --------------------------------------------
 # `cs provides` compared published names literally, so a coordinate differing

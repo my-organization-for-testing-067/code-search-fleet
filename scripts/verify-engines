@@ -19,12 +19,29 @@
 #   --update   record current versions and probe outcomes as the new baseline
 set -uo pipefail
 
-# Captured before common.sh fills it in from the config file or a default. Only
-# an explicit environment value means "probe against this fleet"; see the same
-# note in verify-search.
-_explicit_fleet_root="${FLEET_ROOT:-}"
-
+# The harness OWNS its fleet scope; it does not inherit one.
+#
+# This used to treat an exported FLEET_ROOT as "probe against this fleet". That
+# reads as a feature and is not one: every probe here asserts FIXTURE-specific
+# content -- the `inventory-api-dotnet` repo, the `Reserve` method, the
+# `IsEnabled` literal -- so pointing it at a real fleet cannot succeed. And
+# exporting FLEET_ROOT is not an unusual configuration, it is THE documented
+# one, so essentially every real user got three engines reported as
+# "REGRESSION since last verified run" for a break that did not exist.
+#
+# Worse, the tokensave probe `cd`s into a fixture repo that a real fleet does
+# not contain, and reported `CONFIRMED — no C# interface implementation in
+# either kind` from a tree it had never read. That reverses the #6 correction
+# with a confident, specific, wrong finding about a third-party tool, which is
+# worse than a harness that simply fails.
+#
+# A deliberate override is still available, but as a FLAG -- an argument is an
+# act, an exported variable is ambient.
+_fleet_override=""
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+# After sourcing, so neither the inherited environment nor the config file can
+# reach `cs` or any probe through the ambient value.
+unset FLEET_ROOT TICKETS_ROOT
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$here/.." && pwd)"
@@ -36,6 +53,7 @@ for a in "$@"; do
   case "$a" in
     --update) update=1 ;;
     --quiet) quiet=1 ;;
+    --fleet=*) _fleet_override="${a#--fleet=}" ;;
     -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown option: $a" ;;
   esac
@@ -44,17 +62,23 @@ done
 have() { command -v "$1" >/dev/null 2>&1; }
 
 owned=0
-if [[ -n "$_explicit_fleet_root" ]] && ! compgen -G "$_explicit_fleet_root/*/.git" >/dev/null; then
-  warn "FLEET_ROOT is set but holds no repositories: $_explicit_fleet_root"
-  warn "using a throwaway fixture fleet instead"
-  _explicit_fleet_root=""
+F="$_fleet_override"
+if [[ -z "$F" || ! -d "$F" ]]; then
+  [[ -n "$F" ]] && warn "--fleet $F does not exist; building a throwaway fixture fleet instead"
+  F="$(mktemp -d)/fleet"; owned=1
+  "$here/build-fixtures" "$F" >/dev/null 2>&1 || die "could not build fixtures"
 fi
-FLEET_ROOT="$_explicit_fleet_root"
-if [[ -z "$FLEET_ROOT" || ! -d "$FLEET_ROOT" ]]; then
-  FLEET_ROOT="$(mktemp -d)/fleet"; export FLEET_ROOT; owned=1
-  "$here/build-fixtures" "$FLEET_ROOT" >/dev/null 2>&1 || die "could not build fixtures"
-fi
-F="$FLEET_ROOT"
+# Every probe below asserts fixture content, so a fleet without it can only
+# produce nonsense. One clear message beats three engines reported as broken:
+# a `cd` that fails must never be allowed to degrade into a capability verdict.
+[[ -d "$F/inventory-api-dotnet" ]] || die \
+"the fixture repo inventory-api-dotnet is not in $F
+  every probe here asserts fixture-specific content (the Reserve method, the
+  IsEnabled literal), so this fleet cannot be probed -- the results would be
+  reported as engine failures rather than as the mismatch they are
+  run without --fleet to build a throwaway fixture fleet"
+# `cs` and the probes both read this; set from F rather than the other way round.
+export FLEET_ROOT="$F"
 
 declare -a ROWS=()
 
@@ -280,7 +304,8 @@ probe_tokensave() {
   fi
 }
 
-[[ $quiet -eq 1 ]] || info "probing engines against $F"
+info "probing engines against $F"   # unconditional: the cheap self-check that
+                                   # catches a scope leak immediately
 probe_text
 probe_ctags
 probe_ast_grep
