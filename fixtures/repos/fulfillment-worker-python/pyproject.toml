@@ -6,6 +6,10 @@ dependencies = [
     "kafka-python>=2.0",
     # Seam: shared contracts package, also depended on by web-monorepo-node.
     "acme-schemas==2.4.0",
+    # Seam across a normalization boundary: kit-service-python declares its name
+    # as "Kit Service", and no consumer would ever write that. cs must connect
+    # the two, or this intra-fleet edge is invisible by construction.
+    "kit-service>=1.0",
 ]
 
 [dependency-groups]

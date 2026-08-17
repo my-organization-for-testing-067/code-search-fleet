@@ -30,8 +30,41 @@ def _read(path):
         return ""
 
 
-def publishes(repo):
-    """Coordinates this repo publishes, as a list of strings."""
+# A package name can be spelled several ways and mean one distribution, and only
+# the publisher's ECOSYSTEM knows which of those differences are meaningless.
+# Comparing literally made `cs provides kit-service` report "no fleet repo
+# publishes this (external dependency?)" for a repo whose pyproject.toml says
+# `name = "Kit Service"` -- a confident wrong negative in the `declared` tier,
+# which the skill documents as the strongest kind for a negative and the one
+# most likely to be repeated to a person as fact. The parenthetical then points
+# the reader at the wrong conclusion: they stop looking, because it reads as
+# third-party.
+#
+# The rules are NOT symmetrical, and folding them together would trade this bug
+# for a worse one:
+#
+#   pypi   PEP 503 -- [-_.] runs collapse to '-', case-insensitive
+#   npm    lowercase only; the @scope/ prefix is significant
+#   nuget  case-insensitive
+#   maven  groupId:artifactId is CASE-SENSITIVE -- must not be folded, or two
+#          genuinely different artifacts merge into one
+def normalize_coord(name, eco):
+    name = name.strip()
+    if eco == "pypi":
+        # Whitespace is folded as well as [-_.], which is a superset of PEP 503.
+        # Strict PEP 503 leaves a space alone -- so `Kit Service` normalizes to
+        # `kit service` and still fails to match `kit-service`, which is the
+        # exact case reported. A space is invalid in a name per PEP 508 anyway;
+        # the packaging tools collapse it when building the distribution, which
+        # is why consumers end up writing the hyphenated form.
+        return re.sub(r"[-_.\s]+", "-", name).lower()
+    if eco in ("npm", "nuget"):
+        return name.lower()
+    return name  # maven, and anything unrecognised: compare exactly
+
+
+def publishes_tagged(repo):
+    """(coordinate, ecosystem, manifest-path) for everything this repo publishes."""
     out = []
 
     for gradle in list(repo.glob("build.gradle.kts")) + list(repo.glob("build.gradle")):
@@ -39,14 +72,14 @@ def publishes(repo):
         group = re.search(r'^\s*group\s*=\s*["\']([^"\']+)["\']', text, re.M)
         artifact = re.search(r'artifactId\s*=\s*["\']([^"\']+)["\']', text)
         if group and artifact:
-            out.append(f"{group.group(1)}:{artifact.group(1)}")
+            out.append((f"{group.group(1)}:{artifact.group(1)}", "maven", gradle))
 
     for pom in repo.glob("pom.xml"):
         text = _read(pom)
         g = re.search(r"<groupId>([^<]+)</groupId>", text)
         a = re.search(r"<artifactId>([^<]+)</artifactId>", text)
         if g and a:
-            out.append(f"{g.group(1)}:{a.group(1)}")
+            out.append((f"{g.group(1)}:{a.group(1)}", "maven", pom))
 
     for pkg in list(repo.glob("package.json")) + list(repo.glob("*/package.json")):
         try:
@@ -54,19 +87,24 @@ def publishes(repo):
         except json.JSONDecodeError:
             continue
         if data.get("name") and not data.get("private"):
-            out.append(data["name"])
+            out.append((data["name"], "npm", pkg))
 
     for pyproject in repo.glob("pyproject.toml"):
         name = re.search(r'^\s*name\s*=\s*["\']([^"\']+)["\']', _read(pyproject), re.M)
         if name:
-            out.append(name.group(1))
+            out.append((name.group(1), "pypi", pyproject))
 
     for csproj in repo.rglob("*.csproj"):
         pkg_id = re.search(r"<PackageId>([^<]+)</PackageId>", _read(csproj))
         if pkg_id:
-            out.append(pkg_id.group(1))
+            out.append((pkg_id.group(1), "nuget", csproj))
 
-    return sorted(set(out))
+    return out
+
+
+def publishes(repo):
+    """Coordinates this repo publishes, as a list of strings."""
+    return sorted({coord for coord, _eco, _path in publishes_tagged(repo)})
 
 
 def consumes(repo):
@@ -191,9 +229,49 @@ def main():
         return 2
 
     publisher = {}
+    # Parallel index keyed on the ECOSYSTEM-normalized name, so a coordinate
+    # that differs from its manifest spelling only by normalization still
+    # resolves. Carries the raw spelling and manifest path so a match found this
+    # way can say what the manifest actually declares -- a name that needs
+    # normalizing is usually a small bug in that repo too, and surfacing it
+    # beats silently papering over it.
+    publisher_norm = {}
     for repo in repos(root):
-        for coord in publishes(repo):
+        for coord, eco, path in publishes_tagged(repo):
             publisher[coord] = repo.name
+            try:
+                rel = path.relative_to(root)
+            except ValueError:
+                rel = path
+            publisher_norm.setdefault(
+                normalize_coord(coord, eco), (repo.name, coord, eco, str(rel))
+            )
+
+    def resolve(want):
+        """(repo, note) for whoever publishes `want`, or (None, None)."""
+        if want in publisher:
+            return publisher[want], None
+        # A bare artifact id, so "pricing-lib" resolves as well as the full
+        # "com.acme:pricing-lib".
+        for coord, owner in publisher.items():
+            if coord.split(":")[-1] == want:
+                return owner, None
+        # Normalized -- but each candidate is compared under ITS OWN ecosystem's
+        # rules, never under a rule borrowed from another. Trying the query
+        # against every ruleset in turn instead let npm's lowercasing match a
+        # Maven key, so `com.acme:Pricing-Lib` resolved to `com.acme:pricing-lib`
+        # -- exactly the case-folding that ecosystem forbids, and the merge of
+        # two genuinely different artifacts the rules exist to prevent.
+        for key, (owner, raw, raw_eco, rel) in publisher_norm.items():
+            if normalize_coord(want, raw_eco) == key:
+                if raw != want:
+                    return owner, f"{want} -> declared as '{raw}' in {rel} ({raw_eco} normalization)"
+                return owner, None
+        # And a bare artifact id on the normalized side too.
+        for key, (owner, raw, raw_eco, rel) in publisher_norm.items():
+            if key.split(":")[-1] == normalize_coord(want, raw_eco):
+                return owner, f"{want} -> declared as '{raw}' in {rel} ({raw_eco} normalization)"
+        return None, None
 
     if cmd == "publishes":
         for coord, name in sorted(publisher.items()):
@@ -205,16 +283,12 @@ def main():
             print("usage: deps.py <root> provides <coordinate>", file=sys.stderr)
             return 2
         want = sys.argv[3]
-        name = publisher.get(want)
+        name, note = resolve(want)
         if name:
+            if note:
+                print(note, file=sys.stderr)
             print(name)
             return 0
-        # Match a bare artifact id too, so "pricing-lib" resolves as well as
-        # the full "com.acme:pricing-lib".
-        for coord, owner in publisher.items():
-            if coord.split(":")[-1] == want:
-                print(owner)
-                return 0
         print(f"no fleet repo publishes '{want}' (external dependency?)", file=sys.stderr)
         return 1
 
@@ -224,12 +298,11 @@ def main():
             if only and repo.name != only:
                 continue
             for coord in consumes(repo):
-                owner = publisher.get(coord)
-                if not owner:
-                    owner = next(
-                        (o for c, o in publisher.items() if c.split(":")[-1] == coord),
-                        None,
-                    )
+                # Same resolution as `provides`, so an intra-fleet edge is not
+                # invisible purely because the two manifests spell the name
+                # differently. Without this, any edge involving a
+                # non-normalized publish name could never be detected.
+                owner, _note = resolve(coord)
                 if owner and owner != repo.name:
                     print(f"{repo.name}\t->\t{owner}\t({coord})")
         return 0

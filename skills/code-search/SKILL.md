@@ -346,7 +346,12 @@ acme-schemas	DRIFT	2 version(s)	external
 ```
 
 Versions are compared on the number, not the spelling, so `==2.4.0` and `2.4.0`
-report as `AGREED` rather than as a false drift. It reads **manifests, not
+report as `AGREED` rather than as a false drift. Package **names** are compared
+per ecosystem too — PEP 503 for PyPI (`Kit Service`, `kit_service` and
+`kit-service` are one package), case-insensitively for npm and NuGet, and
+**exactly** for Maven, whose coordinates are case-sensitive. When a match needs
+normalizing, `cs` says what the manifest actually declares, because a name that
+needs it is usually a small bug in that repo too. It reads **manifests, not
 lockfiles** — two repos agreeing here can still resolve differently at build
 time, so report drift as a declaration mismatch, never as proof of what is
 installed.

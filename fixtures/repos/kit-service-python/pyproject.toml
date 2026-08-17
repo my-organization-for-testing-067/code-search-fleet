@@ -1,0 +1,13 @@
+[project]
+# Deliberately NOT in PEP 503 normalized form. This is what the fixture is for:
+# a publish name that a consumer would never write, because pip, PyPI and Poetry
+# all normalize it to `kit-service`. Matching literally reported "no fleet repo
+# publishes 'kit-service' (external dependency?)" — a confident wrong negative
+# in the `declared` tier, pointing the reader at the wrong conclusion.
+#
+# A name with a space is invalid per PEP 508; it occurs in the wild anyway, and
+# the packaging tools collapse it when building the distribution.
+name = "Kit Service"
+version = "1.2.0"
+requires-python = ">=3.11"
+dependencies = []

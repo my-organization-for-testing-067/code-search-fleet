@@ -884,6 +884,77 @@ fi
 
 rm -f "$dangle_repo/CLAUDE.local.md" "$dangle_repo/src/import"
 
+# ---- package-name normalization --------------------------------------------
+# `cs provides` compared published names literally, so a coordinate differing
+# from its manifest spelling only by PEP 503 normalization was reported as not
+# published by the fleet — with `(external dependency?)`, which points the
+# reader at the wrong conclusion and they stop looking. That is a confident
+# wrong negative in the `declared` tier, the one the skill documents as
+# strongest for a negative and most likely to be repeated to a person as fact.
+#
+# kit-service-python publishes `Kit Service`; fulfillment-worker-python depends
+# on `kit-service`. No human writes the former, so without normalization that
+# intra-fleet edge is invisible by construction.
+info ""
+info "${C_BOLD}package-name normalization${C_OFF}"
+
+norm_bad=()
+for form in 'kit-service' 'kit_service' 'kit.service' 'Kit Service' 'KIT-SERVICE'; do
+  o=$("$here/cs" provides "$form" 2>/dev/null); r=$?
+  [[ $r -eq 0 && "$o" == "kit-service-python" ]] || norm_bad+=("$form:exit$r/$o")
+done
+if [[ ${#norm_bad[@]} -eq 0 ]]; then
+  ok "cs provides resolves every PEP 503 spelling of a published name"
+  pass=$((pass + 1))
+else
+  err "normalized spellings did not resolve: ${norm_bad[*]}"
+  fail=$((fail + 1)); failed_ids+=("provides-normalization")
+fi
+
+# Maven is CASE-SENSITIVE. Folding it would merge two genuinely different
+# artifacts, which is a worse bug than the one being fixed — and an early
+# version of this fix did exactly that by trying the query under every
+# ecosystem's rules in turn, letting npm's lowercasing match a Maven key.
+mvn_out=$("$here/cs" provides 'com.acme:Pricing-Lib' 2>/dev/null); mvn_rc=$?
+if [[ $mvn_rc -eq 2 && -z "$mvn_out" ]]; then
+  ok "a Maven coordinate is not case-folded"; pass=$((pass + 1))
+else
+  err "cs provides case-folded a Maven coordinate (exit $mvn_rc, '$mvn_out')"
+  fail=$((fail + 1)); failed_ids+=("provides-maven-case")
+fi
+# …while the correctly-spelled one still resolves, both fully and bare.
+if [[ "$("$here/cs" provides com.acme:pricing-lib 2>/dev/null)" == "pricing-lib-java" \
+   && "$("$here/cs" provides pricing-lib 2>/dev/null)" == "pricing-lib-java" ]]; then
+  ok "Maven coordinates still resolve, full and bare"; pass=$((pass + 1))
+else
+  err "a Maven coordinate stopped resolving"
+  fail=$((fail + 1)); failed_ids+=("provides-maven-regression")
+fi
+
+# The matching half: an intra-fleet edge across the normalization boundary.
+_deps_norm=$("$here/cs" deps fulfillment-worker-python 2>/dev/null || true)
+if printf '%s' "$_deps_norm" | grep -q 'kit-service-python'; then
+  ok "cs deps connects a consumer to a non-normalized publish name"; pass=$((pass + 1))
+else
+  err "cs deps missed an edge across a normalization boundary"
+  fail=$((fail + 1)); failed_ids+=("deps-normalization")
+fi
+
+# A name that needs normalizing is usually a small bug in that repo too, so a
+# match found this way says what the manifest actually declares.
+_prov_note=$("$here/cs" provides kit-service 2>&1 >/dev/null || true)
+if printf '%s' "$_prov_note" | grep -q "declared as 'Kit Service'"; then
+  ok "a normalized match reports the raw declared spelling"; pass=$((pass + 1))
+else
+  err "a normalized match did not say what the manifest declares"
+  fail=$((fail + 1)); failed_ids+=("provides-normalization-note")
+fi
+
+# And a genuinely absent package must still be absent — the fix must not turn
+# normalization into a catch-all that resolves anything.
+finds_nothing "a genuinely unpublished coordinate is still not found" \
+  "$here/cs" provides "no-such-package-$$"
+
 # ---- cs deps: the outlier of the declared family ---------------------------
 # It neither validated its repo argument nor followed the zero-hit contract, so
 # a real repo with no edges and a repo that does not exist were byte-identical:
