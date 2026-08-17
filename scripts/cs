@@ -2184,9 +2184,29 @@ serena_answered_or_die() {  # <rc> <raw-file> <stderr-file> <subcommand> <symbol
 # implementation, so they are worth the setup cost -- but only these.
 # The graph route, taken only when the language server cannot run. Answers are
 # `structural`, never `resolved`.
-impls_via_tokensave() {  # <symbol> <repo-name> <repo-dir> <missing-toolchain>
-  local sym="$1" repo="$2" dir="$3" tc="$4" out rc age
-  answer structural "tokensave (graph)" "scoped to $repo; no $tc here, so no language server"
+# The fourth argument is a REASON CODE, not a string to interpolate. It used to
+# be documented as <missing-toolchain> and two of the three callers passed an
+# English phrase into it, so the provenance line read "no explicitly requested
+# here, so no language server" and the blind-spot warning claimed "cs refs ...
+# needs explicitly requested" -- not merely ungrammatical, but FALSE about what
+# cs refs actually requires, and a reader has no other way to learn the real
+# prerequisite from that sentence.
+#
+# A malformed provenance label is the worst place for this project to be sloppy:
+# labelling every answer with how it was obtained is the stated reason it
+# exists. So the three routes get three sentences, and the toolchain is resolved
+# HERE from the repo rather than passed in by a caller that may not know it.
+impls_via_tokensave() {  # <symbol> <repo-name> <repo-dir> <toolchain-missing|forced|lsp-unresolved>
+  local sym="$1" repo="$2" dir="$3" reason="$4" out rc age tc lang note
+  lang=$(symbol_language "$sym" "$dir") || lang=$(repo_language "$dir") || lang=""
+  tc=""
+  [[ -n "$lang" ]] && tc=$(language_toolchain "$lang" || true)
+  case "$reason" in
+    forced)         note="scoped to $repo; graph requested explicitly" ;;
+    lsp-unresolved) note="scoped to $repo; the language server did not resolve the symbol" ;;
+    *)              note="scoped to $repo; no ${tc:-language toolchain} here, so no language server" ;;
+  esac
+  answer structural "tokensave (graph)" "$note"
   out=$(python3 "$lib_dir/tokensave_call.py" impls "$dir" "$repo" "$sym"); rc=$?
   case "$rc" in
     3) die "cs impls: '$sym' is not a type in $repo's graph
@@ -2201,7 +2221,13 @@ impls_via_tokensave() {  # <symbol> <repo-name> <repo-dir> <missing-toolchain>
   # correctness problem rather than a tidiness one. Always stated.
   age=$(tokensave_graph_age_days "$dir") && [[ -n "$age" ]] && \
     warn "answered from a tokensave graph last synced ${age} day(s) ago — it cannot see changes made since (cd $dir && tokensave sync)"
-  warn "this is a GRAPH answer, not a language server: it cannot see reflection, DI registration, or generated code. cs refs is the only thing here that bridges a DI registration, and it needs $tc."
+  # Names the real prerequisite, or says nothing specific rather than something
+  # untrue: the reader cannot learn what cs refs needs from anywhere else here.
+  if [[ -n "$tc" ]]; then
+    warn "this is a GRAPH answer, not a language server: it cannot see reflection, DI registration, or generated code. cs refs is the only thing here that bridges a DI registration, and it needs $tc."
+  else
+    warn "this is a GRAPH answer, not a language server: it cannot see reflection, DI registration, or generated code. cs refs is the only thing here that bridges a DI registration, and it needs a working language server for this repo's language."
+  fi
   if [[ $rc -ne 0 || -z "$out" ]]; then
     report_answer 0 0
     hint "cs def $sym $repo       (where the symbol is declared)" \
@@ -2226,7 +2252,7 @@ cmd_impls() {
       have_tokensave || die "--engine=tokensave requested but tokensave is not installed"
       tokensave_graph_at "$repo_dir" || die "--engine=tokensave requested but $2 has no graph
   build one with: cd $repo_dir && tokensave init"
-      impls_via_tokensave "$1" "$2" "$repo_dir" "explicitly requested"
+      impls_via_tokensave "$1" "$2" "$repo_dir" forced
       return $? ;;
     serena|lsp) ;;   # the default route below
     "") ;;
@@ -2243,7 +2269,7 @@ cmd_impls() {
   local _missing_tc
   if _missing_tc=$(serena_missing_toolchain "$repo_dir" "$1"); then
     if have_tokensave && tokensave_graph_at "$repo_dir"; then
-      impls_via_tokensave "$1" "$2" "$repo_dir" "$_missing_tc"
+      impls_via_tokensave "$1" "$2" "$repo_dir" toolchain-missing
       return $?
     fi
   fi
@@ -2284,7 +2310,7 @@ if pick:
   if [[ -z "$name_path" || -z "$rel" ]]; then
     if have_tokensave && tokensave_graph_at "$repo_dir"; then
       warn "the language server could not locate '$1' in $2 — falling back to the tokensave graph"
-      impls_via_tokensave "$1" "$2" "$repo_dir" "the language server did not resolve it"
+      impls_via_tokensave "$1" "$2" "$repo_dir" lsp-unresolved
       return $?
     fi
     err "could not locate symbol '$1' in $2 — find_implementations was not run, so nothing was ruled out"

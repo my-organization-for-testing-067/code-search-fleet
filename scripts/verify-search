@@ -105,7 +105,10 @@ skip() {  # skip <check-name> <why>
 #
 #   emits   <out|err|both> <pattern> <command...>   run it, then match
 #   matches <pattern> <string>                      match something already held
-matches() { grep -qi -- "$2" <<< "$1"; }
+# -E, not basic regex. A caller writing `(a|b)` gets alternation rather than a
+# literal parenthesis, which is what anyone reaching for this expects; every
+# existing pattern here is ERE-compatible.
+matches() { grep -qiE -- "$2" <<< "$1"; }
 emits() {
   local stream="$1" pat="$2"; shift 2
   local captured
@@ -1017,6 +1020,39 @@ else
     else
       ok "with no toolchain and no graph, cs impls still refuses"; pass=$((pass + 1))
     fi
+    # ---- the provenance line must be a sentence ----------------------------
+    # impls_via_tokensave's fourth argument was documented as <missing-toolchain>
+    # and two of three callers passed an English phrase into it, so the label
+    # read "no explicitly requested here, so no language server" and the
+    # blind-spot warning claimed "cs refs ... needs explicitly requested" —
+    # which is FALSE about what cs refs requires, not just clumsy. Labelling
+    # every answer with how it was obtained is this project's stated reason to
+    # exist, so a malformed label is the worst place to be sloppy.
+    prov_bad=()
+    forced_out=$("$here/cs" impls IStockLedger inventory-api-dotnet --engine=tokensave 2>&1 || true)
+    auto_out=$(PATH="$ts_nodot:$PATH" "$here/cs" impls IStockLedger inventory-api-dotnet 2>&1 || true)
+
+    # Each route gets its OWN sentence, and neither leaks the other's.
+    matches "$forced_out" 'graph requested explicitly' || prov_bad+=("forced:no-reason")
+    matches "$forced_out" 'no explicitly requested'    && prov_bad+=("forced:prose-in-toolchain-slot")
+    matches "$auto_out"   'no dotnet here'             || prov_bad+=("auto:lost-toolchain")
+
+    # The prerequisite named must be a real toolchain, on every route. This is
+    # the half that was actively untrue.
+    for o in "$forced_out" "$auto_out"; do
+      if matches "$o" 'it needs '; then
+        matches "$o" 'it needs (dotnet|java|node|a working language server)' \
+          || prov_bad+=("names-a-non-toolchain")
+      fi
+    done
+    if [[ ${#prov_bad[@]} -eq 0 ]]; then
+      ok "every graph route states a well-formed reason and a real prerequisite"
+      pass=$((pass + 1))
+    else
+      err "malformed provenance: ${prov_bad[*]}"
+      fail=$((fail + 1)); failed_ids+=("graph-provenance-string")
+    fi
+
     # ---- a mixed-language repo must route on the SYMBOL ---------------------
     # Routing used the repo's PLURALITY language, so a repo that is mostly JS
     # with a large C# component reported `javascript`, found node installed,
@@ -1198,6 +1234,22 @@ else
   fi
 fi
 rm -rf "$FLEET_ROOT/inventory-api-dotnet/.tokensave"
+
+# ---- reason codes, not free text -------------------------------------------
+# impls_via_tokensave takes a reason CODE; passing prose into it produced
+# "no explicitly requested here, so no language server" on the answer line.
+# The shape is invisible until someone reads the output, so it is pinned here.
+info ""
+info "${C_BOLD}reason codes${C_OFF}"
+bad_reason=$(grep -nE 'impls_via_tokensave "\$[0-9]" "\$[0-9]" "\$[a-z_]+" ' "$here/cs" \
+             | grep -vE '(toolchain-missing|forced|lsp-unresolved)[[:space:]]*$' || true)
+if [[ -z "$bad_reason" ]]; then
+  ok "every impls_via_tokensave call passes a known reason code"; pass=$((pass + 1))
+else
+  err "a free-text reason was passed where a code belongs:"
+  printf '%s\n' "$bad_reason" | sed 's/^/    /' >&2
+  fail=$((fail + 1)); failed_ids+=("graph-reason-code")
+fi
 
 # ---- portability of the plumbing, not just the engines ---------------------
 # BSD's `mktemp -t PREFIX` treats the argument as a prefix and appends its own
