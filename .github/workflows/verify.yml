@@ -13,6 +13,10 @@ on:
   pull_request:
   schedule:
     - cron: "17 6 * * 1"   # Mondays, 06:17 UTC
+    # NOTE: GitHub disables scheduled workflows after 60 days with no repo
+    # activity, and says so only by email. A schedule that has stopped running
+    # looks exactly like a schedule that keeps passing, so if this repo goes
+    # quiet, check the Actions tab rather than trusting the last green run.
   workflow_dispatch:
 
 jobs:
@@ -23,12 +27,47 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Best-effort by design. Every engine here is OPTIONAL -- cs routes around
+      # whatever is missing, verify-engines reports it as MISSING rather than
+      # FAIL, and verify-search skips the checks that need it. So a registry
+      # hiccup on the unattended weekly run should degrade to "that engine is
+      # absent", which the suites already handle correctly, instead of failing
+      # the job as though an engine had regressed. Those two outcomes mean
+      # opposite things and the schedule exists to tell them apart.
       - name: Install engines
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ripgrep universal-ctags
-          npm install -g @ast-grep/cli
-          pipx install semgrep || pip install --quiet semgrep
+          try() {
+            echo "::group::install $*"
+            if "$@"; then echo "::endgroup::"
+            else echo "::endgroup::"; echo "::warning::install failed (engine will be reported absent): $*"; fi
+          }
+          try sudo apt-get update -qq
+          try sudo apt-get install -y -qq ripgrep universal-ctags
+          try npm install -g @ast-grep/cli
+          pipx install semgrep \
+            || pip install --quiet semgrep \
+            || echo "::warning::semgrep unavailable (engine will be reported absent)"
+
+      # A run where everything failed to install would still PASS both suites,
+      # because both correctly skip what is absent -- and a green run that
+      # exercised nothing is precisely the hazard this project is organised
+      # against. So the vacuous case is made loud.
+      - name: Refuse a vacuous run
+        run: |
+          missing=0
+          for e in rg ctags ast-grep semgrep; do
+            if command -v "$e" >/dev/null 2>&1; then
+              echo "ok       $e"
+            else
+              echo "MISSING  $e"
+              missing=$((missing + 1))
+            fi
+          done
+          if [ "$missing" -ge 4 ]; then
+            echo "::error::no search engine installed — this run would prove nothing"
+            exit 1
+          fi
+          echo "$missing of 4 optional engines absent; the suites will skip what they cannot exercise."
 
       - name: Record engine versions
         run: ./scripts/bootstrap --check || true
