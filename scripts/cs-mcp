@@ -11,7 +11,7 @@ session start, and this server does not repeal it.
 
 It is no longer the whole story for clients that DEFER tool schemas -- tools
 arrive as names only, and a schema is fetched when a tool is actually called.
-There the standing cost is a list of ~19 identifiers, which is smaller than the
+There the standing cost is a list of ~21 identifiers, which is smaller than the
 always-on skill description this partly duplicates.
 
 So: both surfaces, and neither is the default for everyone. The CLI stays the
@@ -168,6 +168,34 @@ TOOLS = [
      "What implements this interface — resolved by a language server, the "
      "strongest evidence available.",
      [arg("symbol", "The interface or base type name."),
+      arg("repo", "The repo directory name holding it."),
+      SCOPE_ARG]),
+
+    # --- symbol mode: the same three questions the CLI fronts, and no more ---
+    # The graph behind these exposes ~90 operations. Fronting them all would put
+    # a worse interface in the tool list than the one the client could call
+    # directly, and would cost the property that makes this surface legible:
+    # tools shaped like questions, few enough to skim. Each description states
+    # the per-repo scope, because that is what a caller cannot see from here.
+    ("cs_callers", "callers",
+     "What calls this symbol, from one repo's symbol graph. Direct callers "
+     "only, and scoped to that repo — a caller in another repo is a string, "
+     "which is cs_uses.",
+     [arg("symbol", "The function, method or constructor name."),
+      arg("repo", "The repo directory name holding it."),
+      SCOPE_ARG]),
+
+    ("cs_callees", "callees",
+     "What this symbol calls, from one repo's symbol graph. Direct callees "
+     "only, so nothing transitive is mixed in unlabelled.",
+     [arg("symbol", "The function, method or constructor name."),
+      arg("repo", "The repo directory name holding it."),
+      SCOPE_ARG]),
+
+    ("cs_impact", "impact",
+     "What depends on this symbol, transitively — the 'what breaks if I change "
+     "it' question, within one repo's graph.",
+     [arg("symbol", "The symbol whose dependents you want."),
       arg("repo", "The repo directory name holding it."),
       SCOPE_ARG]),
 

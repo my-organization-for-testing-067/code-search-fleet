@@ -1249,6 +1249,248 @@ else
 fi
 rm -rf "$FLEET_ROOT/inventory-api-dotnet/.tokensave"
 
+# ---- symbol mode: cs callers / cs callees / cs impact -----------------------
+# The graph route, asked directly rather than only as a fallback. Everything
+# here is about the two traps that come with it:
+#
+#   1. Two of the graph CLI's own tools take a node id and return an EMPTY
+#      result with EXIT 0 for a bare name -- `callers_for` and `impact` both
+#      succeed while having looked nothing up. "Nothing calls this" is the
+#      answer someone deletes code on, so it must never be manufactured: the
+#      lookup is two-step (name -> node id -> question) and a name that does not
+#      resolve refuses instead of printing nothing.
+#   2. A graph index is per-project. The layered view -- ticket repos at branch
+#      state, everything else at main -- has no equivalent, so a symbol answer
+#      covers ONE repo at ONE layer. When the layer is not the one the scope
+#      asked for, that is a confident answer from the wrong scope, and it has to
+#      be visible in the answer rather than inferable from the setup.
+info ""
+info "${C_BOLD}symbol mode${C_OFF}"
+if ! command -v tokensave >/dev/null 2>&1; then
+  skip "symbol mode" "tokensave not installed"
+else
+  sym_repo="$FLEET_ROOT/inventory-api-dotnet"
+  (cd "$sym_repo" && tokensave init >/dev/null 2>&1) || true
+  if [[ ! -f "$sym_repo/.tokensave/tokensave.db" ]]; then
+    skip "symbol mode" "could not build a tokensave graph here"
+  else
+    # ReservationController.Reserve calls _store.ReserveAsync, which the graph
+    # records against the CONCRETE method. `ReserveAsync` is two nodes here --
+    # the interface declaration and the implementation -- and the interface one
+    # has no callers, so asking only the top-ranked node reports "nothing calls
+    # ReserveAsync" about a method with a caller. Every exact-name node is asked.
+    sym_callers=$("$here/cs" callers ReserveAsync inventory-api-dotnet 2>&1); sym_rc=$?
+    if [[ $sym_rc -eq 0 ]] && matches "$sym_callers" 'ReservationController.cs'; then
+      ok "cs callers answers from the graph"; pass=$((pass + 1))
+    else
+      err "cs callers did not answer (exit $sym_rc)"
+      fail=$((fail + 1)); failed_ids+=("callers-no-answer")
+    fi
+    if matches "$sym_callers" 'ALL were asked'; then
+      ok "one name that is several nodes asks all of them, and says so"
+      pass=$((pass + 1))
+    else
+      err "an overloaded name was answered from one node without disclosure"
+      fail=$((fail + 1)); failed_ids+=("callers-node-ambiguity")
+    fi
+
+    # Never `resolved`, and the provenance names the index AND its age -- a
+    # graph is the one engine here that can be confidently wrong rather than
+    # merely blind, so "which graph, how old" is part of the answer.
+    if matches "$sym_callers" 'answer:.*structural via tokensave' \
+       && ! matches "$sym_callers" 'answer:.*resolved' \
+       && matches "$sym_callers" 'answer:.*(fleet|ticket) layer, synced'; then
+      ok "a symbol answer is structural, and names which graph answered and when"
+      pass=$((pass + 1))
+    else
+      err "the symbol-mode provenance did not name the index and its age"
+      fail=$((fail + 1)); failed_ids+=("symbol-provenance")
+    fi
+
+    # Trap 1. `tokensave tool impact <bare-name>` exits 0 with node_count 0, and
+    # `callers_for` the same -- so the refusal here is the whole difference
+    # between cs and the raw CLI on the question people delete code over.
+    sym_bad=()
+    for _m in callers callees impact; do
+      "$here/cs" "$_m" NoSuchSymbolAnywhere inventory-api-dotnet >/dev/null 2>&1
+      [[ $? -eq 1 ]] || sym_bad+=("$_m:did-not-refuse")
+    done
+    if [[ ${#sym_bad[@]} -eq 0 ]]; then
+      ok "a name that resolves to no node refuses, rather than reporting zero"
+      pass=$((pass + 1))
+    else
+      err "a manufactured negative got through: ${sym_bad[*]}"
+      fail=$((fail + 1)); failed_ids+=("symbol-manufactured-negative")
+    fi
+
+    # And an interface is not a call-graph node at all. Empty would read as
+    # "nothing calls it"; the refusal names the question that IS askable.
+    if "$here/cs" callers IStockLedger inventory-api-dotnet >/dev/null 2>&1; then
+      err "cs callers answered for an interface instead of refusing"
+      fail=$((fail + 1)); failed_ids+=("callers-container-kind")
+    else
+      ok "asking a call graph about an interface refuses, not zero"
+      pass=$((pass + 1))
+    fi
+
+    # The other half of the same contract: a resolved node with genuinely no
+    # callers is an HONEST zero (exit 2), not a refusal. Release is the fixture's
+    # decoy endpoint -- nothing in the fleet calls it -- so this is the case the
+    # two-step exists to make trustworthy.
+    "$here/cs" callers Release inventory-api-dotnet >/dev/null 2>&1
+    if [[ $? -eq 2 ]]; then
+      ok "a resolved symbol with no callers is an honest zero, not a refusal"
+      pass=$((pass + 1))
+    else
+      err "a genuine zero was not reported as one"
+      fail=$((fail + 1)); failed_ids+=("callers-honest-zero")
+    fi
+
+    # `callees` defaults to depth 3 in the tool and its rows carry no depth
+    # field, so the default answer mixes direct calls with things three hops
+    # away and gives the reader no way to tell. Reserve calls ReserveAsync and
+    # IsEnabled; CountAsync and HoldAsync are one hop further, through
+    # SqlInventoryStore.ReserveAsync.
+    sym_callees=$("$here/cs" callees Reserve inventory-api-dotnet 2>&1 || true)
+    if matches "$sym_callees" 'ReserveAsync' && ! matches "$sym_callees" 'CountAsync'; then
+      ok "cs callees returns direct callees only, not an unlabelled transitive mix"
+      pass=$((pass + 1))
+    else
+      err "cs callees mixed transitive callees into a direct answer"
+      fail=$((fail + 1)); failed_ids+=("callees-depth")
+    fi
+
+    # impact walks further ON PURPOSE, and says so rather than leaving the
+    # reader to assume the same depth as callers.
+    sym_impact=$("$here/cs" impact ReserveAsync inventory-api-dotnet 2>&1 || true)
+    if matches "$sym_impact" 'ReservationController.cs' \
+       && matches "$sym_impact" 'answer:.*depth'; then
+      ok "cs impact reports dependents and states the depth it walked"
+      pass=$((pass + 1))
+    else
+      err "cs impact did not answer, or did not state its depth"
+      fail=$((fail + 1)); failed_ids+=("impact-depth-undisclosed")
+    fi
+
+    # A repo with no graph is a place results cannot come from. Answering zero
+    # there is the same false negative as an excluded directory.
+    if "$here/cs" callers pick_items kit-service-python >/dev/null 2>&1; then
+      err "cs callers answered for a repo with no graph"
+      fail=$((fail + 1)); failed_ids+=("symbol-no-graph-answered")
+    else
+      ok "a repo with no graph refuses rather than reporting zero"
+      pass=$((pass + 1))
+    fi
+
+    # An --engine symbol mode cannot serve is refused, not dropped -- same rule
+    # as cs impls, and for the same reason: a dropped request is indistinguishable
+    # from that engine having been asked and found nothing.
+    sym_eng=()
+    "$here/cs" callers ReserveAsync inventory-api-dotnet --engine=serena >/dev/null 2>&1 && sym_eng+=("serena-accepted")
+    "$here/cs" impact  ReserveAsync inventory-api-dotnet --engine=bogus  >/dev/null 2>&1 && sym_eng+=("bogus-accepted")
+    "$here/cs" callers ReserveAsync inventory-api-dotnet --engine=tokensave >/dev/null 2>&1 || sym_eng+=("tokensave-rejected")
+    if [[ ${#sym_eng[@]} -eq 0 ]]; then
+      ok "symbol mode honours --engine=tokensave and refuses the rest"
+      pass=$((pass + 1))
+    else
+      err "an --engine was mishandled: ${sym_eng[*]}"
+      fail=$((fail + 1)); failed_ids+=("symbol-engine-flag")
+    fi
+
+    # ---- trap 2: the layered view does not survive into symbol mode ---------
+    # A ticket workspace layers your branch state over the fleet, and no graph
+    # index spans both. Asking about a repo you are editing and being answered
+    # from the fleet index describes the world before your edits -- so which
+    # index answered is stated on the answer, and a substituted one is DEGRADED
+    # (which puts it in the porcelain envelope too, where a non-human caller can
+    # see it without reading stderr).
+    sym_tick=$(mktemp -d)
+    mkdir -p "$sym_tick/SYM-1"
+    if git -C "$sym_repo" worktree add -b verify/symbol-mode \
+         "$sym_tick/SYM-1/inventory-api-dotnet" >/dev/null 2>&1; then
+      sym_sub=$(TICKETS_ROOT="$sym_tick" "$here/cs" callers ReserveAsync \
+                inventory-api-dotnet --ticket=SYM-1 --porcelain 2>/dev/null)
+      if printf '%s' "$sym_sub" | python3 -c '
+import json, sys
+env = json.load(sys.stdin)
+assert env["scope"] == "SYM-1", env["scope"]
+assert env["degraded"], "a fleet-index answer to a ticket-scoped question was not degraded"
+assert "FLEET" in env["degraded"], env["degraded"]
+assert "fleet layer" in (env["note"] or ""), env["note"]
+assert env["hits"], "no hits to attach the warning to"
+' 2>/dev/null; then
+        ok "a ticket-scoped question answered from the fleet index says so, as data"
+        pass=$((pass + 1))
+      else
+        err "the fleet-index substitution was silent"
+        fail=$((fail + 1)); failed_ids+=("symbol-scope-substitution")
+      fi
+
+      # And with a graph in the workspace, the SAME query is answered from it,
+      # with no substitution to warn about. Otherwise the warning above would be
+      # unconditional, which is how a warning stops being read.
+      (cd "$sym_tick/SYM-1/inventory-api-dotnet" && tokensave init >/dev/null 2>&1) || true
+      sym_own=$(TICKETS_ROOT="$sym_tick" "$here/cs" callers ReserveAsync \
+                inventory-api-dotnet --ticket=SYM-1 --porcelain 2>/dev/null)
+      if printf '%s' "$sym_own" | python3 -c '
+import json, sys
+env = json.load(sys.stdin)
+assert "ticket layer" in (env["note"] or ""), env["note"]
+assert not env["degraded"], env["degraded"]
+' 2>/dev/null; then
+        ok "a workspace with its own graph is answered from it, undegraded"
+        pass=$((pass + 1))
+      else
+        err "the ticket workspace's own graph was not used, or was flagged anyway"
+        fail=$((fail + 1)); failed_ids+=("symbol-ticket-layer")
+      fi
+      git -C "$sym_repo" worktree remove --force "$sym_tick/SYM-1/inventory-api-dotnet" >/dev/null 2>&1
+      git -C "$sym_repo" branch -D verify/symbol-mode >/dev/null 2>&1
+    else
+      skip "symbol-mode scope" "could not create a worktree for the ticket layer"
+    fi
+    rm -rf "$sym_tick"
+
+    # The query log exists to make the refusal RATE measurable, and a rate is
+    # only actionable if you know which refusal. Symbol mode adds two reasons
+    # that are different problems -- a graph nobody has built, and a name the
+    # graph does not hold -- and both messages mention an engine, so without
+    # their own classes they would land in `engine-failed` alongside a crashing
+    # ripgrep.
+    sym_log=$(mktemp -d)
+    CS_LOG="$sym_log/q.jsonl" "$here/cs" impact NoSuchSymbolAnywhere inventory-api-dotnet >/dev/null 2>&1
+    CS_LOG="$sym_log/q.jsonl" "$here/cs" callers pick_items kit-service-python >/dev/null 2>&1
+    if python3 -c '
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1])]
+assert len(rows) == 2, rows
+assert [r["sub"] for r in rows] == ["impact", "callers"], rows
+assert rows[0]["refusal"] == "symbol-unresolved", rows[0]["refusal"]
+assert rows[1]["refusal"] == "no-graph", rows[1]["refusal"]
+' "$sym_log/q.jsonl" 2>/dev/null; then
+      ok "symbol-mode refusals are logged under their own reasons"
+      pass=$((pass + 1))
+    else
+      err "a symbol-mode refusal was logged without a usable reason"
+      fail=$((fail + 1)); failed_ids+=("symbol-refusal-class")
+    fi
+    rm -rf "$sym_log"
+
+    # The facade must not pretend to be the whole graph tool. Ninety operations
+    # behind three subcommands is a facade that answers less than the thing it
+    # fronts, so the pointer to the real tool is part of the routing table.
+    if emits out '(graph question|beyond what cs fronts)' "$here/cs" which \
+       && emits out 'cs callers' "$here/cs" which; then
+      ok "cs which routes to symbol mode, and points past it for the rest"
+      pass=$((pass + 1))
+    else
+      err "cs which does not document symbol mode, or its boundary"
+      fail=$((fail + 1)); failed_ids+=("symbol-which-table")
+    fi
+  fi
+fi
+rm -rf "$FLEET_ROOT/inventory-api-dotnet/.tokensave"
+
 # ---- reason codes, not free text -------------------------------------------
 # impls_via_tokensave takes a reason CODE; passing prose into it produced
 # "no explicitly requested here, so no language server" on the answer line.

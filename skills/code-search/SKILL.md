@@ -40,12 +40,15 @@ searches the current directory, which is not a fleet. If it is unset, ask the
 user for the directory holding their repos rather than guessing.
 
 Every *engine* is optional. `cs engines` reports what is present, and `cs` routes
-around whatever is missing rather than failing silently. **`python3` is the
-exception** — `uses`, `provides`, `deps`, `publishes`, `versions`, `owns`,
-`impls` and `refs` run through it, and refuse without it rather than returning
-zero hits that would read exactly like a real "nothing uses this". If `cs`
-reports python3 missing, tell the user; `cs seam` still works without it, but
-counts comments as hits.
+around whatever is missing rather than failing silently. **Two exceptions.**
+`python3` — `uses`, `provides`, `deps`, `publishes`, `versions`, `owns`, `impls`,
+`refs` and symbol mode run through it, and refuse without it rather than
+returning zero hits that would read exactly like a real "nothing uses this". If
+`cs` reports python3 missing, tell the user; `cs seam` still works without it,
+but counts comments as hits. And **`tokensave`** — nothing else here answers a
+call graph, so `cs callers`, `cs callees` and `cs impact` refuse without it (and
+without a graph built in the repo being asked about: `cd <repo> && tokensave
+init`) rather than degrading to something weaker.
 
 **Read the `ANSWER KIND` table in `cs engines`, not just the binary list.** The
 binaries are not the decision-relevant fact — which *kinds* of answer this
@@ -53,8 +56,8 @@ machine can produce is, because that is what the negative results are worth:
 
 ```
 ANSWER KIND  STATUS
-structural   UNAVAILABLE — needs ast-grep or semgrep, neither installed → cs calls and cs def both refuse
-               backs: cs calls, cs def
+structural   UNAVAILABLE — needs ast-grep or semgrep, and universal-ctags — none installed → cs calls and cs def both refuse; no tokensave → cs callers / cs callees / cs impact refuse
+               backs: cs calls, cs def, cs impls (graph fallback), cs callers, cs callees, cs impact
 resolved     DEGRADED — dotnet ok, java MISSING (Java/Kotlin), node ok → cs impls / cs refs refuse for the missing languages
                backs: cs impls, cs refs
 ```
@@ -78,6 +81,9 @@ Run `cs which` for this table at any time.
 | Where a symbol is defined | `cs def <symbol> [repo]` |
 | Calls shaped like X, or taking literal Y | `cs calls '<pattern>' [lang]` |
 | What implements this interface | `cs impls <symbol> <repo>` |
+| What calls this symbol | `cs callers <symbol> <repo>` |
+| What this symbol calls | `cs callees <symbol> <repo>` |
+| What breaks if I change this symbol | `cs impact <symbol> <repo>` |
 | What references this symbol (bridges DI) | `cs refs <symbol> <repo> <file>` |
 | Which repo publishes this package | `cs provides <coordinate>` |
 | Which repos depend on which | `cs deps [repo]` |
@@ -105,6 +111,21 @@ bridges, and the reason `cs refs` is worth its cost.
 
 When a subcommand finds nothing it prints what to try instead, so a wrong first
 choice self-corrects.
+
+**Two kinds of question, one interface.** `cs uses` / `cs seam` / `cs history`
+ask about **names**; `cs callers` / `cs callees` / `cs impact` / `cs impls` ask
+about **symbols**. A real question crosses between them — *"I am renaming this
+route, what breaks"* starts as a seam question and ends as a symbol one — which
+is why both live here instead of in two tools with two scoping models. Run the
+seam half first: it spans every repo, and it is what tells you which repo to
+then ask the symbol half about.
+
+Symbol mode reads a **tokensave graph**, which is per-repo — see *Symbol mode
+answers about one repo at one layer* under **Known blind spots** before
+reporting the result. `cs impact` is the one to reach for when the user is
+deciding whether a change is safe; `cs callers` returning nothing for a resolved
+symbol is the strongest "this looks dead" signal available inside one repo, and
+still says nothing about the other repos.
 
 ## Read the answer kind before you trust the answer
 
@@ -161,6 +182,15 @@ cannot answer honestly: no such fleet root, no repos in it, python3 missing,
 around a refusal by falling back to raw `grep`** — the refusal means the
 conditions for a trustworthy negative are not met, and grep's negative is
 weaker still. Fix the cause, or tell the user what is missing.
+
+Symbol mode refuses for two more reasons, both of the same shape. A repo with no
+tokensave graph is a place results cannot come from (`cd <repo> && tokensave
+init`), and a symbol that does not resolve to a graph node means the graph was
+never asked at all. That second one matters because the raw graph CLI does *not*
+refuse there: `tokensave tool impact <bare-name>` and `tokensave tool
+callers_for <bare-name>` both **exit 0 with an empty result**, having looked
+nothing up. "Nothing calls this" is the answer people delete code on, so `cs`
+resolves the name to a node id first and refuses when it cannot.
 
 That last one is worth naming, because it is the strongest label on the weakest
 evidence: Serena is a *driver* for a language server, and a language server
@@ -441,6 +471,25 @@ installed.
   not preflighted: `cs` warns that it did not check, and an empty result there
   may still mean the project failed to load. Check `cs engines` before treating
   such a negative as strong.
+- **Symbol mode answers about one repo at one layer.** `cs callers`, `cs callees` and
+  `cs impact` read a tokensave graph, and a graph index is **per-project**: the
+  workspace copy of a repo has its own, the fleet copy has its own, and *there is
+  no union*. So these cannot deliver what `cs uses` delivers — a caller in
+  another repo of the fleet is a string, not an edge, and is invisible here.
+  Always pair a symbol answer with `cs uses '<symbol>'` before telling anyone
+  something is unused. The answer line names **which** index answered and how
+  old it is (`scoped to <repo>; ticket layer, synced 2d ago`); when the scope was
+  a ticket workspace and the fleet index answered instead, `cs` reports that as
+  `degraded` — the answer then describes `main`, not the branch being edited, and
+  must be passed on with that caveat rather than as the state of the code.
+  A stale graph is a source of confidently *wrong* answers, not merely blind
+  ones. `cs callers` and `cs callees` return **direct** edges only; `cs impact`
+  walks transitively to depth 3 and says so.
+- **Symbol mode fronts three graph questions, not ninety.** The tool behind it
+  also answers dead code, coupling, complexity, blame, test mapping, call chains
+  and inheritance depth. `cs` deliberately does not wrap those: for anything
+  deeper than the three, say so and use the graph tool directly
+  (`tokensave tool <name>`) rather than reporting that `cs` could not answer.
 - **`cs uses` filters comments by file extension**, so its coverage is a table
   rather than a parser: 106 extensions plus 13 well-known filenames. A file in
   a language outside the table is passed through unfiltered and *named* in the

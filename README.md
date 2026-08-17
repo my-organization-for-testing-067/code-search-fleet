@@ -28,7 +28,7 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 126 checks against a throwaway fixture fleet
+scripts/verify-search              # 157 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only
@@ -38,7 +38,8 @@ Every *engine* is optional; `cs engines` reports what is present and `cs` routes
 around what is missing rather than failing silently.
 
 **`python3` is the one hard requirement** — `uses`, `provides`, `deps`,
-`publishes`, `versions`, `owns`, `impls` and `refs` all run through it. It is
+`publishes`, `versions`, `owns`, `impls`, `refs` and symbol mode all run through
+it. It is
 separate from the engines because it does not degrade: those commands refuse
 rather than answer without it. Nothing installs it for you (a system python is
 the OS's business), but `bootstrap` and `cs engines` both report it.
@@ -57,6 +58,9 @@ than a wrong one, because nothing reports it. `brew install coreutils` on macOS.
 | Where is a symbol defined | `cs def <symbol> [repo]` |
 | Calls shaped like X, or taking literal Y | `cs calls '<pattern>' [lang]` |
 | What implements this interface | `cs impls <symbol> <repo>` |
+| What calls this symbol | `cs callers <symbol> <repo>` |
+| What this symbol calls | `cs callees <symbol> <repo>` |
+| What breaks if I change this symbol | `cs impact <symbol> <repo>` |
 | What references this symbol (bridges DI) | `cs refs <symbol> <repo> <file>` |
 | Which repo publishes this package | `cs provides <coordinate>` |
 | Which repos depend on which | `cs deps [repo]` |
@@ -247,6 +251,76 @@ graphs are **per-repo** — so `cs` names the repos it could not cover:
 Without that line a definition living in an unindexed repo would look exactly
 like a symbol that does not exist, which is the failure this whole project is
 organised against.
+
+### And the same graph answers the symbol half of a question
+
+`cs uses`, `cs seam` and `cs history` ask about **names**. `cs callers`,
+`cs callees`, `cs impact` and `cs impls` ask about **symbols**. Both are here
+because a real question crosses between them — *"I am renaming this route, what
+breaks"* starts as a seam question and ends as a symbol one — and the handoff to
+a second tool with a second scoping model is the cost worth removing.
+
+```
+$ cs callers ReserveAsync inventory-api-dotnet
+tokensave: 'ReserveAsync' is 2 nodes in this graph and ALL were asked
+  (src/Infrastructure/SqlInventoryStore.cs:14, src/Domain/IInventoryStore.cs:5)
+inventory-api-dotnet/src/Controllers/ReservationController.cs:27: [method] Reserve (calls)
+answer: structural via tokensave (graph) (scoped to inventory-api-dotnet; fleet layer, synced 0d ago; direct callers) · 1 hit(s)
+```
+
+Three subcommands, not ninety. The tool behind this fronts dead code, coupling,
+complexity, blame, test mapping, call chains and inheritance depth; wrapping all
+of that would make `cs` a second, worse interface for something already good at
+it and would cost the property that makes it legible — subcommands shaped like
+questions, few enough to hold in your head. `cs which` points at the graph tool
+directly for anything deeper, because a facade that quietly answers *less* than
+the thing it fronts is worse than no facade.
+
+What `cs` adds over calling the graph is the part the graph does not carry:
+
+- **The answer kind.** `structural`, never `resolved`. A graph cannot see
+  reflection, DI registration or generated code, and raw graph output says so
+  nowhere.
+- **Refusal discipline.** Two of the graph CLI's own tools take a node id and
+  answer a bare *name* with an empty result and **exit 0**: `callers_for` returns
+  `{"callers": {"<Name>": []}}` and `impact` returns `node_count: 0`, both having
+  looked nothing up. "Nothing calls this" is the answer someone deletes code on,
+  so every lookup is two-step — name → node id → question — and a name that does
+  not resolve refuses instead of printing nothing. (`callers` and `callees`
+  reject a bare name loudly, so only two of the four needed the guard; a name
+  that is several nodes, like an interface method and its implementation, has
+  all of them asked rather than the top-ranked one.)
+- **The scope it actually had.** Below.
+
+#### The layered view does not survive into symbol mode, and `cs` says so
+
+`cs`'s best property is the layered view: ticket repos at branch state, every
+other repo at main, one root. Graph indexes cannot do that. They are
+per-project — the workspace copy of a repo has its own index, the fleet copy has
+its own, and **there is no union**. So `cs callers <symbol>` cannot deliver what
+`cs uses <string>` delivers, and left unsaid the gap is invisible in the output:
+ask for callers of something you just renamed on your branch, get the fleet
+index's answer, and it describes the world before your edit.
+
+There is no clean fix, so the gap is made loud instead. Every symbol answer
+names **which** index answered and how old it is, and an index from the wrong
+layer is reported as `degraded` — which puts it in the porcelain envelope too,
+where a non-human caller sees it without reading stderr:
+
+```
+$ cs callers ReserveAsync inventory-api-dotnet --ticket=PROJ-9
+! the PROJ-9 workspace copy of inventory-api-dotnet has no graph, so its FLEET
+  copy answered — this describes main, not your branch
+answer: structural via tokensave (graph) (scoped to …; fleet layer, synced 0d ago; direct callers) · 1 hit(s)
+! degraded: answered from inventory-api-dotnet's FLEET index (main) although the
+  scope is PROJ-9 — graph indexes are per-project and there is no union of the
+  two, so your branch's edits to inventory-api-dotnet are invisible in this answer
+```
+
+A caller who knows the answer excludes their branch can act on it; one who does
+not, cannot. Build a graph in the workspace copy and the same query is answered
+from it, with no warning to ignore — which is what keeps the warning worth
+reading.
 
 ## Tuning it for your repos
 
@@ -467,6 +541,10 @@ replayed tip matches the canonical tree, so history cannot drift from source.
   nothing resolves them symbolically. Report such links as textual matches.
 - Runtime indirection — DI resolved from config, reflection, identifiers built
   at runtime — is undecidable statically at any budget.
+- Symbol mode is **per-repo, at one layer**. A graph index spans neither the
+  fleet nor your ticket workspace, so `cs callers` finding nothing rules out
+  callers in *that repo* and nothing else. Pair it with `cs uses` before calling
+  anything dead.
 - 9/9 on this fixture means the test set is exhausted, not that search is
   solved. The real measure is a query set drawn from your own tickets.
 - Result caps and timeouts mean an answer can be partial. `cs` says so when it
@@ -580,7 +658,7 @@ The cost argument above — schemas are permanent, the skill body is on demand �
 assumed a client that inlines every tool schema at session start. That is still
 true of some, and there the objection stands unchanged. It is no longer true of
 clients that **defer** tool schemas: tools arrive as names only, and a schema is
-fetched when a tool is actually called. The standing cost there is a list of 19
+fetched when a tool is actually called. The standing cost there is a list of 21
 identifiers — smaller than the always-on skill description it partly duplicates.
 
 So `scripts/cs-mcp` exposes the same subcommands over MCP, and it is **opt-in**
