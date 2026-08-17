@@ -1060,6 +1060,67 @@ else
       ok "cs def --engine=tokensave with no graph refuses"; pass=$((pass + 1))
     fi
 
+    # ---- the branch that CHOOSES between them ------------------------------
+    # Everything above drives the graph through --engine=tokensave, which is the
+    # deliberate path. The automatic one — ctags absent, so fall back — was the
+    # single `if` nothing exercised, because ctags_bin resolves ABSOLUTE paths
+    # (to dodge macOS's BSD ctags) and PATH therefore cannot hide the real one.
+    # CS_CTAGS_BIN is authoritative for exactly this reason.
+    auto_out=$(CS_CTAGS_BIN=/nonexistent/ctags "$here/cs" def Reserve 2>&1); auto_rc=$?
+    if [[ $auto_rc -eq 0 ]] \
+       && printf '%s' "$auto_out" | grep -q 'via tokensave (graph)' \
+       && printf '%s' "$auto_out" | grep -q 'ReservationController.cs'; then
+      ok "with no ctags, cs def falls back to the graph without being asked"
+      pass=$((pass + 1))
+    else
+      err "the no-ctags fallback did not engage (exit $auto_rc)"
+      fail=$((fail + 1)); failed_ids+=("def-ctags-missing-fallback")
+    fi
+
+    # A ctags that is not universal-ctags is a DIFFERENT program with a
+    # different output format — the reason ctags_bin checks the banner rather
+    # than the name. It must be treated as absent, not trusted.
+    bsd_ctags=$(mktemp -d)
+    printf '#!/bin/sh\necho "ctags (GNU Emacs 28.1)"\n' > "$bsd_ctags/ctags"
+    chmod +x "$bsd_ctags/ctags"
+    # Captured, not piped into `grep -q`: that kills cs with SIGPIPE on the
+    # first match and pipefail then reports failure on success.
+    bsd_out=$(CS_CTAGS_BIN="$bsd_ctags/ctags" "$here/cs" def Reserve 2>&1 || true)
+    if printf '%s' "$bsd_out" | grep -q 'via tokensave (graph)'; then
+      ok "a ctags that is not universal-ctags counts as absent"; pass=$((pass + 1))
+    else
+      err "a non-universal ctags was trusted as the symbol index"
+      fail=$((fail + 1)); failed_ids+=("def-nonuniversal-ctags")
+    fi
+    rm -rf "$bsd_ctags"
+
+    # With neither engine, the refusal has to name BOTH remedies — a reader who
+    # cannot install ctags needs to learn the graph route exists at the moment
+    # it would have helped.
+    noboth=$(CS_CTAGS_BIN=/nonexistent/ctags FLEET_ROOT="$ts_nograph/fleet" \
+             "$here/cs" def Reserve 2>&1); noboth_rc=$?
+    if [[ $noboth_rc -eq 1 ]] \
+       && printf '%s' "$noboth" | grep -q 'universal-ctags' \
+       && printf '%s' "$noboth" | grep -q 'tokensave init'; then
+      ok "with neither engine, cs def refuses and names both remedies"
+      pass=$((pass + 1))
+    else
+      err "the no-engine refusal was missing or incomplete (exit $noboth_rc)"
+      fail=$((fail + 1)); failed_ids+=("def-no-engine-refusal")
+    fi
+
+    # And the seam must not become the default: a real ctags still wins.
+    unset_out=$("$here/cs" def Reserve 2>&1 || true)
+    if [[ -z "$(command -v ctags 2>/dev/null)" ]]; then
+      skip "CS_CTAGS_BIN default" "no ctags on this machine to fall back to"
+    elif printf '%s' "$unset_out" | grep -q 'via ctags'; then
+      ok "CS_CTAGS_BIN unset leaves the normal ctags scan in charge"
+      pass=$((pass + 1))
+    else
+      err "the CS_CTAGS_BIN seam changed behaviour when unset"
+      fail=$((fail + 1)); failed_ids+=("def-ctags-seam-default")
+    fi
+
     rm -rf "$ts_nodot" "$ts_nograph"
   fi
 fi

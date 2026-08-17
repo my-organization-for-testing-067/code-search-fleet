@@ -28,7 +28,7 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 112 checks against a throwaway fixture fleet
+scripts/verify-search              # 116 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only
@@ -252,6 +252,7 @@ organised against.
 | `CS_EXCLUDE_EXTRA` | directories to skip, added to the built-in list |
 | `CS_EXCLUDE_REMOVE` | directories to **stop** skipping |
 | `CS_JSON` | `1` for one JSON object on stdout instead of result lines (same as `--porcelain`) |
+| `CS_CTAGS_BIN` | use exactly this universal-ctags; if it does not validate, ctags counts as absent |
 
 `CS_EXCLUDE_REMOVE` matters more than it looks. The built-in exclusion list is a
 guess about other people's repos, and some entries are wrong for some of them:

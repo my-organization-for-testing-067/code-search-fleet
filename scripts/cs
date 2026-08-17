@@ -66,6 +66,9 @@
 #   CS_EXCLUDE_REMOVE directories to STOP skipping, e.g. "bin vendor" when a
 #                    repo keeps hand-written source there (`cs engines` prints
 #                    the effective list)
+#   CS_CTAGS_BIN     use exactly this universal-ctags, and treat ctags as absent
+#                    if it does not validate (cs def then falls back to a
+#                    tokensave graph, or refuses)
 #
 # Exit codes:
 #   0  the query ran and found at least one hit
@@ -839,6 +842,18 @@ scan_unreadable_for_grep() {
   done < <(find -L "$view"/*/ \( "${prune[@]}" \) -prune -o -type l -print 2>/dev/null)
 }
 ctags_bin() {
+  # CS_CTAGS_BIN names the binary explicitly, and is authoritative: if it does
+  # not validate, ctags is ABSENT rather than falling back to the scan below.
+  # Same reasoning as CS_TEXT_ENGINE -- an engine you can force is an engine you
+  # can compare rather than trust -- and it is the only way to exercise the
+  # no-ctags path at all, because the scan resolves ABSOLUTE paths specifically
+  # to dodge macOS's BSD ctags, so PATH cannot hide the real one.
+  if [[ -n "${CS_CTAGS_BIN:-}" ]]; then
+    [[ -x "$CS_CTAGS_BIN" ]] || return 1
+    "$CS_CTAGS_BIN" --version 2>&1 | grep -qi universal || return 1
+    printf '%s\n' "$CS_CTAGS_BIN"
+    return 0
+  fi
   # On macOS, Homebrew's universal-ctags is shadowed by the BSD ctags in
   # /usr/bin, which is a different program with a different output format --
   # so check for the Universal banner rather than trusting the name.
