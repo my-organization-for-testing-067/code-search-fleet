@@ -897,7 +897,9 @@ rm -f "$dangle_repo/CLAUDE.local.md" "$dangle_repo/src/import"
 # prefix of a longer one anywhere in the fleet lost its warning.
 info ""
 info "${C_BOLD}whole-identifier matching${C_OFF}"
-printf 'class AccessionUpdateIn { }\n' \
+# Two whole-word hits, not one. With a single hit the helper's line-number
+# list is one line long, which is exactly the shape that hid the awk bug.
+printf 'class AccessionUpdateIn { }\nvar handler = new AccessionUpdateIn();\n' \
   > "$FLEET_ROOT/inventory-api-dotnet/src/AccessionUpdateIn.cs"
 mkdir -p "$FLEET_ROOT/web-monorepo-node/schemas"
 printf 'input AccessionUpdateInput {\n  id: ID!\n}\n' \
@@ -941,7 +943,9 @@ have_rg_binary_here && word_engines=(ripgrep grep)
 for eng in "${word_engines[@]}"; do
   wn=$(CS_TEXT_ENGINE=$eng "$here/cs" uses 'AccessionUpdateIn' --word --quiet 2>/dev/null | grep -c '[^[:space:]]')
   sn=$(CS_TEXT_ENGINE=$eng "$here/cs" uses 'AccessionUpdateIn' --quiet 2>/dev/null | grep -c '[^[:space:]]')
-  [[ "$wn" -eq 1 && "$sn" -eq 2 ]] || word_bad+=("$eng:word=$wn/substring=$sn")
+  # 2 whole-word hits in inventory-api-dotnet, plus 1 substring hit in
+  # web-monorepo-node's GraphQL type.
+  [[ "$wn" -eq 2 && "$sn" -eq 3 ]] || word_bad+=("$eng:word=$wn/substring=$sn")
 done
 if [[ ${#word_bad[@]} -eq 0 ]]; then
   ok "--word matches whole identifiers only (${word_engines[*]})"; pass=$((pass + 1))
@@ -952,7 +956,7 @@ fi
 
 # The default must NOT have become -w: a name assembled from parts is a real
 # use and the documented blind spot of a heuristic answer.
-if [[ "$("$here/cs" uses 'AccessionUpdateIn' --quiet 2>/dev/null | grep -c '[^[:space:]]')" -eq 2 ]]; then
+if [[ "$("$here/cs" uses 'AccessionUpdateIn' --quiet 2>/dev/null | grep -c '[^[:space:]]')" -eq 3 ]]; then
   ok "substring hits are still returned by default, not silently dropped"
   pass=$((pass + 1))
 else
@@ -962,6 +966,66 @@ fi
 
 rm -f "$FLEET_ROOT/inventory-api-dotnet/src/AccessionUpdateIn.cs"
 rm -rf "$FLEET_ROOT/web-monorepo-node/schemas"
+
+# A LIVE seam must never be called dead. This is the assertion the suite was
+# missing: whole_word_hits() passed its line numbers through `awk -v`, and BSD
+# awk (/usr/bin/awk on macOS) rejects a literal newline in a -v operand, exits
+# 2, and writes nothing. The function returned empty for every query with TWO OR
+# MORE whole-word hits, and empty reads as "no repo mentions this as a whole
+# identifier" — the orphan warning. A live cross-repo seam was reported as a
+# producer with no consumer.
+#
+# 79 checks passed over it, because every fixture query yielded at most ONE
+# whole-word hit. The bug is invisible below two matches and certain at or
+# above, so these cases are chosen for having several.
+live_bad=()
+for live in 'orders.reserved.v1' 'reservationId' '/api/v1/inventory/reserve'; do
+  lo=$("$here/cs" seam "$live" 2>&1)
+  # These are real multi-repo seams in the fixture; none is dead.
+  printf '%s' "$lo" | grep -q 'producer with no consumer, or dead' \
+    && live_bad+=("$live:called-dead")
+  printf '%s' "$lo" | grep -q 'matched only INSIDE a longer identifier' \
+    && live_bad+=("$live:false-substring-claim")
+done
+if [[ ${#live_bad[@]} -eq 0 ]]; then
+  ok "a live multi-hit seam is not reported as dead"; pass=$((pass + 1))
+else
+  err "live seams reported as dead or substring-only: ${live_bad[*]}"
+  fail=$((fail + 1)); failed_ids+=("live-seam-called-dead")
+fi
+
+# The helper swallowed awk's exit status, so a broken helper was
+# indistinguishable from a substantive answer. Any tool diagnostic on stderr
+# means something ran and failed while cs reported a clean result.
+diag_bad=()
+for q in 'orders.reserved.v1' 'reservationId' 'AccessionUpdateIn'; do
+  d=$("$here/cs" seam "$q" 2>&1 >/dev/null | grep -cE '^(awk|sed|cut|tr|sort|comm):')
+  [[ "$d" -eq 0 ]] || diag_bad+=("$q:$d")
+done
+for q in 'orders.reserved.v1' 'reservationId'; do
+  d=$("$here/cs" uses "$q" 2>&1 >/dev/null | grep -cE '^(awk|sed|cut|tr|sort|comm):')
+  [[ "$d" -eq 0 ]] || diag_bad+=("uses:$q:$d")
+done
+if [[ ${#diag_bad[@]} -eq 0 ]]; then
+  ok "no tool diagnostics leak onto stderr from a normal query"; pass=$((pass + 1))
+else
+  err "a helper failed while cs reported a clean result: ${diag_bad[*]}"
+  fail=$((fail + 1)); failed_ids+=("helper-diagnostics")
+fi
+
+# And when the helper genuinely cannot run, cs must decline to assert the
+# negative rather than emit it from an empty result.
+brokeawk=$(mktemp -d)
+printf '#!/bin/sh\nexit 2\n' > "$brokeawk/awk"; chmod +x "$brokeawk/awk"
+ba_out=$(PATH="$brokeawk:$PATH" "$here/cs" seam 'orders.reserved.v1' 2>&1)
+if ! printf '%s' "$ba_out" | grep -q 'producer with no consumer, or dead'; then
+  ok "a failed whole-identifier analysis suppresses the warning instead of asserting it"
+  pass=$((pass + 1))
+else
+  err "cs asserted a dead seam from a helper that had failed"
+  fail=$((fail + 1)); failed_ids+=("orphan-from-broken-helper")
+fi
+rm -rf "$brokeawk"
 
 # ---- what counts as a repository -------------------------------------------
 # A fleet root grows housekeeping — a README, an update script, a log, a folder

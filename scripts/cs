@@ -1231,16 +1231,37 @@ $1"; else CS_RESULTS="$1"; fi
 #
 # The prefix is stripped before testing, so a pattern occurring in a FILE NAME
 # cannot pass itself off as a whole-identifier hit in the code.
+#
+# The line numbers are passed as a FILE, not through `awk -v`. POSIX leaves a
+# literal newline in a -v operand undefined; BSD awk -- /usr/bin/awk on macOS --
+# rejects it outright with "newline in string", exits 2, and writes nothing.
+# That made this function return empty for every query with TWO OR MORE
+# whole-word hits, and an empty result here reads as "no repo mentions this as a
+# whole identifier": the orphan warning. A live cross-repo seam was reported as
+# dead, which is the inverse of the bug this function was added to fix and the
+# outcome the whole project exists to prevent.
+#
+# It survived a 79-check run because every fixture query yielded at most ONE
+# whole-word hit, so `keep` was always a single line and -v behaved. Invisible
+# below two matches, certain at or above -- hence the multi-hit fixture cases in
+# verify-search.
+#
+# Returns awk's exit status, so the caller can tell "no whole-word hits" from
+# "the analysis did not run". An empty result from a broken helper is not an
+# answer, which is the rule cs already applies to ripgrep and filter_code.py.
 whole_word_hits() {  # <pattern>, hit lines on stdin
-  local pat="$1" all stripped keep
+  local pat="$1" all stripped keep tmp rc
   all=$(cat)
   [[ -n "$all" ]] || return 0
   stripped=$(printf '%s\n' "$all" | sed 's/^[^:]*:[0-9]*: \{0,1\}//')
   keep=$(printf '%s\n' "$stripped" | grep -nwF -- "$pat" 2>/dev/null | cut -d: -f1)
   [[ -n "$keep" ]] || return 0
-  printf '%s\n' "$all" | awk -v keep="$keep" '
-    BEGIN { n = split(keep, a, "\n"); for (i = 1; i <= n; i++) want[a[i]] = 1 }
-    want[NR]'
+  tmp=$(mktemp -t "cs-word.$$")
+  printf '%s\n' "$keep" > "$tmp"
+  printf '%s\n' "$all" | awk 'NR == FNR { want[$1] = 1; next } want[FNR]' "$tmp" -
+  rc=$?
+  rm -f "$tmp"
+  return $rc
 }
 
 n_repos_in() { printf '%s\n' "$1" | cut -d/ -f1 | sort -u | grep -c ''; }
@@ -1360,8 +1381,18 @@ cmd_seam() {
   # a real use (a name assembled by concatenation is exactly the heuristic blind
   # spot documented in `cs why`); computing the warning on the narrower set
   # loses nothing and restores the signal.
-  local word_hits word_repos n_word substring_only
-  word_hits=$(printf '%s\n' "$hits" | whole_word_hits "$1")
+  local word_hits word_repos n_word substring_only ww_rc
+  word_hits=$(printf '%s\n' "$hits" | whole_word_hits "$1"); ww_rc=$?
+  # The orphan warning ASSERTS A NEGATIVE, so it needs the same evidence bar as
+  # any other negative here: if the analysis did not run, no warning is emitted
+  # at all. Reading a failed helper's empty output as "nothing matched" is what
+  # turned a live seam into a dead one.
+  if [[ $ww_rc -ne 0 ]]; then
+    engine_error "whole-identifier analysis failed (exit $ww_rc) while checking '$1'"
+    warn "could not determine whole-identifier matches — the dead/orphan warning is NOT being reported for this query"
+    report_answer "$(n_hits_in "$hits")" "$n"
+    return 0
+  fi
   word_repos=$(printf '%s\n' "$word_hits" | grep '[^[:space:]]' | cut -d/ -f1 | sort -u)
   n_word=$(printf '%s\n' "$word_repos" | grep -c '[^[:space:]]')
 
@@ -1486,11 +1517,16 @@ cmd_uses() {
   # Same reasoning as the seam warning: a hit inside a longer identifier is not
   # a use of THIS name, and "who uses this" is the question being asked. Named
   # rather than removed, so a name genuinely assembled from parts is not lost.
-  local uses_word n_uses_word n_uses_all
-  uses_word=$(printf '%s\n' "$hits" | whole_word_hits "$1")
+  local uses_word n_uses_word n_uses_all uw_rc
+  uses_word=$(printf '%s\n' "$hits" | whole_word_hits "$1"); uw_rc=$?
   n_uses_all=$(n_hits_in "$hits")
   n_uses_word=$(printf '%s\n' "$uses_word" | grep -c '[^[:space:]]')
-  if [[ "$n_uses_word" -lt "$n_uses_all" ]]; then
+  if [[ $uw_rc -ne 0 ]]; then
+    # Same rule as cs seam: a claim about what did NOT match needs the analysis
+    # to have actually run.
+    engine_error "whole-identifier analysis failed (exit $uw_rc) while checking '$1'"
+    warn "could not determine which hits matched inside a longer identifier"
+  elif [[ "$n_uses_word" -lt "$n_uses_all" ]]; then
     warn "$((n_uses_all - n_uses_word)) of $n_uses_all hit(s) matched INSIDE a longer identifier — not a use of this name (use --word to exclude them)"
   fi
   emit_capped "$hits"
