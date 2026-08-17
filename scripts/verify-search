@@ -1017,6 +1017,54 @@ else
     else
       ok "with no toolchain and no graph, cs impls still refuses"; pass=$((pass + 1))
     fi
+    # ---- a mixed-language repo must route on the SYMBOL ---------------------
+    # Routing used the repo's PLURALITY language, so a repo that is mostly JS
+    # with a large C# component reported `javascript`, found node installed,
+    # and never reached the graph — while the symbol asked about was C# and
+    # dotnet was missing. The only thing separating an answer from a refusal
+    # was the ratio of file extensions, which has nothing to do with the
+    # question. And the refusal read "could not locate symbol", which a reader
+    # takes as "it does not exist".
+    mkdir -p "$ts_repo/wwwroot/js"
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      printf 'export function widget%s() { return %s; }\n' "$i" "$i" > "$ts_repo/wwwroot/js/w$i.js"
+    done
+    mixed_out=$(PATH="$ts_nodot:$PATH" "$here/cs" impls IStockLedger inventory-api-dotnet 2>&1)
+    mixed_rc=$?
+    if [[ $mixed_rc -eq 0 ]] && printf '%s' "$mixed_out" | grep -q 'AuditedStockLedger'; then
+      ok "a mixed-language repo routes on the symbol's language, not the repo's"
+      pass=$((pass + 1))
+    else
+      err "a mixed-language repo did not reach the graph (exit $mixed_rc)"
+      fail=$((fail + 1)); failed_ids+=("impls-mixed-language")
+    fi
+    rm -rf "$ts_repo/wwwroot"
+
+    # --engine is an instruction, not a hint. cs impls read force_engine
+    # nowhere, so an explicit request was ACCEPTED and DISCARDED — and the
+    # refusal that followed looked exactly like the graph had been asked and
+    # had nothing, which is strictly worse than not offering the flag.
+    if emits out 'AuditedStockLedger' "$here/cs" impls IStockLedger inventory-api-dotnet --engine=tokensave; then
+      ok "cs impls honours --engine=tokensave"; pass=$((pass + 1))
+    else
+      err "cs impls ignored an explicit --engine=tokensave"
+      fail=$((fail + 1)); failed_ids+=("impls-engine-flag-ignored")
+    fi
+
+    # An engine a subcommand cannot serve must be rejected loudly: a caller
+    # cannot otherwise tell "that engine found nothing" from "your request was
+    # dropped" — the same class as a refusal and a zero-hit sharing an exit code.
+    eng_bad=()
+    "$here/cs" impls IStockLedger inventory-api-dotnet --engine=bogus >/dev/null 2>&1 && eng_bad+=("impls:accepted-bogus")
+    "$here/cs" refs IInventoryStore inventory-api-dotnet src/Domain/IInventoryStore.cs \
+      --engine=tokensave >/dev/null 2>&1 && eng_bad+=("refs:accepted-tokensave")
+    if [[ ${#eng_bad[@]} -eq 0 ]]; then
+      ok "an --engine a subcommand cannot serve is refused, not dropped"; pass=$((pass + 1))
+    else
+      err "an inapplicable --engine was silently accepted: ${eng_bad[*]}"
+      fail=$((fail + 1)); failed_ids+=("engine-flag-dropped")
+    fi
+
     # ---- cs def, the cross-repo graph alternative to the ctags index --------
     # ctags indexes the whole view in one pass; graphs are per-repo, so coverage
     # is whatever has been indexed. That gap has to be DISCLOSED — a repo with

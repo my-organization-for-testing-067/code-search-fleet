@@ -943,6 +943,45 @@ CS_TOOLCHAINS="dotnet java node"
 # Extension counts, walked in rank order rather than taking the single commonest
 # extension: a repo's most numerous file type is often .json or .yml, which
 # names no language at all. The first ranked extension that IS a language wins.
+# One extension -> language map, shared by the repo census and the symbol route.
+ext_language() {
+  case "$1" in
+    cs)             echo csharp ;;
+    java)           echo java ;;
+    kt|kts)         echo kotlin ;;
+    ts|tsx)         echo typescript ;;
+    js|jsx|mjs|cjs) echo javascript ;;
+    py)             echo python ;;
+    go)             echo go ;;
+    rs)             echo rust ;;
+    *) return 1 ;;
+  esac
+}
+
+# The language of the SYMBOL, which is the language of the QUESTION.
+#
+# repo_language answers a different question -- what is this repo mostly written
+# in -- and routing on it means a repo that is 554 .js and 419 .cs files reports
+# `javascript`, finds node installed, and never reaches the graph fallback even
+# when the symbol asked about is C# and dotnet is missing. The only difference
+# between an answer and a refusal was the ratio of file extensions in the repo,
+# which has nothing to do with the question.
+#
+# ctags locates the defining file cheaply and without any toolchain, and its
+# extension is a far better signal than a file census. Falls back to the census
+# when there is no ctags or the symbol is not indexed.
+symbol_language() {  # <symbol> <repo-dir>
+  local sym="$1" dir="$2" ct tags ext
+  ct=$(ctags_bin) || return 1
+  tags=$(cs_tmp cs-symlang)
+  run_timed "$ct" -R --fields=+n -f "$tags" "$dir" >/dev/null 2>&1
+  ext=$(awk -F'\t' -v w="$sym" '$1 == w { print $2 }' "$tags" \
+        | sed -n 's/.*\.\([A-Za-z0-9_]\{1,\}\)$/\1/p' | tr 'A-Z' 'a-z' | head -1)
+  rm -f "$tags"
+  [[ -n "$ext" ]] || return 1
+  ext_language "$ext"
+}
+
 repo_language() {
   local dir="$1" ranked n ext
   ranked=$(find -L "$dir" -type d \( -name .git -o -name node_modules -o -name vendor \
@@ -951,18 +990,10 @@ repo_language() {
            | sed -n 's/.*\.\([A-Za-z0-9_]\{1,\}\)$/\1/p' \
            | tr 'A-Z' 'a-z' | sort | uniq -c | sort -rn)
   [[ -n "$ranked" ]] || return 1
+  local lang
   while read -r n ext; do
     [[ -n "$ext" ]] || continue
-    case "$ext" in
-      cs)             echo csharp;     return 0 ;;
-      java)           echo java;       return 0 ;;
-      kt|kts)         echo kotlin;     return 0 ;;
-      ts|tsx)         echo typescript; return 0 ;;
-      js|jsx|mjs|cjs) echo javascript; return 0 ;;
-      py)             echo python;     return 0 ;;
-      go)             echo go;         return 0 ;;
-      rs)             echo rust;       return 0 ;;
-    esac
+    if lang=$(ext_language "$ext"); then printf '%s\n' "$lang"; return 0; fi
   done <<EOF
 $ranked
 EOF
@@ -978,9 +1009,11 @@ EOF
 # Split out of require_serena_toolchain so a caller can offer a fallback instead
 # of only refusing -- installing the SDK is not a fix for every repo, and where
 # it is not, refusing was cs's ONLY answer.
-serena_missing_toolchain() {  # <repo-dir>
+serena_missing_toolchain() {  # <repo-dir> [symbol]
   local lang tc
-  lang=$(repo_language "$1") || return 1
+  # The symbol's language first; the repo census only as a fallback.
+  if [[ -n "${2:-}" ]]; then lang=$(symbol_language "$2" "$1") || lang=""; fi
+  [[ -n "${lang:-}" ]] || lang=$(repo_language "$1") || return 1
   tc=$(language_toolchain "$lang") || return 1
   have_toolchain "$tc" && return 1
   printf '%s\n' "$tc"
@@ -1021,7 +1054,8 @@ tokensave_graph_age_days() {
 
 require_serena_toolchain() {
   local sub="$1" sym="$2" repo="$3" dir="$4" lang tc
-  if ! lang=$(repo_language "$dir"); then
+  lang=$(symbol_language "$sym" "$dir") || lang=""
+  if [[ -z "$lang" ]] && ! lang=$(repo_language "$dir"); then
     warn "could not tell what language $repo is written in — if Serena cannot load it, an empty result here would look like a clean negative (cs why resolved)"
     return 0
   fi
@@ -1041,7 +1075,7 @@ require_serena_toolchain() {
   check:      cs engines   (per-kind availability, including this)
   where the toolchain cannot be installed at all (.NET Framework is Windows-only
   to build), a tokensave graph answers cs impls without one:
-    cd $repo && tokensave init
+    cd $repo && tokensave init$(tokensave_graph_at "$dir" && printf '\n  NOTE: %s already has a graph — rerun with --engine=tokensave to use it' "$repo")
   weaker but available now:
     cs def $sym $repo      (structural: ctags, matches spelling not identity)
     cs uses '$sym'         (heuristic: text, comments filtered — cs why heuristic)"
@@ -2183,10 +2217,31 @@ cmd_impls() {
   require_python3 impls "driving the language server and formatting its answer"
   local repo_dir="$view/$2" file="${3:-}"
   [[ -d "$repo_dir" ]] || die "no such repo: $2"
+  # An explicit --engine is an instruction, not a hint. It used to be read only
+  # by cs def, so `cs impls X repo --engine=tokensave` was ACCEPTED and
+  # DISCARDED -- and the refusal that followed looked exactly like the graph had
+  # been asked and had nothing. That is worse than not offering the flag.
+  case "${force_engine:-}" in
+    tokensave)
+      have_tokensave || die "--engine=tokensave requested but tokensave is not installed"
+      tokensave_graph_at "$repo_dir" || die "--engine=tokensave requested but $2 has no graph
+  build one with: cd $repo_dir && tokensave init"
+      impls_via_tokensave "$1" "$2" "$repo_dir" "explicitly requested"
+      return $? ;;
+    serena|lsp) ;;   # the default route below
+    "") ;;
+    *) die "cs impls has no engine named '$force_engine'
+  it answers from: serena (language server) or tokensave (graph)
+  a request for an engine that cannot serve this subcommand is dropped silently
+  otherwise, which is indistinguishable from that engine finding nothing" ;;
+  esac
   # Routing, in order of answer strength: a language server when it can run, a
-  # graph when it cannot, and a refusal only when neither is available.
+  # graph when it cannot, and a refusal only when neither is available. The
+  # toolchain question is asked about THIS SYMBOL's language, not the repo's
+  # plurality one -- a mixed repo that is mostly JS with a large C# component
+  # reported `javascript`, found node, and never reached the graph.
   local _missing_tc
-  if _missing_tc=$(serena_missing_toolchain "$repo_dir"); then
+  if _missing_tc=$(serena_missing_toolchain "$repo_dir" "$1"); then
     if have_tokensave && tokensave_graph_at "$repo_dir"; then
       impls_via_tokensave "$1" "$2" "$repo_dir" "$_missing_tc"
       return $?
@@ -2221,7 +2276,17 @@ if pick:
   # A REFUSAL, not a zero-hit answer: find_implementations was never called, so
   # no implementation was ruled out. It reported the same exit code as a real
   # empty result set, which is the distinction this whole taxonomy turns on.
+  #
+  # But a language server that was pointed at the wrong language and found
+  # nothing is not evidence either, and dying here with a usable graph sitting
+  # untouched is a working engine never being asked. So the graph gets the
+  # question before the refusal does.
   if [[ -z "$name_path" || -z "$rel" ]]; then
+    if have_tokensave && tokensave_graph_at "$repo_dir"; then
+      warn "the language server could not locate '$1' in $2 — falling back to the tokensave graph"
+      impls_via_tokensave "$1" "$2" "$repo_dir" "the language server did not resolve it"
+      return $?
+    fi
     err "could not locate symbol '$1' in $2 — find_implementations was not run, so nothing was ruled out"
     hint "cs def $1 $2            (check the symbol exists and how it is spelled)"
     return $CS_EXIT_REFUSED
@@ -2265,6 +2330,17 @@ cmd_refs() {
   require_python3 refs "driving the language server and formatting its answer"
   local repo_dir="$view/$2"
   [[ -d "$repo_dir" ]] || die "no such repo: $2"
+  # Same rule as cs impls: an --engine cs refs cannot honour is rejected rather
+  # than dropped. There is no alternative engine here -- a graph records no
+  # references and cannot bridge a DI registration -- so anything but serena is
+  # an error, and silence would look like that engine having found nothing.
+  case "${force_engine:-}" in
+    ""|serena|lsp) ;;
+    *) die "cs refs has no engine named '$force_engine'
+  only a language server resolves references, and it is the one thing here that
+  bridges a DI registration — a tokensave graph does not record them
+  for a graph-backed answer to a narrower question, use: cs impls $1 $2 --engine=tokensave" ;;
+  esac
   # Before `answer resolved` is set, and before the server is started: uvx,
   # python3 and the repo directory all passing says nothing about whether this
   # language can be loaded at all.

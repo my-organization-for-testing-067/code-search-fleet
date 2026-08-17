@@ -402,6 +402,10 @@ installed.
   server needs (C# → `dotnet`, Java/Kotlin → `java`, TS/JS → `node`) and refuse
   when it is absent — **unless** a tokensave graph exists for that repo, in
   which case `cs impls` falls back to it and labels the answer `structural`.
+  The toolchain question is asked about the **symbol's** language (found via the
+  ctags index), not the repo's most-common one, so a mostly-JavaScript repo with
+  a C# component still routes correctly. `--engine=tokensave` forces the graph;
+  an `--engine` a subcommand cannot serve is refused rather than ignored.
   That matters for code where the toolchain cannot be installed at all: .NET
   Framework C# is Windows-only to build, so on macOS or Linux `resolved` is
   unavailable *by construction* there. A graph answer is weaker in a specific
