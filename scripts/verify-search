@@ -1934,6 +1934,236 @@ else
   fail=$((fail + 1)); failed_ids+=("porcelain-escaping")
 fi
 
+# ---- the MCP surface -------------------------------------------------------
+# scripts/cs-mcp exposes the same subcommands over MCP, as an additional
+# surface. It is a second door to the same engine room, and the danger of a
+# second door is that it can be built without the lock the first one has.
+#
+# The specific lock: `cs` resolves the ticket workspace from $PWD, which is
+# right for a CLI and meaningless for a long-lived server whose cwd is wherever
+# the client launched it. Inheriting that cwd would make every MCP query a
+# silent fleet-only search -- an answer from main while the user edits a
+# branch, with none of the provenance that makes the substitution visible.
+# That is the exact failure the layering exists to prevent, arriving through a
+# new door, so the checks below are mostly about scope rather than about hits.
+info ""
+info "${C_BOLD}MCP surface${C_OFF}"
+
+# One or more JSON-RPC lines in, one digest line per response out:
+# "ok|isError|meta|ERROR<TAB><the text, newlines collapsed>".
+# The tickets root is an ARGUMENT, not inherited: a `VAR=x cmd | other` prefix
+# reaches only the left-hand side of the pipeline, and the server is on the
+# right. Getting that wrong would have left the ticket checks below passing
+# against a workspace root that was never configured.
+mcp_drive() {  # mcp_drive <cwd> [tickets-root] ; requests on stdin
+  local wd="$1" troot="${2:-}"
+  (cd "$wd" && TICKETS_ROOT="$troot" "$here/cs-mcp" 2>/dev/null) | python3 -c '
+import json, sys
+for line in sys.stdin:
+    d = json.loads(line)
+    r = d.get("result")
+    if r is None:
+        print("ERROR\t" + json.dumps(d.get("error")))
+    elif "content" in r:
+        print(("isError" if r.get("isError") else "ok") + "\t"
+              + " / ".join(r["content"][0]["text"].splitlines()))
+    else:
+        print("meta\t" + json.dumps(r))
+'
+}
+mcp_req() {  # mcp_req <tool> <json-arguments>
+  printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"%s","arguments":%s}}\n' "$1" "$2"
+}
+
+# The handshake, and a tool list that agrees with the CLI. A tool naming a
+# subcommand `cs` does not have is a surface that has drifted from the thing it
+# is a surface for, which is the failure mode of every facade over a facade.
+mcp_init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+mcp_list=$(printf '%s\n' "$mcp_init" | mcp_drive "$FLEET_ROOT")
+if printf '%s' "$mcp_list" | CS_HERE="$here" python3 -c '
+import json, subprocess, sys, os
+lines = [l for l in sys.stdin.read().splitlines() if l.startswith("meta\t")]
+assert len(lines) == 2, "expected an initialize and a tools/list result"
+init = json.loads(lines[0].split("\t", 1)[1])
+assert init["protocolVersion"], "no protocol version"
+assert init["serverInfo"]["name"], "no server name"
+# The one place a search facade can announce itself from inside the tool list.
+assert "cs_scopes" in init["instructions"], "instructions do not point at cs_scopes"
+tools = json.loads(lines[1].split("\t", 1)[1])["tools"]
+assert len(tools) >= 15, "suspiciously few tools: %d" % len(tools)
+here = os.environ["CS_HERE"]
+usage = subprocess.run([here + "/cs", "--help"], capture_output=True, text=True).stdout
+for t in tools:
+    sub = t["name"][3:]
+    assert t["name"].startswith("cs_"), t["name"]
+    assert ("cs " + sub) in usage, "tool %s names a subcommand cs does not document" % t["name"]
+    assert t["description"].strip(), "%s has no description" % t["name"]
+' 2>/dev/null; then
+  ok "the MCP server hands back a tool list that agrees with cs --help"
+  pass=$((pass + 1))
+else
+  err "the MCP handshake or tool list did not match the CLI"
+  fail=$((fail + 1)); failed_ids+=("mcp-tools-list")
+fi
+
+# The design constraint, asserted structurally rather than hoped for. Every
+# tool that READS the fleet must make scope required; the four that only
+# explain the tool must not, or asking "which scopes exist" would itself need
+# a scope.
+if printf '%s' "$mcp_list" | CS_HERE="$here" python3 -c '
+import json, sys
+lines = [l for l in sys.stdin.read().splitlines() if l.startswith("meta\t")]
+tools = json.loads(lines[1].split("\t", 1)[1])["tools"]
+explainers = {"cs_scopes", "cs_which", "cs_why", "cs_engines"}
+for t in tools:
+    req = t["inputSchema"].get("required", [])
+    if t["name"] in explainers:
+        assert "scope" not in req, "%s should not need a scope" % t["name"]
+    else:
+        assert "scope" in req, "%s does not require a scope" % t["name"]
+' 2>/dev/null; then
+  ok "every fleet-reading MCP tool requires an explicit scope"
+  pass=$((pass + 1))
+else
+  err "an MCP tool reads the fleet without requiring a scope"
+  fail=$((fail + 1)); failed_ids+=("mcp-scope-required")
+fi
+
+# A tool call with no scope must REFUSE, not fall back. A client that does not
+# enforce `required` is the case this guards: the schema alone is a request,
+# not a lock.
+mcp_noscope=$(mcp_req cs_uses '{"query":"orders.reserved.v1"}' | mcp_drive "$FLEET_ROOT")
+if printf '%s' "$mcp_noscope" | grep -q '^isError' \
+   && printf '%s' "$mcp_noscope" | grep -qi 'scope is required'; then
+  ok "an MCP call with no scope refuses instead of searching the fleet"
+  pass=$((pass + 1))
+else
+  err "an MCP call with no scope did not refuse: $mcp_noscope"
+  fail=$((fail + 1)); failed_ids+=("mcp-noscope-refusal")
+fi
+
+# cs's central distinction has to survive the new surface: a refusal and an
+# honest zero are opposite facts, and over MCP the only channel for that is
+# isError. Collapsing them would make "nothing uses this" and "this did not
+# run" the same result -- the manufactured negative, one layer up.
+mcp_zero=$(mcp_req cs_uses '{"query":"zzz-no-such-token-anywhere","scope":"fleet"}' | mcp_drive "$FLEET_ROOT")
+mcp_refuse=$(mcp_req cs_uses '{"query":"x","scope":"NO-SUCH-WORKSPACE"}' | mcp_drive "$FLEET_ROOT")
+if printf '%s' "$mcp_zero" | grep -q '^ok' \
+   && printf '%s' "$mcp_zero" | grep -q 'search RAN' \
+   && printf '%s' "$mcp_refuse" | grep -q '^isError' \
+   && printf '%s' "$mcp_refuse" | grep -q 'REFUSED'; then
+  ok "over MCP a zero-hit answer is not an error, and a refusal is"
+  pass=$((pass + 1))
+else
+  err "MCP collapsed the refusal / zero-hit distinction"
+  fail=$((fail + 1)); failed_ids+=("mcp-refusal-vs-zero")
+fi
+
+# A scope is interpolated into a cs argument, so anything that is not a
+# workspace name has to be rejected before it gets there.
+mcp_bad=$(mcp_req cs_uses '{"query":"x","scope":"../../etc"}' | mcp_drive "$FLEET_ROOT")
+if printf '%s' "$mcp_bad" | grep -q '^isError'; then
+  ok "a scope that is not a workspace name is rejected"; pass=$((pass + 1))
+else
+  err "a path-shaped scope was passed through to cs"
+  fail=$((fail + 1)); failed_ids+=("mcp-scope-validation")
+fi
+
+# THE cwd CHECK, as a DIFFERENTIAL: the same request is issued twice, from two
+# working directories -- one of them inside a ticket workspace -- and the two
+# answers must be identical.
+#
+# Asserted this way rather than as "launched in a workspace, does not leak it",
+# because that weaker form passes for the wrong reason. `--fleet` short-circuits
+# the workspace lookup inside cs before $PWD is ever consulted, so as long as a
+# scope flag is passed at all the cwd cannot leak, and the check would hold up
+# just as well for a server that had no cwd protection whatsoever.
+#
+# The regression actually worth catching is a future scope argument that
+# becomes optional and falls back to detection -- at which point these two runs
+# diverge, one silently layering a ticket nobody asked for. The differential
+# fails then; the weaker form would not.
+mcp_tickets=$(mktemp -d)
+mkdir -p "$mcp_tickets/MCP-1"
+mcp_wt_ok=1
+git -C "$FLEET_ROOT/inventory-api-dotnet" worktree add --quiet \
+    "$mcp_tickets/MCP-1/inventory-api-dotnet" -b verify/mcp >/dev/null 2>&1 || mcp_wt_ok=0
+if [[ $mcp_wt_ok -eq 1 ]]; then
+  wt="$mcp_tickets/MCP-1/inventory-api-dotnet"
+  perl -pi -e 's/\[HttpPost\("reserve"\)\]/[HttpPost("mcp-cwd-probe")]/' \
+      "$wt/src/Controllers/ReservationController.cs"
+
+  from_ticket_dir=$(mcp_req cs_text '{"pattern":"mcp-cwd-probe","scope":"fleet"}' \
+    | mcp_drive "$mcp_tickets/MCP-1" "$mcp_tickets")
+  from_fleet_dir=$(mcp_req cs_text '{"pattern":"mcp-cwd-probe","scope":"fleet"}' \
+    | mcp_drive "$FLEET_ROOT" "$mcp_tickets")
+  if [[ "$from_ticket_dir" == "$from_fleet_dir" ]] \
+     && ! printf '%s' "$from_ticket_dir" | grep -q 'inventory-api-dotnet/src' \
+     && printf '%s' "$from_ticket_dir" | grep -q 'searching: fleet'; then
+    ok "the MCP server's working directory does not change its answer"
+    pass=$((pass + 1))
+  else
+    err "the MCP server answered differently from inside a ticket workspace"
+    fail=$((fail + 1)); failed_ids+=("mcp-cwd-not-inherited")
+  fi
+
+  # The backstop behind the differential above, asserted directly because it
+  # cannot be asserted indirectly. While every tool requires a scope, cs never
+  # consults $PWD and so pinning the subprocess's cwd changes no answer -- it
+  # only matters on the day the scope argument stops being required, which is
+  # precisely when nobody will be looking. --self-check reports the cwd it uses
+  # so that the guard is visible while it is still doing nothing.
+  self_check=$(cd "$mcp_tickets/MCP-1" && TICKETS_ROOT="$mcp_tickets" \
+               "$here/cs-mcp" --self-check 2>&1)
+  if printf '%s' "$self_check" | grep -q "cs cwd: /  " \
+     && ! printf '%s' "$self_check" | grep -q "cs cwd: $mcp_tickets"; then
+    ok "cs subprocesses are pinned away from the server's own directory"
+    pass=$((pass + 1))
+  else
+    err "the MCP server would run cs in its own working directory: $self_check"
+    fail=$((fail + 1)); failed_ids+=("mcp-cwd-pinned")
+  fi
+
+  # And the layering still WORKS when it is asked for by name -- the other half
+  # of the same property. A server that simply never layers is not fixed, it is
+  # broken in the safe direction, and would answer from main forever.
+  named=$(mcp_req cs_text '{"pattern":"mcp-cwd-probe","scope":"MCP-1"}' \
+    | mcp_drive "$FLEET_ROOT" "$mcp_tickets")
+  if printf '%s' "$named" | grep -q 'inventory-api-dotnet' \
+     && printf '%s' "$named" | grep -q 'searching: MCP-1 (1 repo(s), your branch)'; then
+    ok "a named MCP scope layers the ticket and says so in the result"
+    pass=$((pass + 1))
+  else
+    err "a named MCP scope did not layer the ticket: $named"
+    fail=$((fail + 1)); failed_ids+=("mcp-named-scope-layers")
+  fi
+
+  git -C "$FLEET_ROOT/inventory-api-dotnet" worktree remove --force \
+      "$mcp_tickets/MCP-1/inventory-api-dotnet" >/dev/null 2>&1 || true
+  git -C "$FLEET_ROOT/inventory-api-dotnet" branch -D verify/mcp >/dev/null 2>&1 || true
+else
+  skip "MCP cwd isolation" "could not create git worktrees here"
+fi
+rm -rf "$mcp_tickets"
+
+# stdout belongs to the JSON-RPC stream. One stray print corrupts it, and the
+# client reports the server as broken rather than as noisy -- a failure that
+# looks nothing like its cause. Asserted over a call that produces plenty of
+# stderr, which is where all of cs's own output lives.
+mcp_stream=$(mcp_req cs_engines '{}' | (cd "$FLEET_ROOT" && "$here/cs-mcp" 2>/dev/null))
+if printf '%s' "$mcp_stream" | python3 -c '
+import json, sys
+lines = [l for l in sys.stdin.read().splitlines() if l.strip()]
+assert len(lines) == 1, "expected exactly one line on stdout, got %d" % len(lines)
+json.loads(lines[0])
+' 2>/dev/null; then
+  ok "the MCP server keeps stdout to the protocol alone"; pass=$((pass + 1))
+else
+  err "something other than JSON-RPC reached the MCP server's stdout"
+  fail=$((fail + 1)); failed_ids+=("mcp-stdout-clean")
+fi
+
 info ""
 if [[ $skipped -gt 0 ]]; then
   info "${C_BOLD}$pass passed, $fail failed, $skipped skipped${C_OFF}"

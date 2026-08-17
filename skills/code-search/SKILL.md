@@ -85,6 +85,7 @@ Run `cs which` for this table at any time.
 | Who to ask about this repo or file | `cs owns [repo\|repo/path]` |
 | When a seam appeared, or last changed | `cs history <string> [repo]` |
 | What is actually being searched right now | `cs repos` |
+| Which workspaces there are to search at all | `cs scopes` |
 
 **Start cheap.** `cs uses`, `cs def`, and `cs seam` answer in well under a
 second. `cs impls` and `cs refs` start language servers and take minutes on a
@@ -213,12 +214,18 @@ object. Everything you would otherwise have to scrape off stderr is a field:
 cs uses '/api/v1/inventory/reserve' --porcelain
 ```
 ```json
-{"cs":1,"subcommand":"uses","exit":0,"refused":false,"reason":null,
- "kind":"heuristic","engine":"ripgrep","note":"literal, prose filtered",
- "hits":2,"repos":2,"degraded":null,"partial":false,"truncated":false,
- "returned":2,"engine_errors":[],"hints":[],
+{"cs":1,"subcommand":"uses","query":"…","scope":"PROJ-123",
+ "view":"PROJ-123 (2 repo(s), your branch) + fleet (8 repo(s), main)",
+ "exit":0,"refused":false,"reason":null,"kind":"heuristic",
+ "engine":"ripgrep","note":"literal, prose filtered","hits":2,"repos":2,
+ "degraded":null,"partial":false,"truncated":false,"returned":2,
+ "engine_errors":[],"hints":[],
  "results":[{"repo":"…","path":"…","line":7,"text":"…"}]}
 ```
+
+`view` is the `searching:` line as a field, and `scope` the workspace it
+resolved to (or `"fleet"`) — so a caller that asked for a named workspace can
+check it got that one rather than main.
 
 Refusals emit the envelope too, with `refused: true` and the reason — that is
 the case with no result stream to attach anything to, and the one you most need
@@ -275,6 +282,11 @@ themselves.
 
 Always read the `searching:` line before trusting a layered answer. If it is
 absent, no ticket was layered and every hit came from the fleet.
+
+`cs scopes` lists the fleet and every ticket workspace with its repo count. Use
+it when you are **not** standing in a workspace — the layering is resolved from
+the working directory, so anything invoking `cs` from somewhere else has to
+choose a scope explicitly rather than let it be inferred.
 
 ## The distinctions that matter
 

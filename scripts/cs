@@ -38,6 +38,7 @@
 #   cs refs   <symbol> <repo> <file>   references to a symbol (LSP)
 #   cs history <string> [repo]     when a seam entered or left history (git -S)
 #   cs repos                       what is in the current view, and from where
+#   cs scopes                      which workspaces exist to be searched
 #   cs which                       decision table: which subcommand answers what
 #   cs why    [kind]               what each kind of answer cannot see
 #   cs engines                     which engines are available here
@@ -89,11 +90,14 @@
 # checked, so 2 means the search actually ran.
 #
 # --porcelain / CS_JSON=1 puts the same facts on stdout as one JSON object:
-#   {"cs":1,"subcommand":…,"exit":…,"refused":…,"reason":…,"kind":…,"engine":…,
-#    "note":…,"hits":…,"repos":…,"degraded":…,"partial":…,"truncated":…,
-#    "returned":…,"engine_errors":[…],"hints":[…],"results":[…]}
+#   {"cs":1,"subcommand":…,"query":…,"scope":…,"view":…,"exit":…,"refused":…,
+#    "reason":…,"kind":…,"engine":…,"note":…,"hits":…,"repos":…,"degraded":…,
+#    "partial":…,"truncated":…,"returned":…,"engine_errors":[…],"hints":[…],
+#    "results":[…]}
 # `hits` is how many exist and `returned` how many are in `results`; comparing
-# them is how a caller sees a cap without reading a stderr warning.
+# them is how a caller sees a cap without reading a stderr warning. `view` is
+# the `searching:` provenance line, and `scope` the workspace id (or "fleet")
+# it resolved to -- so a caller can assert it got the scope it asked for.
 #
 # Requires: python3 (uses, provides, deps, publishes, versions, owns, impls,
 # refs). Everything else is optional -- `cs engines` reports what is present,
@@ -261,6 +265,26 @@ ticket_root="${TICKET_ROOT:-}"
 # be reported as "no such workspace" rather than quietly becoming a fleet search.
 ticket_id=""
 layer_note=""
+# The provenance line, as DATA. layer_note drives the `searching:` line on
+# stderr and is deliberately empty when nothing is layered, because a human
+# standing in a directory does not need to be told which directory. A caller
+# reading the envelope has no such context -- it did not choose the working
+# directory and cannot see it -- so these two are always populated, even for an
+# unlayered fleet search. CS_SCOPE is the machine-checkable half: a caller that
+# asked for a named workspace can assert it got that workspace rather than main.
+CS_VIEW=""
+CS_SCOPE=""
+
+# How many repos the fleet root holds. build_view counts these as a side effect
+# on the layered path; the other two paths need the same number and had nothing
+# to say about the size of what they searched.
+count_fleet_repos() {
+  local d n=0
+  for d in "$root"/*/; do
+    [[ -d "$d" ]] && is_repo "${d%/}" && n=$((n + 1))
+  done
+  printf '%s' "$n"
+}
 
 # common.sh's die() is the single refusal path, and porcelain needs the reason
 # it carried -- a refusal is the outcome a caller most needs to detect, and the
@@ -286,6 +310,12 @@ cs_emit_porcelain() {
   printf '"cs":1,'
   printf '"subcommand":%s,' "$(json_str "$CS_SUB")"
   printf '"query":%s,'      "$(json_str "$CS_QUERY")"
+  # WHAT was searched, next to what was asked. A result whose scope is invisible
+  # is the failure this layering exists to prevent, and stdout is the only
+  # channel a non-human caller reads -- the `searching:` line it would otherwise
+  # have to reconstruct is on stderr.
+  printf '"scope":%s,'      "$(json_str "$CS_SCOPE")"
+  printf '"view":%s,'       "$(json_str "$CS_VIEW")"
   printf '"exit":%s,'       "$rc"
   printf '"refused":%s,'    "$refused"
   if [[ -n "$CS_REFUSAL" ]]; then
@@ -393,10 +423,19 @@ resolve_explicit_ticket() {
 }
 
 build_view() {
-  [[ $fleet_only -eq 1 ]] && { layer_note="fleet only"; return; }
+  if [[ $fleet_only -eq 1 ]]; then
+    layer_note="fleet only ($(count_fleet_repos) repo(s), main)"
+    CS_VIEW="$layer_note"; CS_SCOPE="fleet"
+    return
+  fi
   resolve_explicit_ticket
-  detect_ticket || return 0
-  [[ -d "$ticket_root" ]] || return 0
+  # No workspace to layer. Nothing is printed for this case -- see layer_note
+  # above -- but the envelope still has to say what was searched.
+  if ! detect_ticket || [[ ! -d "$ticket_root" ]]; then
+    CS_VIEW="fleet ($(count_fleet_repos) repo(s), main) — no ticket workspace layered"
+    CS_SCOPE="fleet"
+    return 0
+  fi
 
   view_tmp=$(mktemp -d)
   view="$view_tmp"
@@ -421,6 +460,7 @@ build_view() {
     ln -s "${d%/}" "$view/$name" && n_fleet=$((n_fleet + 1))
   done
   layer_note="$(basename "$ticket_root") ($n_ticket repo(s), your branch) + fleet ($n_fleet repo(s), main)"
+  CS_VIEW="$layer_note"; CS_SCOPE="$(basename "$ticket_root")"
 }
 
 announce_view() {
@@ -1621,6 +1661,7 @@ Which version does each repo pin?                cs versions [coordinate]
 Who owns this repo, or this file?                cs owns [repo|repo/path]
 When did this seam appear, or last change?       cs history <string> [repo]
 What am I actually searching right now?           cs repos
+Which workspaces are there to search at all?     cs scopes
 How much should I trust this answer?             cs why [kind]
 
 Two same-named symbols in different repos: resolve the dependency first, then
@@ -2489,6 +2530,54 @@ cmd_repos() {
   return 0
 }
 
+# Which scopes exist to be searched -- the fleet, and every ticket workspace.
+#
+# `cs repos` answers "what am I searching right now", which presumes a right
+# now: it reads $PWD to find the workspace. A caller that does not HAVE a
+# meaningful working directory -- the MCP server in scripts/cs-mcp is the
+# motivating one, but any daemon or CI job is the same -- cannot use that. It
+# has to name a scope on every call, and so it first has to be able to find out
+# which names are valid. Listing them is the difference between an explicit
+# scope argument and a guess.
+#
+# Exempt from require_fleet, for the same reason `cs engines` is: reporting
+# that the fleet root is empty or absent is half of what this command is for.
+cmd_scopes() {
+  local d name n
+  printf '%-32s %5s  %s\n' "SCOPE" "REPOS" "PATH"
+  if [[ -d "$root" ]]; then
+    printf '%-32s %5s  %s\n' "fleet" "$(count_fleet_repos)" "$root"
+  else
+    printf '%-32s %5s  %s\n' "fleet" "-" "$root (does not exist)"
+  fi
+  local troot="${TICKETS_ROOT:-}" listed=0
+  if [[ -n "$troot" && -d "$troot" ]]; then
+    for d in "$troot"/*/; do
+      [[ -d "$d" ]] || continue
+      name=$(basename "$d")
+      n=0
+      local w
+      for w in "$d"*/; do [[ -d "$w" ]] && is_repo "${w%/}" && n=$((n + 1)); done
+      printf '%-32s %5s  %s\n' "$name" "$n" "${d%/}"
+      listed=$((listed + 1))
+    done
+  fi
+  printf '\n'
+  # A workspace that holds no repos layers nothing, so a query naming it is
+  # answered entirely from the fleet. That is legitimate but it is not what the
+  # caller asked for, and `cs` says so at query time -- said here too, because
+  # this is where the scope gets chosen.
+  if [[ $listed -eq 0 ]]; then
+    if [[ -z "$troot" || ! -d "$troot" ]]; then
+      warn "no ticket workspaces: TICKETS_ROOT is ${troot:-unset}${troot:+ and does not exist}"
+    else
+      info "no ticket workspaces under $troot — every scope is the fleet"
+    fi
+  fi
+  info "search one with: cs --ticket=<scope> <subcommand> …, or cs --fleet for the fleet alone"
+  return 0
+}
+
 cmd_why() {
   if [[ $# -ge 1 ]]; then
     blind_spots "$1" || die "unknown answer kind: $1 (resolved, declared, structural, historical, heuristic, textual)"
@@ -2589,11 +2678,11 @@ CS_SUB="$sub"; CS_QUERY="${1:-}"
 # it would have used.
 case "$sub" in
   which|why|-h|--help|help) ;;
-  engines) [[ -d "$root" ]] || warn "fleet root does not exist yet: $root" ;;
+  engines|scopes) [[ -d "$root" ]] || warn "fleet root does not exist yet: $root" ;;
   *) require_fleet ;;
 esac
 build_view
-case "$sub" in engines|which|why|repos|-h|--help|help) ;; *) announce_view ;; esac
+case "$sub" in engines|which|why|repos|scopes|-h|--help|help) ;; *) announce_view ;; esac
 case "$sub" in
   text)    cmd_text "$@" ;;
   seam)    cmd_seam "$@" ;;
@@ -2609,6 +2698,7 @@ case "$sub" in
   refs)    cmd_refs "$@" ;;
   history) cmd_history "$@" ;;
   repos)   cmd_repos ;;
+  scopes)  cmd_scopes ;;
   which)   cmd_which ;;
   why)     cmd_why "$@" ;;
   engines) cmd_engines ;;

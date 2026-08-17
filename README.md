@@ -64,6 +64,7 @@ than a wrong one, because nothing reports it. `brew install coreutils` on macOS.
 | Who to ask about this repo or file | `cs owns [repo\|repo/path]` |
 | When a seam appeared, or last changed | `cs history <string> [repo]` |
 | What is actually being searched | `cs repos` |
+| Which workspaces there are to search | `cs scopes` |
 | How much to trust an answer | `cs why [kind]` |
 
 ## Every answer says what kind of answer it is
@@ -169,16 +170,24 @@ answer kind and the four warnings that must not be swallowed. `--porcelain` (or
 `CS_JSON=1`) puts one JSON object on stdout instead of the result lines:
 
 ```json
-{"cs":1,"subcommand":"uses","exit":0,"refused":false,"kind":"heuristic",
- "engine":"ripgrep","hits":2,"repos":2,"degraded":null,"partial":false,
- "truncated":false,"returned":2,"engine_errors":[],
- "results":[{"repo":"…","path":"…","line":7,"text":"…"}]}
+{"cs":1,"subcommand":"uses","query":"…","scope":"PROJ-123",
+ "view":"PROJ-123 (2 repo(s), your branch) + fleet (8 repo(s), main)",
+ "exit":0,"refused":false,"kind":"heuristic","engine":"ripgrep","hits":2,
+ "repos":2,"degraded":null,"partial":false,"truncated":false,"returned":2,
+ "engine_errors":[],"results":[{"repo":"…","path":"…","line":7,"text":"…"}]}
 ```
 
 Refusals carry the envelope too, with `refused: true` and the reason — the case
 with no result stream to attach anything to. `hits` is how many exist and
 `returned` how many came back, so a cap is visible without reading a warning.
 stderr is untouched, so `--porcelain` composes with `--quiet`.
+
+`scope` and `view` are the `searching:` line as data. A human running `cs` knows
+which directory they are standing in; a caller reading the envelope chose
+neither the directory nor the layering and could not otherwise tell which of
+the two levels answered — so the provenance goes on stdout with everything else
+that decides what the result is worth, and a caller that asked for a named
+workspace can assert it got that workspace rather than `main`.
 
 ### And `cs engines` reports answer kinds, not just binaries
 
@@ -296,7 +305,9 @@ contain — the failure that makes renaming a shared route look safe.
 in, and **fails** if that workspace does not exist. Falling back to the fleet
 would be the same mistake inverted: you asked for your branch state and would
 have been handed main, with no `searching:` line to reveal the substitution.
-`--fleet` is how you ask for the fleet on purpose.
+`--fleet` is how you ask for the fleet on purpose, and `cs scopes` lists what
+there is to choose between — which is what anything calling `cs` without a
+working directory to stand in has to do first.
 
 ## Verifying
 
@@ -478,9 +489,11 @@ both numbers for the version you actually have installed — prefer it to this
 line, which is a snapshot: the always-on figure was ~150 before `cs owns` and
 `cs versions` needed announcing in the description.
 
-That split is the argument against exposing this over MCP instead: MCP tool
+That split is the argument against exposing this over MCP *instead*: MCP tool
 schemas sit in context for the whole session whether or not you search, so the
 8.2k would be permanent rather than on demand.
+
+It is not the argument against exposing it over MCP *as well* — see below.
 
 From a plain clone instead, symlink the skill:
 
@@ -491,6 +504,72 @@ ln -s "$PWD/skills/code-search" ~/.claude/skills/code-search
 Either way the skill resolves the CLI through `${CLAUDE_PLUGIN_ROOT}`, falling
 back to the checkout — the working directory is the user's project, so `cs` is
 never on a relative path.
+
+### Also available over MCP, opt-in
+
+The cost argument above — schemas are permanent, the skill body is on demand —
+assumed a client that inlines every tool schema at session start. That is still
+true of some, and there the objection stands unchanged. It is no longer true of
+clients that **defer** tool schemas: tools arrive as names only, and a schema is
+fetched when a tool is actually called. The standing cost there is a list of 19
+identifiers — smaller than the always-on skill description it partly duplicates.
+
+So `scripts/cs-mcp` exposes the same subcommands over MCP, and it is **opt-in**
+rather than bundled with the plugin. A client that inlines schemas should not
+be made to pay for a surface that is only cheap somewhere else:
+
+```sh
+# $CS_ROOT as resolved under "Running the scripts from a terminal" above
+"$CS_ROOT/scripts/cs-mcp" --install     # prints the exact command, path resolved
+"$CS_ROOT/scripts/cs-mcp" --self-check  # can it reach cs and your fleet from here?
+"$CS_ROOT/scripts/cs-mcp" --tools       # the surface, without speaking the protocol
+```
+
+`--install` exists because the path is the whole difficulty: `CLAUDE_PLUGIN_ROOT`
+is unset in the shell where you actually run `claude mcp add`, and an installed
+plugin lives under a versioned cache directory nobody types from memory.
+
+What it buys over the CLI is **reachability**, not capability. A tool an agent
+must be told about is reached only when something remembers to tell it; a tool
+in the tool list is reached because it is there. Prose that has to be loaded
+first is the layer that fails. Measurement comes with it: usage rollups key on
+the `mcp__<server>__` tool-name prefix, so calls are counted by name rather than
+by matching the shape of a shell command — which undercounts precisely when
+someone invokes it in a way the matcher does not recognise, and an uncounted
+call is indistinguishable from non-use.
+
+#### Every tool requires an explicit scope
+
+This is the part that would otherwise break silently, so it is worth stating
+plainly. `cs` resolves the ticket workspace from `$PWD`. That is right for a
+CLI — you are standing in the workspace — and **meaningless for a server**,
+which is a long-lived process whose working directory is wherever the client
+launched it and which does not move when you do.
+
+A server that inherited that cwd would make every MCP query a silent fleet-only
+search: stale copies of the files you are editing, answered from `main`, with
+none of the `searching:` provenance that makes the substitution visible. That
+is the worst failure available here — a confident wrong answer arriving through
+a new door.
+
+So `scope` is a **required** argument on every tool that reads the fleet, with
+no default and no detection. `cs_scopes` lists the valid values, `"fleet"` is
+spelled out as one of them so that searching `main` alone is a choice rather
+than a fallback, and every result carries the same provenance line the CLI
+prints:
+
+```
+searching: PROJ-123 (2 repo(s), your branch) + fleet (8 repo(s), main)
+answer: heuristic via ripgrep (literal, prose filtered) · 2 hit(s) · 2 repo(s)
+```
+
+The refusal/zero-hit distinction survives the crossing too: a query that ran
+and found nothing comes back as a normal result saying so, and a query that did
+not run comes back with `isError` — the same two facts the exit codes carry,
+which would otherwise collapse into one at the boundary.
+
+`verify-search` covers all of this, including a differential that issues the
+same request from two working directories and requires the answers to match.
 
 ## License
 

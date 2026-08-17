@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+"""cs-mcp -- the `cs` CLI exposed over MCP, as an ADDITIONAL surface.
+
+Why this exists alongside the CLI rather than instead of it
+-----------------------------------------------------------
+The README's original argument against MCP was cost: tool schemas sit in
+context for the whole session whether or not you search, so an MCP surface for
+`cs` would have made the ~8.2k skill body permanent rather than on demand. That
+argument is still exactly right for a client that inlines every schema at
+session start, and this server does not repeal it.
+
+It is no longer the whole story for clients that DEFER tool schemas -- tools
+arrive as names only, and a schema is fetched when a tool is actually called.
+There the standing cost is a list of ~19 identifiers, which is smaller than the
+always-on skill description this partly duplicates.
+
+So: both surfaces, and neither is the default for everyone. The CLI stays the
+primary one and needs nothing installed. This server is opt-in (see README), so
+a client that inlines schemas is not made to pay for a surface that is only
+cheap somewhere else.
+
+What it buys, given the CLI already works
+-----------------------------------------
+Reachability. A tool an agent must be TOLD about is reached only when something
+remembers to tell it; a tool in the tool list is reached because it is there.
+That difference decides adoption independently of whether the tool is any good.
+The `instructions` field below is the whole point of the exercise -- it is the
+one place a search facade can say "start here" from inside the tool list.
+
+Measurability comes with it: usage rollups key on the `mcp__<server>__` prefix,
+so calls are countable by name rather than by matching the shape of a shell
+command, which undercounts precisely when someone invokes it a new way.
+
+THE TRAP: a server has no working directory worth reading
+---------------------------------------------------------
+`cs` resolves the ticket workspace from `$PWD`. That is right for a CLI -- you
+are standing in the workspace -- and meaningless for a server, which is a
+long-lived process whose cwd is wherever the client launched it and which does
+not move when the user does.
+
+Inherit that cwd and every MCP query silently becomes a fleet-only search: the
+ticket layer disappears, the answer comes from main while the user is editing a
+branch, and none of the `searching:` provenance that makes the scope visible is
+attached. A confident answer from the wrong scope is the exact failure the
+layering was built to prevent, and it would arrive through a brand new door.
+
+Two things stop that here, and they are deliberately belt-and-braces:
+
+  1. `scope` is a REQUIRED argument on every tool that reads the fleet. There
+     is no default and no detection. "fleet" is spelled out as a value, so
+     searching the fleet alone is a choice a caller makes rather than what it
+     gets by falling through.
+  2. `cs` is spawned with cwd="/", so even if (1) were bypassed there is no
+     ticket workspace under the working directory to be found. The failure
+     mode becomes a loud refusal instead of a quiet wrong scope.
+
+And every result carries the `view` provenance line the CLI prints on stderr,
+because a caller that names a scope must be able to see which scope answered.
+
+Transport: JSON-RPC 2.0 over newline-delimited stdio, stdlib only -- `cs` runs
+where python3 runs and nothing here should add an install step to that.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CS = os.path.join(HERE, "cs")
+
+# The working directory every cs subprocess is given -- see the module
+# docstring. Deliberately not the server's own, and deliberately a NAMED
+# constant reported by --self-check: while scope stays required this backstop
+# is unreachable, so nothing observes it, so nothing would notice it being
+# removed until the day something else regressed and it was needed. A defence
+# that cannot be inspected is one you find out about by not having it.
+CS_CWD = "/"
+
+# Newest first. An unknown version from the client is answered with our newest
+# rather than an error: the parts of the protocol this server uses (initialize,
+# tools/list, tools/call) have not changed across any of these.
+PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+
+# Long enough for a cold language server on a large repo, short enough that a
+# wedged engine returns an error instead of hanging the client forever. `cs`
+# has its own per-engine CS_TIMEOUT; this is the backstop for the whole call.
+CALL_TIMEOUT = int(os.environ.get("CS_MCP_TIMEOUT", "600"))
+
+# A scope is a directory name under TICKETS_ROOT, or the literal "fleet".
+# Anything else is rejected before it reaches `cs`, because a scope is
+# interpolated into an argument and a path separator or a leading dash would
+# make it something other than a workspace id.
+SCOPE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+# `cs` has no `--` end-of-options marker, so a positional argument spelled like
+# one of its flags would be eaten by the flag loop and silently change the
+# query. Caught here rather than producing an answer to a different question.
+CS_FLAGS = {
+    "--fleet", "--why", "--quiet", "-q", "--all", "--touched",
+    "--refresh", "--porcelain", "--json", "--word", "-w",
+}
+
+
+# ---- the tool surface ------------------------------------------------------
+# Named `cs_<subcommand>`, one per CLI subcommand, so the two surfaces cannot
+# drift into answering differently. Descriptions are one line: in a client that
+# defers schemas the name and this line are the entire standing cost, and the
+# schema below is fetched only when the tool is actually used.
+#
+# Flags that change the MEANING of an answer are exposed (`word`, `touched`).
+# Flags that only change presentation or the result cap are not -- `cs` reports
+# a cap in the result rather than making the caller pre-guess one.
+
+def arg(name, desc, required=True, type_="string", enum=None):
+    prop = {"type": type_, "description": desc}
+    if enum:
+        prop["enum"] = enum
+    return (name, prop, required)
+
+
+SCOPE_ARG = arg(
+    "scope",
+    'Which workspace to search: a ticket workspace id, or "fleet" for the '
+    "fleet alone. REQUIRED — this server is not running in your working "
+    "directory and cannot infer it. Call cs_scopes for the valid values. "
+    'Naming a ticket layers that ticket\'s branch state over the fleet; '
+    '"fleet" answers from main only.',
+)
+
+TOOLS = [
+    # --- the questions ------------------------------------------------------
+    ("cs_uses", "uses",
+     "Who uses this string in CODE across every repo — comments excluded. The "
+     "cross-repo caller question: start here for an endpoint, topic or config key.",
+     [arg("query", "The string to find: an endpoint path, topic name, config key."),
+      SCOPE_ARG]),
+
+    ("cs_seam", "seam",
+     "Which repos share this string, comments included — and warns when only "
+     "one does, which is how a dead seam looks.",
+     [arg("query", "The string that would form the seam."), SCOPE_ARG]),
+
+    ("cs_text", "text",
+     "Plain text or regex across every repo, comments included. The fallback "
+     "when no sharper question fits.",
+     [arg("pattern", "A literal string or regex."),
+      SCOPE_ARG,
+      arg("word", "Match whole identifiers only, not substrings of longer ones.",
+          required=False, type_="boolean")]),
+
+    ("cs_def", "def",
+     "Where a symbol is defined, across the fleet or within one repo.",
+     [arg("symbol", "The symbol name."),
+      SCOPE_ARG,
+      arg("repo", "Limit to this repo directory name.", required=False)]),
+
+    ("cs_calls", "calls",
+     "Structural search: call sites shaped like a pattern, or taking a literal "
+     "argument — finds what text search cannot express.",
+     [arg("pattern", "An ast-grep/semgrep pattern, e.g. 'foo($$$ARGS)'."),
+      SCOPE_ARG,
+      arg("language", "Restrict to one language, e.g. csharp, kotlin, python.",
+          required=False)]),
+
+    ("cs_impls", "impls",
+     "What implements this interface — resolved by a language server, the "
+     "strongest evidence available.",
+     [arg("symbol", "The interface or base type name."),
+      arg("repo", "The repo directory name holding it."),
+      SCOPE_ARG]),
+
+    ("cs_refs", "refs",
+     "What references this symbol, resolved by a language server — bridges "
+     "dependency injection that text search cannot follow.",
+     [arg("symbol", "The symbol name."),
+      arg("repo", "The repo directory name holding it."),
+      arg("file", "Path to the file declaring it, relative to the repo."),
+      SCOPE_ARG]),
+
+    ("cs_provides", "provides",
+     "Which repo publishes this package coordinate — read from build "
+     "manifests, not guessed from names.",
+     [arg("coordinate", "A package coordinate, e.g. com.acme:pricing-lib."),
+      SCOPE_ARG]),
+
+    ("cs_deps", "deps",
+     "Dependency edges between fleet repos, read from build manifests.",
+     [SCOPE_ARG,
+      arg("repo", "Limit to this repo's edges.", required=False)]),
+
+    ("cs_versions", "versions",
+     "Which version each repo pins for a shared package, and where they "
+     "disagree — the version-drift question.",
+     [SCOPE_ARG,
+      arg("coordinate", "A package coordinate; omit for every shared one.",
+          required=False)]),
+
+    ("cs_owns", "owns",
+     "Who CODEOWNERS names for this repo or path, across the fleet.",
+     [SCOPE_ARG,
+      arg("target", "A repo name, or repo/path; omit for every repo.",
+          required=False)]),
+
+    ("cs_publishes", "publishes",
+     "What each repo in the fleet publishes.",
+     [SCOPE_ARG]),
+
+    ("cs_history", "history",
+     "When a cross-repo seam entered or left history, across every repo, "
+     "ordered by date — answers 'what changed near this incident'.",
+     [arg("query", "The string whose history you want."),
+      SCOPE_ARG,
+      arg("repo", "Limit to one repo.", required=False),
+      arg("touched", "Include commits that modified a line containing it in "
+                     "place, not only those that added or removed it.",
+          required=False, type_="boolean")]),
+
+    # --- what am I searching, and how much is it worth ----------------------
+    ("cs_scopes", "scopes",
+     "Which workspaces exist to be searched — the fleet, and every ticket "
+     "workspace. Call this first: every other tool needs a scope.",
+     []),
+
+    ("cs_repos", "repos",
+     "Which repos a scope actually contains, and whether each came from the "
+     "ticket or the fleet.",
+     [SCOPE_ARG]),
+
+    ("cs_which", "which",
+     "Decision table: which cs tool answers which kind of question.",
+     []),
+
+    ("cs_why", "why",
+     "What a given kind of answer cannot see, and how much a NEGATIVE result "
+     "of that kind is worth.",
+     [arg("kind", "resolved, declared, structural, historical, heuristic, or "
+                  "textual; omit for the table.", required=False,
+          enum=["resolved", "declared", "structural", "historical",
+                "heuristic", "textual"])]),
+
+    ("cs_engines", "engines",
+     "Which engines and answer kinds are available on this machine — what the "
+     "negatives here are worth.",
+     []),
+]
+
+# The one place a search facade can tell an agent it exists, from inside the
+# tool list rather than from prose someone has to remember to load. Kept short:
+# it is standing context in every session this server is enabled for.
+INSTRUCTIONS = """\
+cs searches a fleet of repositories. Start with a cs_* tool for any question \
+that spans more than one repo — who calls an endpoint, where a symbol is \
+defined, what implements an interface, which repo publishes a package, who \
+owns it, which version each repo pins. Reach for grep only after cs.
+
+Every tool needs a `scope`: a ticket workspace id, or "fleet". This server has \
+no working directory to infer it from, and guessing would answer from main \
+while the user edits a branch. Call cs_scopes once to see the valid values.
+
+Every answer is labelled with the KIND of evidence behind it, which is what \
+decides how much a NEGATIVE is worth: a `resolved` no is strong, a `textual` \
+no is weak. Pass on the provenance line and any PARTIAL / degraded / truncated \
+warning rather than reporting the hits alone.\
+"""
+
+
+def tool_schema(spec):
+    name, sub, desc, args = spec
+    props, required = {}, []
+    for arg_name, prop, is_required in args:
+        props[arg_name] = prop
+        if is_required:
+            required.append(arg_name)
+    return {
+        "name": name,
+        "description": desc,
+        "inputSchema": {
+            "type": "object",
+            "properties": props,
+            "required": required,
+            "additionalProperties": False,
+        },
+    }
+
+
+BY_NAME = {spec[0]: spec for spec in TOOLS}
+
+
+# ---- running cs ------------------------------------------------------------
+
+def scope_flag(scope):
+    """The cs flag for a scope, or raise with a message the agent can act on."""
+    if not isinstance(scope, str) or not scope.strip():
+        raise ToolError(
+            "scope is required and was not given.\n"
+            "  This server has no working directory to infer a workspace from, so "
+            "answering anyway would search the fleet (main) while you may be asking "
+            "about a ticket branch — with nothing in the answer to reveal the "
+            "substitution.\n"
+            '  Pass scope="fleet" to search the fleet on purpose, or a ticket '
+            "workspace id. Call cs_scopes for the valid values."
+        )
+    scope = scope.strip()
+    if scope == "fleet":
+        return "--fleet"
+    if not SCOPE_RE.match(scope):
+        raise ToolError(
+            f"not a usable scope: {scope!r}\n"
+            "  A scope is a ticket workspace id (a single directory name under "
+            'TICKETS_ROOT) or the literal "fleet".\n'
+            "  Call cs_scopes for the valid values."
+        )
+    return "--ticket=" + scope
+
+
+class ToolError(Exception):
+    """A failure to report as an isError tool result, not a protocol error."""
+
+
+def run_cs(sub, argv, scope=None, flags=()):
+    """Run one cs subcommand and return its porcelain envelope as a dict.
+
+    --quiet as well as --porcelain: the human `answer:` line goes to stderr and
+    every fact on it is in the envelope, so printing it too would only mean
+    parsing back out what we already have structured.
+    """
+    for a in argv:
+        if a in CS_FLAGS or a.startswith("--ticket="):
+            raise ToolError(
+                f"argument {a!r} is spelled like a cs flag and would change the "
+                "query rather than be searched for.\n"
+                "  cs has no end-of-options marker. Search for it with cs_text "
+                "using a pattern that does not begin with a dash."
+            )
+    cmd = [CS, sub] + list(argv) + ["--porcelain", "--quiet"]
+    if scope is not None:
+        cmd.append(scope_flag(scope))
+    cmd.extend(flags)
+
+    env = dict(os.environ)
+    # The flag on the command line is the single source of truth for output
+    # mode; an inherited CS_JSON could otherwise turn porcelain on for a
+    # subprocess we then parse differently. (It is already on -- this is about
+    # not depending on the environment for it.)
+    env.pop("CS_JSON", None)
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=CS_CWD,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=CALL_TIMEOUT,
+        )
+    except FileNotFoundError:
+        raise ToolError(f"cs not found at {CS} — this server ships beside it")
+    except subprocess.TimeoutExpired:
+        raise ToolError(
+            f"cs did not finish within {CALL_TIMEOUT}s and was killed.\n"
+            "  Nothing was searched to completion, so nothing is ruled out. "
+            "Narrow the query, or raise CS_MCP_TIMEOUT."
+        )
+
+    out = proc.stdout.decode("utf-8", "replace").strip()
+    err = proc.stderr.decode("utf-8", "replace").strip()
+    try:
+        return json.loads(out)
+    except ValueError:
+        # cs emits its envelope from an EXIT trap, so no envelope means it died
+        # in a way that skipped the trap. That is not a zero-hit answer and must
+        # not be allowed to read like one.
+        tail = "\n".join(err.splitlines()[-15:]) or "(no output)"
+        raise ToolError(
+            f"cs exited {proc.returncode} without a result envelope, so this "
+            f"search did not run:\n{tail}"
+        )
+
+
+# The subcommands whose output is a TABLE, not a list of hits. They write it
+# straight to stdout rather than through cs's result buffer, so `--porcelain`
+# would put the table and the envelope on the same stream and neither would
+# parse. Their stdout is passed through as written instead.
+PLAIN_SUBS = {"which", "why", "engines", "scopes", "repos"}
+
+
+def run_cs_plain(sub, argv=(), scope=None):
+    """For the explain-yourself subcommands: prose about the tool, not answers
+    about the code.
+
+    `cs repos` is scoped like a real query even though it is one of these --
+    which repos it lists IS the scope, so asking it without one would describe
+    a view nobody searched.
+    """
+    cmd = [CS, sub] + list(argv)
+    if scope is not None:
+        cmd.append(scope_flag(scope))
+    try:
+        proc = subprocess.run(
+            cmd, cwd=CS_CWD, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=CALL_TIMEOUT,
+        )
+    except FileNotFoundError:
+        raise ToolError(f"cs not found at {CS} — this server ships beside it")
+    except subprocess.TimeoutExpired:
+        raise ToolError(f"cs {sub} did not finish within {CALL_TIMEOUT}s")
+    out = proc.stdout.decode("utf-8", "replace").rstrip()
+    err = proc.stderr.decode("utf-8", "replace").rstrip()
+    # These four write their diagnostics to stderr and their table to stdout,
+    # and for cs scopes and cs engines the stderr half carries the part a
+    # caller most needs -- "TICKETS_ROOT is unset", "this engine is missing".
+    if err:
+        out = (out + "\n\n" + err) if out else err
+    if proc.returncode != 0 and not out:
+        raise ToolError(f"cs {sub} exited {proc.returncode} with no output")
+    return out or "(no output)"
+
+
+# ---- rendering an answer ---------------------------------------------------
+
+def render(env):
+    """The envelope as text: provenance, kind, every warning, then the hits.
+
+    Deliberately not the raw JSON. The four warnings and the answer kind are
+    the parts a caller is most likely to drop, and burying them as sibling keys
+    of a results array is how they get dropped -- so they are put above the
+    results, in the order a reader would want them, and the results follow.
+    """
+    lines = []
+    if env.get("view"):
+        lines.append("searching: " + env["view"])
+
+    if env.get("refused"):
+        lines.append("")
+        lines.append("REFUSED — this search did not run, so nothing is ruled out.")
+        if env.get("reason"):
+            lines.append(env["reason"])
+        return "\n".join(lines), True
+
+    kind, engine = env.get("kind"), env.get("engine")
+    if kind:
+        line = f"answer: {kind} via {engine}"
+        if env.get("note"):
+            line += f" ({env['note']})"
+        for label, key in (("hit(s)", "hits"), ("repo(s)", "repos")):
+            if env.get(key) is not None:
+                line += f" · {env[key]} {label}"
+        lines.append(line)
+
+    # Everything that makes the result a subset of the truth, or worth less
+    # than it looks. Above the hits, because below them is where they get
+    # skimmed past.
+    warnings = []
+    if env.get("degraded"):
+        warnings.append("degraded: " + env["degraded"])
+    if env.get("partial"):
+        warnings.append(
+            "PARTIAL: an engine timed out or files could not be read — these "
+            "results are a subset of the truth, not a complete answer."
+        )
+    if env.get("truncated"):
+        warnings.append(
+            f"TRUNCATED: {env.get('returned')} of {env.get('hits')} hits shown. "
+            "Narrow the query to see the rest."
+        )
+    for e in env.get("engine_errors") or []:
+        warnings.append("engine error: " + e)
+    skipped = env.get("skipped") or []
+    if skipped:
+        shown = ", ".join(skipped[:5])
+        more = f" (+{len(skipped) - 5} more)" if len(skipped) > 5 else ""
+        warnings.append(f"could not read: {shown}{more}")
+    if env.get("exclusions"):
+        warnings.append("non-default exclusion list in force: " + env["exclusions"])
+    lines.extend(warnings)
+
+    results = env.get("results") or []
+    if results:
+        lines.append("")
+        for r in results:
+            if r.get("path"):
+                lines.append(f"{r['repo']}/{r['path']}:{r['line']}: {r['text']}")
+            else:
+                lines.append(r["text"])
+    else:
+        lines.append("")
+        # Exit 2, not exit 1: the search ran. Said in those words because the
+        # whole point of the exit-code split is that a caller must not read
+        # this as "the tool failed" OR as "definitely nothing exists".
+        lines.append(
+            "No hits. The search RAN and found nothing — this is an answer, not "
+            "a failure."
+        )
+        if kind:
+            lines.append(
+                f"How much that is worth depends on the kind: this was {kind}. "
+                f"Call cs_why with kind={kind!r} before concluding nothing exists."
+            )
+        for h in env.get("hints") or []:
+            lines.append("  try: " + h)
+
+    return "\n".join(lines), False
+
+
+# ---- dispatch --------------------------------------------------------------
+
+def positional(spec, arguments):
+    """The subcommand's positional arguments, in the order cs expects them.
+
+    cs's arguments are positional and order-dependent, and the schema above is
+    written in that same order -- so the order is read off the spec rather than
+    restated per tool, which is one fewer place for the two to disagree.
+    """
+    _, _, _, args = spec
+    argv, seen_gap = [], None
+    for arg_name, prop, is_required in args:
+        if arg_name == "scope" or prop.get("type") == "boolean":
+            continue
+        val = arguments.get(arg_name)
+        if val is None or val == "":
+            if is_required:
+                raise ToolError(f"{arg_name} is required")
+            # An optional positional cannot be skipped over: cs reads
+            # `cs def <symbol> [repo]` by position, so omitting an earlier one
+            # while giving a later one would silently shift every argument.
+            seen_gap = arg_name
+            continue
+        if seen_gap:
+            raise ToolError(
+                f"{arg_name} was given but {seen_gap} was not, and cs reads "
+                f"these by position — give {seen_gap} as well, or drop {arg_name}."
+            )
+        if not isinstance(val, str):
+            raise ToolError(f"{arg_name} must be a string")
+        argv.append(val)
+    return argv
+
+
+def call_tool(name, arguments):
+    spec = BY_NAME.get(name)
+    if spec is None:
+        raise ToolError(f"unknown tool: {name}")
+    _, sub, _, args = spec
+    arg_names = {a[0] for a in args}
+
+    # Reached through the same path as a bad scope, so the explanation is
+    # written once. A client that does not enforce `required` gets the same
+    # refusal as one that passes an empty string.
+    scope = arguments.get("scope") if "scope" in arg_names else None
+    if "scope" in arg_names:
+        scope_flag(scope)
+
+    if sub in PLAIN_SUBS:
+        return run_cs_plain(sub, positional(spec, arguments), scope=scope), False
+
+    flags = []
+    if arguments.get("word"):
+        flags.append("--word")
+    if arguments.get("touched"):
+        flags.append("--touched")
+
+    env = run_cs(sub, positional(spec, arguments), scope=scope, flags=flags)
+    return render(env)
+
+
+def handle(msg):
+    """One request in, one response out — or None for a notification."""
+    mid = msg.get("id")
+    method = msg.get("method")
+    params = msg.get("params") or {}
+
+    if mid is None:
+        return None  # a notification; notifications/initialized is the only one
+
+    if method == "initialize":
+        asked = params.get("protocolVersion")
+        version = asked if asked in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0]
+        return ok(mid, {
+            "protocolVersion": version,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "cs", "version": server_version()},
+            "instructions": INSTRUCTIONS,
+        })
+
+    if method == "ping":
+        return ok(mid, {})
+
+    if method == "tools/list":
+        return ok(mid, {"tools": [tool_schema(s) for s in TOOLS]})
+
+    if method == "tools/call":
+        name = params.get("name")
+        arguments = params.get("arguments") or {}
+        if name not in BY_NAME:
+            return error(mid, -32602, f"unknown tool: {name}")
+        try:
+            text, is_error = call_tool(name, arguments)
+        except ToolError as e:
+            text, is_error = str(e), True
+        except Exception as e:  # never take the transport down over one call
+            text, is_error = f"cs-mcp failed to run this query: {e}", True
+        return ok(mid, {"content": [{"type": "text", "text": text}],
+                        "isError": is_error})
+
+    return error(mid, -32601, f"method not found: {method}")
+
+
+def server_version():
+    """The plugin version, so a rollup can tell two deployments apart."""
+    try:
+        with open(os.path.join(HERE, "..", ".claude-plugin", "plugin.json")) as f:
+            return json.load(f).get("version", "0")
+    except Exception:
+        return "0"
+
+
+def ok(mid, result):
+    return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+
+def error(mid, code, message):
+    return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}}
+
+
+def main():
+    if "--tools" in sys.argv[1:]:
+        # For eyeballing the surface, and for verify-search: what a client
+        # would see, without having to speak the protocol to find out.
+        for spec in TOOLS:
+            req = [a[0] for a in spec[3] if a[2]]
+            print(f"{spec[0]:<14} cs {spec[1]:<10} "
+                  f"({', '.join(req) if req else 'no arguments'})")
+        return 0
+    if "--self-check" in sys.argv[1:]:
+        # Does the thing this server wraps actually work from HERE, with this
+        # server's environment and cwd? That is a different question from
+        # whether cs works in your shell, and it is the one that decides
+        # whether every tool call is about to refuse.
+        print("cs: %s" % CS)
+        print("cs cwd: %s   (this process is in %s)" % (CS_CWD, os.getcwd()))
+        try:
+            print(run_cs_plain("scopes"))
+        except ToolError as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        return 0
+    if "--install" in sys.argv[1:]:
+        # The absolute path is the whole difficulty. CLAUDE_PLUGIN_ROOT is set
+        # only inside a session, so the `$CLAUDE_PLUGIN_ROOT/scripts/…` form
+        # used everywhere else expands to `/scripts/…` in the shell where you
+        # actually run `claude mcp add` -- and an installed plugin lives under a
+        # versioned cache directory nobody types from memory. So the path is
+        # resolved by the thing that already knows it: this file.
+        print("claude mcp add cs -- " + os.path.abspath(__file__))
+        print()
+        print("Add --scope user to enable it everywhere, or --scope project to")
+        print("commit it for one repo. Remove it with: claude mcp remove cs")
+        return 0
+    if {"-h", "--help"} & set(sys.argv[1:]):
+        print(__doc__)
+        return 0
+
+    # stdout belongs to the protocol and nothing else: a stray print here
+    # corrupts the stream and the client sees the server as broken rather than
+    # as noisy. Everything diagnostic goes to stderr.
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            sys.stderr.write("cs-mcp: ignoring unparseable line\n")
+            continue
+        # 2025-03-26 allowed a batch; 2025-06-18 removed it. Accepted either
+        # way, since tolerating one costs three lines.
+        batch = msg if isinstance(msg, list) else [msg]
+        replies = [r for r in (handle(m) for m in batch) if r is not None]
+        for reply in replies:
+            sys.stdout.write(json.dumps(reply) + "\n")
+        sys.stdout.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (BrokenPipeError, KeyboardInterrupt):
+        # The client went away. Not an error worth a traceback on stderr.
+        sys.exit(0)
