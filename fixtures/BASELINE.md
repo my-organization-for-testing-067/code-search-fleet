@@ -45,12 +45,52 @@ kind across the fleet:
 | fulfillment-worker-python | Python | **0** |
 | web-monorepo-node | TypeScript | **0** |
 
-`SqlInventoryStore : IInventoryStore` is not in the C# graph, and
 `implementations --trait IInventoryStore` returns zero matches. Interface to
 implementation is the single most valuable relation in a DI-heavy .NET
-codebase, and for four of the five languages here it is simply absent. All five
-are in tokensave's "lite" tier, its best-supported one. Note also that the
-installed binary reports 34 languages, not the 50+ the README advertises.
+codebase. All five are in tokensave's "lite" tier, its best-supported one. Note
+also that the installed binary reports 34 languages, not the 50+ the README
+advertises.
+
+> **Correction (tokensave 7.9.0).** The table above is a true count and the
+> conclusion drawn from it was wrong. This section originally read
+> "`SqlInventoryStore : IInventoryStore` is not in the C# graph". It is — as an
+> **`extends`** edge. C# has one syntax for both relations,
+> `class Foo : BaseFoo, IFoo`, so an extractor cannot separate them without
+> resolving each name in the base list; tokensave resolves some and defaults the
+> rest. Querying the fixture's graph directly:
+>
+> | edge kind | C# edges | targeting an interface |
+> |---|---|---|
+> | `implements` | 1 | 1 |
+> | `extends` | 4 | 3 |
+>
+> So all four interface implementations are captured; only one is filed under
+> the kind we asked for. The same shape appears at scale — on a tree with
+> ~40,650 C# nodes, 33 `implements` against 399 `extends`, 45 of the latter
+> targeting an interface.
+>
+> That changes what a consumer should do. "Zero implements edges" means route
+> elsewhere; "split across two kinds" means the graph *can* answer interface
+> questions in C#, by querying both kinds and filtering targets. The target id
+> carries its own kind (`interface:<hash>` / `class:<hash>`), which is a more
+> reliable filter than the `I[A-Z]*` naming convention.
+>
+> **Why this went unnoticed** is the part worth keeping. The fixture's C# repo
+> declared only interfaces and no base class, so *every* relation in it was an
+> interface implementation. A graph that emitted zero `implements` edges and one
+> that filed all of them under `extends` produce the identical count, and this
+> file drew the stronger conclusion from evidence that could not distinguish
+> them — a clean-looking negative from a sensor never proven able to fire, which
+> is the exact hazard documented elsewhere in this project.
+> `src/Infrastructure/AuditedStockLedger.cs` now gives the fixture a real base
+> class and a type that does both, so the two kinds are separable here rather
+> than only on real code, and `verify-engines` probes both.
+>
+> This does not change the routing. `cs refs` still uniquely bridges the DI
+> registration (`AddScoped<IInventoryStore, SqlInventoryStore>()`), which no
+> edge kind captures. But the narrower "what implements this interface" is
+> answerable from the graph without a .NET SDK — the expensive prerequisite the
+> LSP path carries.
 
 ## Token cost
 

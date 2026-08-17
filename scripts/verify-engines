@@ -199,18 +199,52 @@ probe_toolchains() {
 # no `implements` edges, which is why it lost the routing. If a release fixes
 # that, this reports IMPROVED and the decision should be revisited -- upgrades
 # can remove reasons as well as introduce regressions.
+#
+# Probing ONE edge kind was the flaw. C# has a single syntax for both relations
+# -- `class Foo : BaseFoo, IFoo` -- so an extractor cannot separate them without
+# resolving each name in the base list, and tokensave resolves some while
+# defaulting the rest to `extends`. Counting only `implements` therefore reports
+# "the relation is absent" about a graph that has it, which is a different and
+# much more consequential claim than "it is filed elsewhere":
+#
+#   absent            -> the graph cannot answer interface questions in C#
+#   filed as extends  -> it can, by querying both kinds and filtering targets
+#
+# The target id carries its own kind (`interface:<hash>` / `class:<hash>`),
+# which is a far better discriminator than the `I[A-Z]*` naming convention --
+# it is what the extractor actually decided, not a guess from the name.
 probe_tokensave() {
   have tokensave || { record tokensave "-" known-limitation SKIP "not installed"; return; }
   local ver; ver=$(tokensave --version 2>/dev/null | awk '{print $2}')
   local dir="$F/inventory-api-dotnet"
   [[ -d "$dir/.tokensave" ]] || (cd "$dir" && tokensave init >/dev/null 2>&1)
-  local n
-  n=$(cd "$dir" && tokensave tool rank --edge-kind implements 2>/dev/null \
-      | awk -F: '/result_count/{gsub(/[ ,]/,"",$2); print $2}')
-  if [[ "${n:-0}" -gt 0 ]]; then
-    record tokensave "$ver" known-limitation IMPROVED "C# implements edges now present ($n) — re-evaluate routing"
+
+  local n_impl n_ext
+  n_impl=$(cd "$dir" && tokensave tool rank --edge-kind implements 2>/dev/null \
+           | awk -F: '/result_count/{gsub(/[ ,]/,"",$2); print $2}')
+  n_ext=$(cd "$dir" && tokensave tool rank --edge-kind extends 2>/dev/null \
+          | awk -F: '/result_count/{gsub(/[ ,]/,"",$2); print $2}')
+  n_impl=${n_impl:-0}; n_ext=${n_ext:-0}
+
+  # How many `extends` edges actually point at an interface. Needs the graph
+  # itself; the rank tool reports counts but not targets.
+  local db n_iface="?"
+  db="$dir/.tokensave/tokensave.db"
+  if have sqlite3 && [[ -f "$db" ]]; then
+    n_iface=$(sqlite3 "$db" "
+      SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source
+      WHERE s.file_path LIKE '%.cs' AND e.kind = 'extends'
+        AND e.target LIKE 'interface:%';" 2>/dev/null)
+    n_iface=${n_iface:-?}
+  fi
+
+  local captured=$((n_impl + ${n_iface//[!0-9]/0}))
+  if [[ "$n_impl" -gt 0 || "${n_iface//[!0-9]/0}" -gt 0 ]]; then
+    record tokensave "$ver" known-limitation IMPROVED \
+      "C# interface impls ARE captured ($captured: $n_impl implements + $n_iface extends→interface, of $n_ext extends) — query BOTH kinds; see BASELINE.md"
   else
-    record tokensave "$ver" known-limitation CONFIRMED "still no C# implements edges"
+    record tokensave "$ver" known-limitation CONFIRMED \
+      "no C# interface implementation in either kind ($n_ext extends, none targeting an interface)"
   fi
 }
 
