@@ -944,6 +944,51 @@ EOF
 # Refuses rather than answering, and refuses BEFORE `answer resolved` is set, so
 # there is no path on which the label reaches stdout for a query that could not
 # have run.
+# The missing toolchain for a repo's language, or empty if it can be analysed.
+# Split out of require_serena_toolchain so a caller can offer a fallback instead
+# of only refusing -- installing the SDK is not a fix for every repo, and where
+# it is not, refusing was cs's ONLY answer.
+serena_missing_toolchain() {  # <repo-dir>
+  local lang tc
+  lang=$(repo_language "$1") || return 1
+  tc=$(language_toolchain "$lang") || return 1
+  have_toolchain "$tc" && return 1
+  printf '%s\n' "$tc"
+}
+
+# ---- the graph fallback ----------------------------------------------------
+# `resolved` needs a language server, and a language server needs its language's
+# toolchain. For .NET Framework C# that toolchain is Windows-only to build, so
+# on macOS or Linux the tier is unavailable BY CONSTRUCTION rather than for want
+# of installing something -- and cs had no answer at all for those repos, not a
+# degraded one.
+#
+# A prebuilt graph is the profile the facade is otherwise missing: offline,
+# cross-repo, no per-language toolchain. It is NEVER labelled `resolved`: a
+# symbol graph cannot see reflection, DI registration, or generated code, and
+# `cs refs` remains the only thing that bridges a DI registration. Calling a
+# graph answer `resolved` would overstate it in precisely the way this project's
+# answer-kind vocabulary exists to prevent, so it is `structural`.
+tokensave_graph_at() { [[ -f "$1/.tokensave/tokensave.db" ]]; }
+
+# Epoch seconds of the graph's last sync, or empty. A graph is the one engine
+# here that can be confidently WRONG rather than merely blind -- it answers
+# about the code as of its last sync -- so its age is surfaced, not assumed.
+# `status` takes its path POSITIONALLY and rejects --project, unlike the `tool`
+# subcommands; and --json avoids ~36KB of ANSI art for a handful of numbers.
+tokensave_graph_epoch() {
+  have_tokensave || return 1
+  tokensave status "$1" --json 2>/dev/null \
+    | sed -n 's/.*"last_updated"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1
+}
+tokensave_graph_age_days() {
+  local e now
+  e=$(tokensave_graph_epoch "$1") || return 1
+  [[ -n "$e" ]] || return 1
+  now=$(date +%s)
+  printf '%s\n' $(( (now - e) / 86400 ))
+}
+
 require_serena_toolchain() {
   local sub="$1" sym="$2" repo="$3" dir="$4" lang tc
   if ! lang=$(repo_language "$dir"); then
@@ -964,6 +1009,9 @@ require_serena_toolchain() {
   where nothing was read. Refusing instead.
   install it: $(toolchain_install "$tc")
   check:      cs engines   (per-kind availability, including this)
+  where the toolchain cannot be installed at all (.NET Framework is Windows-only
+  to build), a tokensave graph answers cs impls without one:
+    cd $repo && tokensave init
   weaker but available now:
     cs def $sym $repo      (structural: ctags, matches spelling not identity)
     cs uses '$sym'         (heuristic: text, comments filtered — cs why heuristic)"
@@ -1082,7 +1130,7 @@ kind_subcommands() {
   case "$1" in
     resolved)   echo "cs impls, cs refs" ;;
     declared)   echo "cs provides, cs deps, cs publishes, cs versions, cs owns" ;;
-    structural) echo "cs calls, cs def" ;;
+    structural) echo "cs calls, cs def, cs impls (graph fallback)" ;;
     historical) echo "cs history" ;;
     heuristic)  echo "cs uses" ;;
     textual)    echo "cs text, cs seam" ;;
@@ -1122,7 +1170,9 @@ kind_status() {
       elif [[ $n_present -eq 0 ]]; then
         echo "unavailable|serena needs a toolchain per language and none are runnable: $(toolchain_roll_call) → cs impls / cs refs refuse for every preflighted language"
       else
-        echo "degraded|$(toolchain_roll_call) → cs impls / cs refs refuse for the missing languages"
+        local _fb=""
+        have_tokensave && _fb="; a tokensave graph answers cs impls (as structural) where a toolchain is missing"
+        echo "degraded|$(toolchain_roll_call) → cs impls / cs refs refuse for the missing languages$_fb"
       fi
       ;;
     declared)
@@ -1137,7 +1187,11 @@ kind_status() {
       { have ast-grep || have semgrep; } && have_calls=1
       ctags_bin >/dev/null 2>&1 && have_def=1
       if [[ $have_calls -eq 1 && $have_def -eq 1 ]]; then
-        echo "ok|ast-grep/semgrep for cs calls, ctags for cs def"
+        if have_tokensave; then
+          echo "ok|ast-grep/semgrep for cs calls, ctags for cs def, tokensave graph for cs impls without a toolchain"
+        else
+          echo "ok|ast-grep/semgrep for cs calls, ctags for cs def"
+        fi
       elif [[ $have_calls -eq 0 && $have_def -eq 0 ]]; then
         echo "unavailable|needs ast-grep or semgrep, and universal-ctags — none installed → cs calls and cs def both refuse"
       elif [[ $have_calls -eq 0 ]]; then
@@ -1342,6 +1396,26 @@ cmd_engines() {
   else printf '%-12s %s\n' "serena" "MISSING (needs uv)"; fi
   if have git; then printf '%-12s %s\n' "git" "ok (cs history)"; n=$((n+1))
   else printf '%-12s %s\n' "git" "MISSING (cs history unavailable)"; fi
+  # Reported with its AGE, because a graph is the only engine here that answers
+  # about the code as of its last sync -- it can be confidently wrong rather
+  # than merely blind, and nothing else in this table has that failure mode.
+  if have_tokensave; then
+    local g_n=0 g_oldest="" g_age d
+    for d in $(real_dirs); do
+      tokensave_graph_at "$d" || continue
+      g_n=$((g_n + 1))
+      g_age=$(tokensave_graph_age_days "$d") || continue
+      [[ -n "$g_age" ]] || continue
+      if [[ -z "$g_oldest" || "$g_age" -gt "$g_oldest" ]]; then g_oldest="$g_age"; fi
+    done
+    if [[ $g_n -eq 0 ]]; then
+      printf '%-12s %s\n' "tokensave" "ok, but no repo has a graph (cd <repo> && tokensave init) — cs impls has no fallback where a toolchain is missing"
+    else
+      printf '%-12s %s\n' "tokensave" "ok ($g_n repo graph(s), oldest ${g_oldest:-?} day(s) old; backs cs impls where no language server can run)"
+    fi
+  else
+    printf '%-12s %s\n' "tokensave" "absent (optional: backs cs impls for a repo whose language toolchain cannot be installed)"
+  fi
   # Serena is a driver, not an analyser: uvx present says nothing about whether
   # a C# or Kotlin project can be LOADED. Reported here so the gap is visible
   # before a query is run, rather than only after one returns empty.
@@ -1984,12 +2058,51 @@ serena_answered_or_die() {  # <rc> <raw-file> <stderr-file> <subcommand> <symbol
 
 # The LSP-backed answers are the only ones that resolve an interface to its
 # implementation, so they are worth the setup cost -- but only these.
+# The graph route, taken only when the language server cannot run. Answers are
+# `structural`, never `resolved`.
+impls_via_tokensave() {  # <symbol> <repo-name> <repo-dir> <missing-toolchain>
+  local sym="$1" repo="$2" dir="$3" tc="$4" out rc age
+  answer structural "tokensave (graph)" "scoped to $repo; no $tc here, so no language server"
+  out=$(python3 "$lib_dir/tokensave_call.py" "$dir" "$repo" "$sym"); rc=$?
+  case "$rc" in
+    3) die "cs impls: '$sym' is not a type in $repo's graph
+  the graph was never asked the question, so this is not 'nothing implements it'
+  the graph may also predate the symbol — rebuild with: cd $dir && tokensave sync
+  weaker but available now: cs def $sym $repo, cs uses '$sym'" ;;
+    4) die "cs impls: the tokensave graph could not be queried for '$sym' in $repo
+  nothing was read, so nothing was ruled out
+  check: cs engines   (graph presence and age)" ;;
+  esac
+  # A graph answers about the code as of its last sync, which makes staleness a
+  # correctness problem rather than a tidiness one. Always stated.
+  age=$(tokensave_graph_age_days "$dir") && [[ -n "$age" ]] && \
+    warn "answered from a tokensave graph last synced ${age} day(s) ago — it cannot see changes made since (cd $dir && tokensave sync)"
+  warn "this is a GRAPH answer, not a language server: it cannot see reflection, DI registration, or generated code. cs refs is the only thing here that bridges a DI registration, and it needs $tc."
+  if [[ $rc -ne 0 || -z "$out" ]]; then
+    report_answer 0 0
+    hint "cs def $sym $repo       (where the symbol is declared)" \
+         "cs calls '<pattern>'    (a shape the graph did not record)"
+    return $CS_EXIT_NO_HITS
+  fi
+  emit_capped "$out"
+  report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
+}
+
 cmd_impls() {
   [[ $# -ge 2 ]] || die "cs impls <symbol> <repo> [file]"
-  have uvx || die "serena needs uv installed"
   require_python3 impls "driving the language server and formatting its answer"
   local repo_dir="$view/$2" file="${3:-}"
   [[ -d "$repo_dir" ]] || die "no such repo: $2"
+  # Routing, in order of answer strength: a language server when it can run, a
+  # graph when it cannot, and a refusal only when neither is available.
+  local _missing_tc
+  if _missing_tc=$(serena_missing_toolchain "$repo_dir"); then
+    if have_tokensave && tokensave_graph_at "$repo_dir"; then
+      impls_via_tokensave "$1" "$2" "$repo_dir" "$_missing_tc"
+      return $?
+    fi
+  fi
+  have uvx || die "serena needs uv installed"
   require_serena_toolchain impls "$1" "$2" "$repo_dir"
 
   # Serena identifies a symbol by name_path plus the file holding it, so the

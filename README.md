@@ -28,7 +28,7 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 100 checks against a throwaway fixture fleet
+scripts/verify-search              # 106 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only
@@ -202,6 +202,28 @@ textual      ok — ripgrep
 through the POSIX grep fallback, which is a slower route to the same kind, not a
 missing kind. `cs why <kind>` reports the same availability alongside that
 kind's blind spots.
+
+### And where no language server can run, a graph answers instead
+
+`cs impls` needs a language server, which needs its language's toolchain. For
+.NET Framework C# that toolchain is Windows-only to build, so on macOS or Linux
+the `resolved` tier is unavailable *by construction* — and refusing was `cs`'s
+only answer there. When a repo has a tokensave graph, `cs impls` now falls back
+to it:
+
+```
+! answered from a tokensave graph last synced 3 day(s) ago — it cannot see changes made since
+! this is a GRAPH answer, not a language server: it cannot see reflection, DI
+  registration, or generated code…
+answer: structural via tokensave (graph) · 2 hit(s) · 1 repo(s)
+```
+
+Never labelled `resolved` — a graph is not a language server, and `cs refs`
+remains the only thing here that bridges a DI registration. The query is
+`implements` ∪ `extends`, because C# has one syntax for both relations (see
+`fixtures/BASELINE.md`). `cs engines` reports graph age alongside the binaries,
+since a graph is the one engine that can be confidently *wrong* rather than
+merely blind.
 
 ## Tuning it for your repos
 

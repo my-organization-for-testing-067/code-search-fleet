@@ -393,7 +393,16 @@ installed.
 - **`resolved` needs a language toolchain, not just Serena.** `cs impls` and
   `cs refs` preflight the repo's dominant language against the runtime its
   server needs (C# → `dotnet`, Java/Kotlin → `java`, TS/JS → `node`) and refuse
-  when it is absent. A language *outside* that mapping — Python, Go, Rust — is
+  when it is absent — **unless** a tokensave graph exists for that repo, in
+  which case `cs impls` falls back to it and labels the answer `structural`.
+  That matters for code where the toolchain cannot be installed at all: .NET
+  Framework C# is Windows-only to build, so on macOS or Linux `resolved` is
+  unavailable *by construction* there. A graph answer is weaker in a specific
+  way — it cannot see reflection, DI registration, or generated code, and
+  `cs refs` remains the only thing that bridges a DI registration. It also
+  answers about the code as of its last sync, so `cs` states the graph's age on
+  every such answer; treat a stale graph as a source of confidently *wrong*
+  answers rather than merely blind ones. A language *outside* that mapping — Python, Go, Rust — is
   not preflighted: `cs` warns that it did not check, and an empty result there
   may still mean the project failed to load. Check `cs engines` before treating
   such a negative as strong.

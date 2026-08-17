@@ -907,6 +907,96 @@ fi
 
 rm -f "$dangle_repo/CLAUDE.local.md" "$dangle_repo/src/import"
 
+# ---- the graph fallback for cs impls ---------------------------------------
+# `resolved` needs a language server, and a language server needs its language's
+# toolchain. Where the C# is .NET Framework that toolchain is Windows-only to
+# build, so on macOS or Linux the tier is unavailable BY CONSTRUCTION rather
+# than for want of installing something — and cs had no answer at all there,
+# not a degraded one. A prebuilt graph is offline, cross-repo, and needs no
+# per-language toolchain.
+info ""
+info "${C_BOLD}graph fallback${C_OFF}"
+if ! command -v tokensave >/dev/null 2>&1; then
+  skip "graph fallback" "tokensave not installed"
+else
+  ts_repo="$FLEET_ROOT/inventory-api-dotnet"
+  (cd "$ts_repo" && tokensave init >/dev/null 2>&1) || true
+  if [[ ! -f "$ts_repo/.tokensave/tokensave.db" ]]; then
+    skip "graph fallback" "could not build a tokensave graph here"
+  else
+    # A machine where the toolchain cannot run — the case the fallback is for.
+    ts_nodot=$(mktemp -d)
+    printf '#!/bin/sh\nexit 127\n' > "$ts_nodot/dotnet"; chmod +x "$ts_nodot/dotnet"
+
+    ts_out=$(PATH="$ts_nodot:$PATH" "$here/cs" impls IStockLedger inventory-api-dotnet 2>&1); ts_rc=$?
+    if [[ $ts_rc -eq 0 ]] && printf '%s' "$ts_out" | grep -q 'AuditedStockLedger'; then
+      ok "cs impls answers from the graph when no language server can run"
+      pass=$((pass + 1))
+    else
+      err "the graph fallback did not answer (exit $ts_rc)"
+      fail=$((fail + 1)); failed_ids+=("graph-fallback-no-answer")
+    fi
+
+    # NEVER `resolved`. A graph cannot see reflection, DI registration or
+    # generated code, and cs refs remains the only thing that bridges a DI
+    # registration — labelling it `resolved` would overstate it in exactly the
+    # way the answer-kind vocabulary exists to prevent.
+    if printf '%s' "$ts_out" | grep -q 'answer:.*structural' \
+       && ! printf '%s' "$ts_out" | grep -q 'answer:.*resolved'; then
+      ok "a graph answer is labelled structural, never resolved"; pass=$((pass + 1))
+    else
+      err "the graph answer was mislabelled"
+      fail=$((fail + 1)); failed_ids+=("graph-fallback-kind")
+    fi
+
+    # Trap 1: the hierarchy tool takes a node ID. A bare name that is not a type
+    # node must refuse — the sibling callers_for returns an empty result with
+    # exit 0 for one, which is the manufactured negative cs refuses elsewhere.
+    if PATH="$ts_nodot:$PATH" "$here/cs" impls ReleaseAsync inventory-api-dotnet >/dev/null 2>&1; then
+      err "a non-type name produced an answer instead of a refusal"
+      fail=$((fail + 1)); failed_ids+=("graph-nontype-answer")
+    else
+      ok "a name that is not a type node refuses, rather than reporting zero"
+      pass=$((pass + 1))
+    fi
+
+    # Trap 3: a graph answers about the code as of its last sync, so it is the
+    # one engine here that can be confidently wrong rather than merely blind.
+    if printf '%s' "$ts_out" | grep -qi 'last synced'; then
+      ok "the graph's age is stated on every answer"; pass=$((pass + 1))
+    else
+      err "a graph answer did not disclose its age"
+      fail=$((fail + 1)); failed_ids+=("graph-staleness-silent")
+    fi
+
+    # With the toolchain present the language server must still win — the
+    # fallback is a fallback, not a replacement.
+    lsp_out=$("$here/cs" impls IInventoryStore inventory-api-dotnet 2>&1 || true)
+    if ! have_dotnet_toolchain || ! command -v uvx >/dev/null 2>&1; then
+      skip "language server precedence" "no .NET SDK or no uv here"
+    elif printf '%s' "$lsp_out" | grep -q 'answer:.*resolved'; then
+      ok "the language server still wins when it can run"; pass=$((pass + 1))
+    else
+      err "the graph fallback displaced a usable language server"
+      fail=$((fail + 1)); failed_ids+=("graph-displaced-lsp")
+    fi
+
+    # And with neither, the #1 refusal must survive intact.
+    ts_nograph=$(mktemp -d)
+    cp -R "$FLEET_ROOT" "$ts_nograph/fleet" >/dev/null 2>&1 || true
+    rm -rf "$ts_nograph/fleet/inventory-api-dotnet/.tokensave"
+    if PATH="$ts_nodot:$PATH" FLEET_ROOT="$ts_nograph/fleet" \
+       "$here/cs" impls IStockLedger inventory-api-dotnet >/dev/null 2>&1; then
+      err "cs impls answered with neither a toolchain nor a graph"
+      fail=$((fail + 1)); failed_ids+=("graph-absent-no-refusal")
+    else
+      ok "with no toolchain and no graph, cs impls still refuses"; pass=$((pass + 1))
+    fi
+    rm -rf "$ts_nodot" "$ts_nograph"
+  fi
+fi
+rm -rf "$FLEET_ROOT/inventory-api-dotnet/.tokensave"
+
 # ---- the harness owns its fleet scope --------------------------------------
 # Both harnesses used to treat an exported FLEET_ROOT as "run against this
 # fleet". Every check asserts FIXTURE content, so that could only report
