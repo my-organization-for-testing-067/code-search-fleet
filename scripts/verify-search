@@ -91,12 +91,37 @@ skip() {  # skip <check-name> <why>
   skipped=$((skipped + 1)); skipped_why+=("$1: $2")
 }
 
+# ---- output matchers -------------------------------------------------------
+# Piping a command into `grep -q` is a trap this file has fallen into five times
+# now. grep exits on its first match, the producer is killed by SIGPIPE, and
+# under `set -o pipefail` the pipeline reports FAILURE ON SUCCESS -- so the
+# check inverts, silently, and only when the pattern actually matches. The
+# comment warning about it is three paragraphs long and has not been enough.
+#
+# These take the shape away. Both match with a HERESTRING rather than a
+# pipeline, so there is no second process to signal and no pipeline status to
+# misread. Use them instead of writing a pipeline by hand; `check-no-grep-q`
+# below fails the suite if a raw one reappears.
+#
+#   emits   <out|err|both> <pattern> <command...>   run it, then match
+#   matches <pattern> <string>                      match something already held
+matches() { grep -qi -- "$2" <<< "$1"; }
+emits() {
+  local stream="$1" pat="$2"; shift 2
+  local captured
+  case "$stream" in
+    out)  captured=$("$@" 2>/dev/null || true) ;;
+    err)  captured=$("$@" 2>&1 >/dev/null || true) ;;
+    both) captured=$("$@" 2>&1 || true) ;;
+    *)    err "emits: unknown stream '$stream'"; return 2 ;;
+  esac
+  matches "$captured" "$pat"
+}
+
 # Whether Serena can actually analyse the C# fixture here. `cs engines` already
 # computes this -- reading it back is the same trick the timeout check uses, and
 # it keeps the toolchain table in cs as the single source of truth.
-have_dotnet_toolchain() {
-  printf '%s\n' "$_engines_probe" | grep -q '^dotnet .*ok'
-}
+have_dotnet_toolchain() { matches "$_engines_probe" '^dotnet .*ok'; }
 have_rg_binary_here() { [[ -x "$(command -v rg 2>/dev/null || true)" ]]; }
 
 check() {
@@ -268,7 +293,7 @@ fi
 # turned this check into a silent SKIP. A check that downgrades itself when an
 # unrelated thing changes is worse than no check, because the run still says
 # "0 failed". This block is the mirror image of that hazard and costs the same.
-if printf '%s\n' "$_engines_probe" | grep -q '^timeout: *[0-9]'; then
+if matches "$_engines_probe" '^timeout: *[0-9]'; then
   slow=$(mktemp -d)
   printf '#!/bin/sh\nsleep 30\n' > "$slow/rg"; chmod +x "$slow/rg"
   to=$(PATH="$slow:$PATH" CS_TEXT_ENGINE=ripgrep CS_TIMEOUT=1 \
@@ -1126,6 +1151,50 @@ else
 fi
 rm -rf "$FLEET_ROOT/inventory-api-dotnet/.tokensave"
 
+# ---- the suite checks itself -----------------------------------------------
+# Five times now a check in this file has piped a command into `grep -q`. grep
+# exits on its first match, the producer dies of SIGPIPE, and under pipefail the
+# pipeline reports failure ON SUCCESS -- so the check inverts, and only when the
+# pattern matches, which is the one case nobody tests. Three paragraphs of
+# warning comments did not stop it; a check does.
+#
+# `emits` and `matches` exist to take the shape away. This fails the suite if a
+# raw pipeline comes back, which is the only way to keep a convention that has
+# already been broken this often.
+info ""
+info "${C_BOLD}suite self-check${C_OFF}"
+# A COMMAND on the left of `grep -q` is the hazard. `printf | grep -q` is safe
+# in practice (small buffer, producer finishes first) and `grep -c` reads all
+# input, so neither is flagged.
+raw_pipes=$(grep -nE '(\$\("?\$here/(cs|verify-engines)"?|^\s*(if|elif)\s+"?\$here/(cs|verify-engines)"?)[^|]*\|[^|]*grep -q' \
+            "$here/verify-search" "$here/verify-engines" 2>/dev/null || true)
+if [[ -z "$raw_pipes" ]]; then
+  ok "no check pipes a command straight into 'grep -q'"; pass=$((pass + 1))
+else
+  err "a command is piped into 'grep -q' — use emits() instead:"
+  printf '%s\n' "$raw_pipes" | sed 's/^/    /' >&2
+  fail=$((fail + 1)); failed_ids+=("raw-grep-q-pipeline")
+fi
+
+# And the helpers themselves have to work, in both directions, or every check
+# built on them is worthless.
+emits_bad=()
+emits out  'orders.reserved.v1' "$here/cs" seam 'orders.reserved.v1' || emits_bad+=("out:miss")
+emits err  'answer:'            "$here/cs" seam 'orders.reserved.v1' || emits_bad+=("err:miss")
+emits both 'answer:'            "$here/cs" seam 'orders.reserved.v1' || emits_bad+=("both:miss")
+# stdout is the result stream, so the provenance line must NOT be there.
+emits out  'answer:'            "$here/cs" seam 'orders.reserved.v1' && emits_bad+=("out:false-positive")
+# A pattern that matches early in a long output is the exact SIGPIPE case.
+emits out  'checkout-service'   "$here/cs" text 'reserv' --all || emits_bad+=("early-match-in-long-output")
+matches "alpha beta gamma" 'beta' || emits_bad+=("matches:miss")
+matches "alpha beta gamma" 'delta' && emits_bad+=("matches:false-positive")
+if [[ ${#emits_bad[@]} -eq 0 ]]; then
+  ok "emits() and matches() report correctly in both directions"; pass=$((pass + 1))
+else
+  err "the output matchers are wrong: ${emits_bad[*]}"
+  fail=$((fail + 1)); failed_ids+=("emits-helper")
+fi
+
 # ---- the harness owns its fleet scope --------------------------------------
 # Both harnesses used to treat an exported FLEET_ROOT as "run against this
 # fleet". Every check asserts FIXTURE content, so that could only report
@@ -1505,7 +1574,7 @@ fi
 # Silently dropping them would trade one invisible error for another: a repo
 # missing because it was never cloned must be distinguishable from an entry cs
 # did not consider a repo at all.
-if "$here/cs" repos 2>&1 >/dev/null | grep -q 'update.log'; then
+if emits err 'update.log' "$here/cs" repos; then
   ok "the non-repository entries are named, not silently dropped"; pass=$((pass + 1))
 else
   err "non-repository entries were dropped without saying so"
