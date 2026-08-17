@@ -1151,6 +1151,81 @@ else
 fi
 rm -rf "$FLEET_ROOT/inventory-api-dotnet/.tokensave"
 
+# ---- portability of the plumbing, not just the engines ---------------------
+# BSD's `mktemp -t PREFIX` treats the argument as a prefix and appends its own
+# suffix, so it needs no X's. GNU's `-t TEMPLATE` requires at least three and
+# FAILS without them. `mktemp -t "cs-engerr.$$"` therefore worked on macOS and
+# returned an empty string on Linux — which made `2>"$err_f"` an ambiguous
+# redirect, so the search command never ran and grep_fleet produced no output
+# at all. Every text query on Linux returned nothing: this tool's worst failure
+# mode, arriving through its own plumbing rather than through an engine.
+#
+# It was invisible for nine commits because the whole suite was being run on
+# macOS, where the call succeeds. So the check emulates the strict behaviour
+# rather than waiting for the other platform to notice.
+info ""
+info "${C_BOLD}temp-file portability${C_OFF}"
+
+# Static: the portable helper exists, so a bare `mktemp -t` is a bug waiting to
+# happen. Comments are excluded; only real calls count.
+# Comment lines and the ok/err MESSAGES below both mention the shape; neither
+# runs it. Only code counts, or the check reports itself.
+bsd_mktemp=$(grep -nE '\bmktemp -t\b' "$here/cs" "$here/verify-search" "$here/verify-engines" 2>/dev/null \
+             | grep -vE ':[[:space:]]*#' \
+             | grep -vE '\b(ok|err|warn|info|skip) "' || true)
+if [[ -z "$bsd_mktemp" ]]; then
+  ok "no script uses BSD-only 'mktemp -t' (cs_tmp is portable)"; pass=$((pass + 1))
+else
+  err "BSD-only 'mktemp -t' found — GNU mktemp rejects a template with no X's:"
+  printf '%s\n' "$bsd_mktemp" | sed 's/^/    /' >&2
+  fail=$((fail + 1)); failed_ids+=("bsd-only-mktemp")
+fi
+
+# Functional: run a real query with a GNU-strict mktemp in front. On Linux the
+# real one already behaves this way; on macOS this is the only way to see it.
+strict=$(mktemp -d)
+real_mktemp=$(command -v mktemp)
+cat > "$strict/mktemp" <<STRICT
+#!/bin/sh
+# GNU rejects a -t template without at least three X's; BSD does not.
+prev=""
+for a in "\$@"; do
+  if [ "\$prev" = "-t" ]; then
+    case "\$a" in
+      *XXX*) ;;
+      *) echo "mktemp: too few X's in template '\$a'" >&2; exit 1 ;;
+    esac
+  fi
+  prev="\$a"
+done
+exec "$real_mktemp" "\$@"
+STRICT
+chmod +x "$strict/mktemp"
+
+strict_hits=$(PATH="$strict:$PATH" "$here/cs" uses 'orders.reserved.v1' --quiet 2>/dev/null | grep -c '[^[:space:]]')
+if [[ "$strict_hits" -ge 1 ]]; then
+  ok "cs still searches when mktemp is GNU-strict"; pass=$((pass + 1))
+else
+  err "cs found nothing under a GNU-strict mktemp — a BSD-only temp file call is back"
+  fail=$((fail + 1)); failed_ids+=("gnu-mktemp-search")
+fi
+
+# The refusal machinery has to survive it too: if a temp file silently fails to
+# appear, a broken engine could look like an honest zero again.
+if PATH="$strict:$PATH" "$here/cs" uses "cs-absent-under-strict-$$" >/dev/null 2>&1; then
+  err "a zero-hit query exited 0 under a GNU-strict mktemp"
+  fail=$((fail + 1)); failed_ids+=("gnu-mktemp-exit-code")
+else
+  gm_rc=$?
+  if [[ $gm_rc -eq 2 ]]; then
+    ok "a genuine zero still exits 2 under a GNU-strict mktemp"; pass=$((pass + 1))
+  else
+    err "a genuine zero exited $gm_rc (not 2) under a GNU-strict mktemp"
+    fail=$((fail + 1)); failed_ids+=("gnu-mktemp-exit-code")
+  fi
+fi
+rm -rf "$strict"
+
 # ---- the suite checks itself -----------------------------------------------
 # Five times now a check in this file has piped a command into `grep -q`. grep
 # exits on its first match, the producer dies of SIGPIPE, and under pipefail the
