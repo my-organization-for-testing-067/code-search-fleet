@@ -28,7 +28,7 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 198 checks against a throwaway fixture fleet
+scripts/verify-search              # 204 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only
@@ -70,6 +70,7 @@ than a wrong one, because nothing reports it. `brew install coreutils` on macOS.
 | Which version each repo pins, and where they disagree | `cs versions [coordinate]` |
 | Who to ask about this repo or file | `cs owns [repo\|repo/path]` |
 | Who crashes if I add a field to a response | `cs strictness [repo]` |
+| What the org has that the fleet does not | `cs gaps <query>` |
 | When a seam appeared, or last changed | `cs history <string> [repo]` |
 | What is actually being searched | `cs repos` |
 | Which workspaces there are to search | `cs scopes` |
@@ -335,6 +336,40 @@ tokensave 7.9.0:
   above roughly 75 sites the reads are re-requested with a limit and become a
   sample of an unknown total. That is reported as `PARTIAL` with the read count
   spelled `≥N`, never as a complete answer.
+
+### The corpus bounds a negative, not just the search
+
+Everything else here is about whether the *search* was sound — a zero is
+distinguished from a refusal, a timeout rules nothing out, `PARTIAL` is
+disclosed. None of it says anything about whether the *corpus* was. A fleet
+holding 43 of an org's 365 repos makes `cs uses <route>` returning nothing mean
+"not in these 43", and reading it as "nothing at this company calls it" is wrong
+in a way no provenance on the search can catch. The proof is set-theoretic: no
+query shape can find a repo that was never cloned.
+
+So every fleet-scoped zero now says so:
+
+```
+! this negative is bounded by the CORPUS, not just the search: 43 repo(s) are in
+  view, and a repo that was never cloned cannot be searched by any query.
+  Escalate before reporting absence: cs gaps '<route>'
+```
+
+`cs gaps` runs the query against the forge's org-wide code search, subtracts the
+repos the fleet already holds, and reports the remainder split by whether the
+match is application code or config only — of ~20 non-fleet repos found
+referencing a service this way, only about half did so from application code;
+the rest were deployment manifests and READMEs, and cloning on a raw match would
+grow the fleet with the wrong half.
+
+It is the one engine here that needs **network**, so it is opt-in, reported by
+`cs engines` like any other, and it **refuses** rather than degrading to a
+fleet-only answer wearing an org-wide label. Three refusals are load-bearing,
+because each was a measured false zero: a rate-limited call (org-wide search is
+limited, and a suppressed stderr turned a 403 into "this repo has no hits for
+anything"), an unauthenticated CLI, and a fleet whose remotes are local paths —
+which an earlier version read as an org named `.origins`, searched, and would
+have reported as "nothing beyond the fleet".
 
 ### A text answer says how much of itself is data
 

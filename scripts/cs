@@ -44,6 +44,9 @@
 #   cs fields <field|Type::field> [repo]  every read and write site of a field,
 #                                  split by kind -- the API-impact question
 #                                  (graph)
+#   cs gaps   <query>              what matches ORG-WIDE that the fleet does not
+#                                  hold -- the bound on a fleet-scoped negative
+#                                  (needs a forge CLI and network)
 #   cs strictness [repo]           which repos REJECT unknown fields on
 #                                  deserialization -- the other half of an
 #                                  API-impact review (declared)
@@ -1882,6 +1885,21 @@ report_answer() {
   if [[ -n "$CS_TRUNCATED" ]]; then
     warn "showing $CS_MAX_RESULTS of $CS_TRUNCATED — rerun with --all, or narrow the query"
   fi
+  # The CORPUS bound on a zero. Everything else here is about whether the SEARCH
+  # was sound; this is the one dishonest negative none of that can catch. cs
+  # already knows the denominator -- it prints it in the view line -- and stating
+  # it converts a silent over-read ("nothing at this company calls it") into a
+  # disclosed limit. Costs one line and needs no network.
+  #
+  # Only on a ZERO, and only for a fleet-reading subcommand: on a positive
+  # answer the bound is not what the reader is about to act on, and a note that
+  # fires on every query stops being read.
+  if [[ "$hits" == "0" && -n "$CS_KIND" ]]; then
+    case "$CS_SUB" in
+      which|why|engines|scopes|repos|gaps) ;;
+      *) warn "this negative is bounded by the CORPUS, not just the search: $(count_fleet_repos) repo(s) are in view, and a repo that was never cloned cannot be searched by any query. Escalate before reporting absence: cs gaps '$CS_QUERY'" ;;
+    esac
+  fi
   if [[ $show_why -eq 1 ]]; then
     info ""
     blind_spots "$CS_KIND" >&2
@@ -2027,6 +2045,18 @@ cmd_engines() {
     fi
   else
     printf '%-12s %s\n' "tokensave" "MISSING — cs callers / cs callees / cs impact refuse (nothing else here answers a call graph); cs impls loses its fallback where a language toolchain cannot be installed"
+  fi
+  # The one engine that needs NETWORK, and the only one whose absence leaves a
+  # CORPUS question unanswerable rather than a search question. Reported like
+  # any other so its absence is visible rather than assumed.
+  if have "${CS_FORGE_BIN:-gh}"; then
+    if have_forge; then
+      printf '%-12s %s\n' "forge" "ok (${CS_FORGE_BIN:-gh}, authenticated) — cs gaps can bound a fleet-scoped negative against the org"
+    else
+      printf '%-12s %s\n' "forge" "${CS_FORGE_BIN:-gh} present but NOT authenticated — cs gaps refuses (an unauthenticated query fails per call, and a per-call failure that reads as empty is a false zero); ${CS_FORGE_BIN:-gh} auth login"
+    fi
+  else
+    printf '%-12s %s\n' "forge" "MISSING — cs gaps refuses; a fleet-scoped negative cannot be escalated org-wide and stays bounded by the fleet"
   fi
   # Serena is a driver, not an analyser: uvx present says nothing about whether
   # a C# or Kotlin project can be LOADED. Reported here so the gap is visible
@@ -2186,6 +2216,7 @@ Which repos depend on which?                     cs deps [repo]
 Which version does each repo pin?                cs versions [coordinate]
 Who owns this repo, or this file?                cs owns [repo|repo/path]
 Who CRASHES if I add a field to a response?      cs strictness [repo]
+What does the fleet NOT hold that the org does?  cs gaps <query>
 When did this seam appear, or last change?       cs history <string> [repo]
 What am I actually searching right now?           cs repos
 Which workspaces are there to search at all?     cs scopes
@@ -3562,6 +3593,82 @@ cmd_strictness() {
   report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
 }
 
+# ---- cs gaps ---------------------------------------------------------------
+# The one dishonest negative cs could not detect. Everything else here is about
+# whether the SEARCH was sound; this is about whether the CORPUS was. A fleet
+# holding 43 of an org's 365 repos makes `cs uses <route>` returning nothing
+# mean "not in these 43", and a caller reading it as "nothing at this company
+# calls it" is wrong in a way no provenance on the search itself can catch.
+#
+# It has bitten concretely: a repo holding a dedicated HTTP client for one of
+# the fleet's own services was simply never cloned, and NO query shape could
+# have found it -- the proof is set-theoretic, not search-dependent.
+#
+# This is the tool's own thesis one level up. cs refuses to manufacture a
+# negative from a broken engine; a negative from an unrepresentative corpus is
+# the same failure with a different cause.
+have_forge() {
+  have "${CS_FORGE_BIN:-gh}" || return 1
+  # Installed is not the same as usable: an unauthenticated CLI fails per query,
+  # and a per-query failure that reads as an empty result is the exact bug this
+  # verb exists to prevent.
+  "${CS_FORGE_BIN:-gh}" auth status >/dev/null 2>&1
+}
+
+cmd_gaps() {
+  [[ $# -ge 1 ]] || die "cs gaps <query>
+  what matches ORG-WIDE that the fleet cannot see"
+  require_python3 gaps "querying the forge and classifying what it returns"
+  local query="$1"
+  have "${CS_FORGE_BIN:-gh}" || die "cs gaps needs a forge CLI (${CS_FORGE_BIN:-gh}), and it is not installed
+  this is the one engine here that needs NETWORK, so it is opt-in and absent by
+  default — cs engines reports it like any other
+  without it a fleet-scoped negative cannot be escalated, and stays bounded by
+  the fleet: see the note printed on any zero-hit fleet answer"
+  have_forge || die "cs gaps: ${CS_FORGE_BIN:-gh} is installed but not authenticated, so no org-wide search ran
+  an unauthenticated query fails per call, and a per-call failure that reads as
+  an empty result is exactly the false zero this verb exists to prevent
+  authenticate with: ${CS_FORGE_BIN:-gh} auth login"
+
+  # textual, and labelled so: an org-wide match on a service name is strong for
+  # "this repo talks to that service" and silent on what it does with it.
+  answer textual "${CS_FORGE_BIN:-gh} (org-wide code search)" "unfiltered, classified after"
+
+  local out rc err_file
+  err_file=$(cs_tmp cs-gaps)
+  out=$(python3 "$lib_dir/forge_gaps.py" "$view" "$query" ${CS_GAPS_LIMIT:+--limit="$CS_GAPS_LIMIT"} 2>"$err_file"); rc=$?
+  [[ -s "$err_file" ]] && cat "$err_file" >&2
+  rm -f "$err_file"
+
+  case "$rc" in
+    3) die "cs gaps: no organisation to search
+  the owner is read from the fleet's own remotes; set CS_ORG to name one" ;;
+    4) die "cs gaps: the org-wide search did not run, so NOTHING is ruled out
+  this is a refusal, not 'no repos beyond the fleet' — org-wide code search is
+  rate limited, and an error read as an empty result is the false zero this
+  whole verb exists to prevent
+  the reason is on the line above" ;;
+  esac
+
+  if [[ "$rc" -eq 1 || -z "$out" ]]; then
+    report_answer 0 0
+    warn "this bounds the negative only as far as the forge index reaches: a private repo the token cannot see, or one the index has not covered, is still outside it"
+    return $CS_EXIT_NO_HITS
+  fi
+
+  emit_capped "$out"
+  info ""
+  info "${C_BOLD}a fleet-scoped negative for '$query' is bounded by the repo(s) above${C_OFF}"
+  warn "application code and config only are DIFFERENT findings: a deployment manifest or README naming a service is not a caller, and cloning on a raw match would grow the fleet with the wrong half"
+  warn "textual, not structural: this says a repo mentions the string, not that it calls, implements or deserializes anything"
+  if [[ $suggest_clone -eq 1 ]]; then
+    info ""
+    info "${C_BOLD}to close the gap — registration is just a clone:${C_OFF}"
+    printf '%s\n' "$out" | sed -n 's/^\([^:]*\):.*/  git -C "$FLEET_ROOT" clone <forge-url>\/\1/p' >&2
+  fi
+  report_answer "$(n_hits_in "$out")" "$(n_hits_in "$out")"
+}
+
 cmd_refs() {
   [[ $# -ge 3 ]] || die "cs refs <symbol> <repo> <file-relative-to-repo>"
   have uvx || die "serena needs uv installed"
@@ -3819,6 +3926,8 @@ source_only=0
 count_mode=0
 # cs constructs only: which field to mark present/ABSENT on each site.
 construct_field=""
+# cs gaps only: print the clone commands that would close the gap.
+suggest_clone=0
 # Env as well as a flag: a caller wrapping cs in a script it does not control
 # can set CS_JSON=1 once rather than threading a flag through every call site.
 case "${CS_JSON:-0}" in 1|true|yes) porcelain=1 ;; esac
@@ -3843,6 +3952,7 @@ for a in "$@"; do
     --source-only) source_only=1 ;;
     --count) count_mode=1 ;;
     --field=*) construct_field="${a#--field=}" ;;
+    --suggest-clone) suggest_clone=1 ;;
     *) args+=("$a") ;;
   esac
 done
@@ -3893,6 +4003,7 @@ case "$sub" in
   fields)  cmd_fields "$@" ;;
   constructs) cmd_constructs "$@" ;;
   strictness) cmd_strictness "$@" ;;
+  gaps)    cmd_gaps "$@" ;;
   refs)    cmd_refs "$@" ;;
   history) cmd_history "$@" ;;
   repos)   cmd_repos ;;

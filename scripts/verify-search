@@ -1448,7 +1448,14 @@ PROBE
     fi
 
     # And NOT printed when they agree, because a suffix on every row is noise.
-    if ! "$here/cs" fields _threshold --fleet --count --quiet 2>&1 | grep -q 'refs:'; then
+    #
+    # emits(), not a raw pipeline. As `if ! cs … | grep -q` this check was
+    # VACUOUS: under `set -o pipefail` a matching grep -q closes the pipe, cs
+    # takes SIGPIPE, the pipeline reports non-zero, and the leading `!` turns
+    # that into a pass -- so it succeeded whether or not the suffix was there.
+    # The negated form also slipped past the suite's own self-check, which is
+    # widened below to catch it.
+    if ! emits both 'refs:' "$here/cs" fields _threshold --fleet --count --quiet; then
       ok "no occurrence suffix when every site holds one reference"; pass=$((pass + 1))
     else
       err "the refs suffix printed even where it carried no information"
@@ -1911,7 +1918,11 @@ info "${C_BOLD}suite self-check${C_OFF}"
 # A COMMAND on the left of `grep -q` is the hazard. `printf | grep -q` is safe
 # in practice (small buffer, producer finishes first) and `grep -c` reads all
 # input, so neither is flagged.
-raw_pipes=$(grep -nE '(\$\("?\$here/(cs|verify-engines)"?|^\s*(if|elif)\s+"?\$here/(cs|verify-engines)"?)[^|]*\|[^|]*grep -q' \
+# `if ! cs … | grep -q` was not caught by the original pattern, and it is the
+# WORSE form: pipefail makes the pipeline non-zero when grep matches (SIGPIPE on
+# the producer) AND when it does not (grep's own 1), so the negation passes
+# either way and the check asserts nothing at all.
+raw_pipes=$(grep -nE '(\$\("?\$here/(cs|verify-engines)"?|^\s*(if|elif)\s+!?\s*"?\$here/(cs|verify-engines)"?)[^|]*\|[^|]*grep -q' \
             "$here/verify-search" "$here/verify-engines" 2>/dev/null || true)
 if [[ -z "$raw_pipes" ]]; then
   ok "no check pipes a command straight into 'grep -q'"; pass=$((pass + 1))
@@ -2404,6 +2415,136 @@ fi
 rm -rf "$nohash"
 # The constant-path index the old code wrote, in case this machine has one.
 rm -f "${TMPDIR:-/tmp}/cs-tags-.tags"
+
+# ---- cs gaps: the corpus bound ---------------------------------------------
+# Every other guard here is about whether the SEARCH was sound. This is the one
+# dishonest negative none of them can catch: a fleet holding 43 of an org's 365
+# repos makes a zero mean "not in these 43", and no query shape can find a repo
+# that was never cloned -- the proof is set-theoretic, not search-dependent.
+#
+# Driven against a STUB forge throughout. The point is not that GitHub works; it
+# is that a forge FAILURE never becomes an empty answer, and that is only
+# testable by making the forge fail on purpose.
+info ""
+info "${C_BOLD}cs gaps${C_OFF}"
+gaps_bin=$(mktemp -d)
+cat > "$gaps_bin/forge-ok" <<'STUB'
+#!/bin/sh
+[ "$1" = "auth" ] && exit 0
+cat <<'JSON'
+[{"path":"src/api/clients/thing_client.py","repository":{"nameWithOwner":"acme/orders-client"}},
+ {"path":"deploy/values.yaml","repository":{"nameWithOwner":"acme/infra-manifests"}},
+ {"path":"README.md","repository":{"nameWithOwner":"acme/infra-manifests"}},
+ {"path":"src/Store.cs","repository":{"nameWithOwner":"acme/inventory-api-dotnet"}}]
+JSON
+STUB
+# Rate limited: a non-zero exit with the reason on stderr and NOTHING on stdout.
+# This is the exact shape that, with stderr suppressed, reported a repo as
+# having no hits for anything -- including a term that was definitely present.
+cat > "$gaps_bin/forge-429" <<'STUB'
+#!/bin/sh
+[ "$1" = "auth" ] && exit 0
+echo "HTTP 403: API rate limit exceeded" >&2
+exit 1
+STUB
+# Exit 0 with output that does not parse: a different fault, same rule.
+cat > "$gaps_bin/forge-junk" <<'STUB'
+#!/bin/sh
+[ "$1" = "auth" ] && exit 0
+echo "not json at all"
+STUB
+# Installed but not logged in.
+cat > "$gaps_bin/forge-noauth" <<'STUB'
+#!/bin/sh
+[ "$1" = "auth" ] && exit 1
+echo "[]"
+STUB
+chmod +x "$gaps_bin"/forge-*
+
+# The fleet's own repos are SUBTRACTED -- inventory-api-dotnet matched org-wide
+# and is already held, so it is not a gap -- and what remains is split by
+# whether the match is application code or config only. Of ~20 non-fleet repos
+# found this way in the reported run, only about half were application code;
+# cloning on a raw match would grow the fleet with the wrong half.
+gaps_out=$(CS_ORG=acme CS_FORGE_BIN="$gaps_bin/forge-ok" "$here/cs" gaps reservationId --fleet 2>&1); gaps_rc=$?
+if [[ $gaps_rc -eq 0 ]] \
+   && printf '%s' "$gaps_out" | grep -q 'orders-client:.*application code' \
+   && printf '%s' "$gaps_out" | grep -q 'infra-manifests:.*config only' \
+   && ! printf '%s' "$gaps_out" | grep -q '^inventory-api-dotnet:'; then
+  ok "cs gaps subtracts the fleet and splits application code from config only"
+  pass=$((pass + 1))
+else
+  err "cs gaps did not bound the negative correctly (exit $gaps_rc)"
+  fail=$((fail + 1)); failed_ids+=("gaps-subtract-and-classify")
+fi
+
+# THE rule of this verb: a forge that fails must REFUSE, never report zero. A
+# rate-limited call whose error was swallowed is what turned a 403 into a false
+# zero in the field.
+rl_out=$(CS_ORG=acme CS_FORGE_BIN="$gaps_bin/forge-429" "$here/cs" gaps x --fleet 2>&1); rl_rc=$?
+junk_rc=0
+CS_ORG=acme CS_FORGE_BIN="$gaps_bin/forge-junk" "$here/cs" gaps x --fleet >/dev/null 2>&1 || junk_rc=$?
+if [[ $rl_rc -eq 1 && $junk_rc -eq 1 ]] \
+   && printf '%s' "$rl_out" | grep -q 'NOTHING is ruled out' \
+   && printf '%s' "$rl_out" | grep -q 'rate limit'; then
+  ok "a failing forge refuses and surfaces its error, never reporting zero"
+  pass=$((pass + 1))
+else
+  err "a forge failure was reported as an empty result (rate-limit=$rl_rc junk=$junk_rc)"
+  fail=$((fail + 1)); failed_ids+=("gaps-failure-refuses")
+fi
+
+# Installed is not usable. An unauthenticated CLI fails per query, and a
+# per-query failure that reads as empty is the same false zero.
+if ! CS_ORG=acme CS_FORGE_BIN="$gaps_bin/forge-noauth" "$here/cs" gaps x --fleet >/dev/null 2>&1; then
+  ok "an unauthenticated forge refuses rather than answering emptily"
+  pass=$((pass + 1))
+else
+  err "cs gaps answered with an unauthenticated forge"
+  fail=$((fail + 1)); failed_ids+=("gaps-unauthenticated")
+fi
+
+# A local-path remote must NOT be read as an org name. The fixture fleet's
+# remotes are local paths, and an earlier version happily searched an "org"
+# called `.origins` -- which returns zero, which this verb would then report as
+# "nothing beyond the fleet". The false negative, arriving through its own
+# configuration.
+noorg_out=$(CS_FORGE_BIN="$gaps_bin/forge-ok" "$here/cs" gaps x --fleet 2>&1); noorg_rc=$?
+if [[ $noorg_rc -eq 1 ]] \
+   && printf '%s' "$noorg_out" | grep -q 'no organisation'; then
+  ok "a local-path remote is not mistaken for an organisation"; pass=$((pass + 1))
+else
+  err "cs gaps inferred an org from a non-forge remote (exit $noorg_rc)"
+  fail=$((fail + 1)); failed_ids+=("gaps-local-remote-not-an-org")
+fi
+
+# The cheap half of the same report, and the one that needs no network: cs
+# already knows the denominator and can state the bound on ANY fleet-scoped
+# zero. That converts a silent over-read -- "nothing at this company calls it"
+# -- into a disclosed limit.
+zero_out=$("$here/cs" uses ZzzNoSuchTokenAnywhere --fleet 2>&1)
+hit_out=$("$here/cs" uses reservationId --fleet 2>&1)
+if printf '%s' "$zero_out" | grep -q 'bounded by the CORPUS' \
+   && printf '%s' "$zero_out" | grep -q 'cs gaps' \
+   && ! printf '%s' "$hit_out" | grep -q 'bounded by the CORPUS'; then
+  ok "a zero-hit answer states the corpus bound, and a positive one does not"
+  pass=$((pass + 1))
+else
+  err "a fleet-scoped zero did not disclose that the corpus bounds it"
+  fail=$((fail + 1)); failed_ids+=("corpus-bound-on-zero")
+fi
+
+# cs engines reports it like any other engine, so its absence is visible rather
+# than assumed. It is the only one that needs network, which is exactly why it
+# must not be silently assumed present.
+if emits both '^forge' "$here/cs" engines; then
+  ok "cs engines reports the forge engine, present or absent"; pass=$((pass + 1))
+else
+  err "the forge engine is invisible to cs engines"
+  fail=$((fail + 1)); failed_ids+=("gaps-engine-reported")
+fi
+
+rm -rf "$gaps_bin"
 
 # ---- cs strictness ---------------------------------------------------------
 # "If I add a field to this response, which consumers REJECT it and crash?" The

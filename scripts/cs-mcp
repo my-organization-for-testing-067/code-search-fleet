@@ -100,7 +100,7 @@ SCOPE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 CS_FLAGS = {
     "--fleet", "--why", "--quiet", "-q", "--all", "--touched",
     "--refresh", "--porcelain", "--json", "--word", "-w",
-    "--source-only", "--count",
+    "--source-only", "--count", "--suggest-clone",
 }
 
 
@@ -299,6 +299,17 @@ TOOLS = [
      [SCOPE_ARG,
       arg("repo", "Limit to this repo, and list its per-model evidence "
                   "instead of the roll-up.", required=False)]),
+
+    # The CORPUS bound, not a search result. The only tool here that needs
+    # network, and the only one whose absence leaves a question unanswerable
+    # rather than answered worse.
+    ("cs_gaps", "gaps",
+     "What matches ORG-WIDE that the fleet does not hold — the bound on a "
+     "fleet-scoped negative. Use before reporting that nothing calls something: "
+     "a repo that was never cloned cannot be searched by any query. Needs a "
+     "forge CLI and network, and refuses rather than degrading to a fleet-only "
+     "answer.",
+     [arg("query", "The string to search for org-wide."), SCOPE_ARG]),
 
     ("cs_refs", "refs",
      "What references this symbol, resolved by a language server — bridges "
