@@ -38,7 +38,8 @@ Four traps, all reproduced against tokensave 7.9.0 rather than taken on trust:
      and the interface method did not. Every exact-name node is asked, and the
      set is named on stderr so the reader can see what was actually queried.
 
-Usage: tokensave_call.py <impls|def|callers|callees|impact|fields> <repo-dir>
+Usage: tokensave_call.py <impls|def|callers|callees|impact|fields|field-counts>
+                         <repo-dir>
                          <repo-name> <symbol>
 Exit:  0 found, 1 nothing found (an honest negative), 3 the symbol does not
        resolve to a node this question can be asked of, 4 the tool itself failed.
@@ -312,7 +313,8 @@ def field_sites(project, repo, field):
 
     Exit: 0 sites found, 1 no sites at all, 3 a qualifier that was not applied,
     4 the tool failed, 5 sites found but the engine truncated its own output so
-    the reads are a sample. `1` is deliberately NOT treated as an answer by the
+    the reads are a sample, 6 too many sites to list at all (use the count
+    mode -- the counts survive the truncation that destroys the arrays). `1` is deliberately NOT treated as an answer by the
     caller -- see below.
     """
     doc, read_limit = _field_doc(project, field)
@@ -323,7 +325,11 @@ def field_sites(project, repo, field):
                   "with reads limited to 1, so the WRITE list alone overflows "
                   "and no complete list can be read from this graph",
                   file=sys.stderr)
-            return 4
+            # 6, not 4: the graph answered fine and the SITE LIST is what does
+            # not fit. Counting still works, because the counts precede the
+            # arrays in the JSON and survive the cut -- so the caller has an
+            # answer to offer rather than only a refusal.
+            return 6
         print(f"tokensave field_sites failed: {read_limit}", file=sys.stderr)
         return 4
 
@@ -390,6 +396,63 @@ def field_sites(project, repo, field):
 
 
 
+# The counts live in the JSON HEAD, before the site arrays -- `write_count` and
+# `read_count` are emitted ahead of `write_sites`/`read_sites`. The 15000-char
+# truncation therefore cuts the arrays and leaves the counts intact, which is
+# what makes a summary mode possible at fleet scale where the full listing
+# cannot be read at all.
+#
+# Read with a regex rather than json.loads precisely BECAUSE the document may be
+# truncated: waiting for valid JSON is what made the fleet-wide question
+# unanswerable. The scalars are matched individually so a cut anywhere after
+# them costs nothing.
+#
+# Critically, this is called with NO --limit. --limit rewrites read_count to the
+# capped number, so counting through it would report the limit back as if it
+# were a total -- the same silent cap the union graph has, and the reason the
+# per-repo fan-out is used here instead.
+_NUM = {k: re.compile(r'"%s"\s*:\s*(\d+)' % k) for k in ("write_count", "read_count")}
+_QUAL = re.compile(r'"qualifier"\s*:\s*(?:"([^"]*)"|null)')
+_QUAL_OK = re.compile(r'"qualifier_applied"\s*:\s*(true|false)')
+
+
+def field_counts(project, repo, field):
+    """cs fields --count: one `repo: writes N, reads M` line, from the head.
+
+    Exit: 0 counted, 1 the field has no sites at all, 3 a qualifier that was not
+    applied, 4 the tool failed.
+    """
+    out, err = _run(["tokensave", "tool", "field_sites", "--field", field,
+                     "--project", project])
+    if out is None:
+        print(f"tokensave field_sites failed: {err}", file=sys.stderr)
+        return 4
+
+    qual = _QUAL.search(out)
+    qual_ok = _QUAL_OK.search(out)
+    if qual and qual.group(1) and qual_ok and qual_ok.group(1) == "false":
+        print(f"tokensave: the qualifier '{qual.group(1)}' was parsed but NOT "
+              f"applied, so these counts would be the bare field name's",
+              file=sys.stderr)
+        return 3
+
+    nums = {}
+    for key, pat in _NUM.items():
+        m = pat.search(out)
+        if not m:
+            # No count in the head means the head itself did not arrive -- a
+            # different fault from a truncated tail, and not one to report a
+            # zero for.
+            print(f"tokensave field_sites returned no {key}", file=sys.stderr)
+            return 4
+        nums[key] = int(m.group(1))
+
+    if nums["write_count"] == 0 and nums["read_count"] == 0:
+        return 1
+    print(f"{repo}: writes {nums['write_count']}, reads {nums['read_count']}")
+    return 0
+
+
 def main():
     if len(sys.argv) < 5:
         print(__doc__, file=sys.stderr)
@@ -400,6 +463,8 @@ def main():
         return defs(project, repo, symbol)
     if mode == "fields":
         return field_sites(project, repo, symbol)
+    if mode == "field-counts":
+        return field_counts(project, repo, symbol)
     if mode in ("callers", "callees", "impact"):
         return graph_edges(project, repo, symbol, mode)
     if mode != "impls":

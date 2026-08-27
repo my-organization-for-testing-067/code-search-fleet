@@ -28,7 +28,7 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 177 checks against a throwaway fixture fleet
+scripts/verify-search              # 182 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only
@@ -62,6 +62,7 @@ than a wrong one, because nothing reports it. `brew install coreutils` on macOS.
 | What this symbol calls | `cs callees <symbol> <repo>` |
 | What breaks if I change this symbol | `cs impact <symbol> <repo>` |
 | Who reads or writes this field, fleet-wide | `cs fields <field> [repo]` |
+| How big is that field's blast radius | `cs fields <field> --count` |
 | What references this symbol (bridges DI) | `cs refs <symbol> <repo> <file>` |
 | Which repo publishes this package | `cs provides <coordinate>` |
 | Which repos depend on which | `cs deps [repo]` |
@@ -297,6 +298,26 @@ tokensave 7.9.0:
   `DiscountEngine::_threshold` and a fabricated `NoSuchClass::_threshold` return
   identical sites. Answering would put the broad question's result under the
   narrow question's heading.
+- **At fleet scale, ask for counts instead.** A common field name overflows
+  tokensave's 15000-character output on its *write* list alone, so the listing
+  refuses — correctly, since a partial site list would understate the blast
+  radius. `cs fields <field> --count` answers anyway, because the counts are
+  emitted *before* the site arrays and survive the cut that destroys them:
+
+  ```
+  $ cs fields chargeAmount --fleet --count
+  repo-a: writes 9, reads 41
+  repo-b: writes 3, reads 12
+
+  total: writes 12, reads 53 across 2 repo(s) with a graph
+  ```
+
+  These are the graph's own totals, not a returned-row count. That distinction
+  is why this fans out per repo rather than querying the fleet-wide union graph:
+  the union graph answers promptly but silently *caps* — its `write_count` came
+  back as 20 with limit 20 and 21 with limit 21, so nothing separates "21 sites
+  exist" from "21 of many were returned". An honest refusal beats a total nobody
+  established.
 - **The cap is per access kind, and engine truncation is `PARTIAL`.** Reads
   outnumber writes heavily, so one cap over the combined stream would spend the
   budget on reads and truncate the writes away. Separately, `tokensave tool`

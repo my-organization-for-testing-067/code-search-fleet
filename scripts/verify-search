@@ -1392,12 +1392,99 @@ assert d["kind"] == "structural", d["kind"]
     fi
 
 
+    # ---- --count: the fleet-wide question, where listing cannot answer ------
+    # A common field name overflows tokensave's own 15000-character output even
+    # with reads limited to 1 -- the WRITE list alone does not fit -- so the
+    # listing route refuses, correctly, and the fleet-wide blast-radius question
+    # was left with no answer at all. The counts have no such ceiling: they are
+    # emitted BEFORE the site arrays, so the truncation that destroys the arrays
+    # leaves them intact.
+    python3 - "$fld_repo/fulfillment/hugeprobe.py" <<'PROBE'
+import sys
+L = ["class Huge:", "    def __init__(self):", "        self._hugeprobefield = 0"]
+for i in range(120):
+    L += [f"    def w{i}(self):", f"        self._hugeprobefield = {i}"]
+for i in range(200):
+    L += [f"    def r{i}(self):", f"        return self._hugeprobefield"]
+open(sys.argv[1], "w").write("\n".join(L) + "\n")
+PROBE
+    (cd "$fld_repo" && tokensave sync >/dev/null 2>&1) || true
+
+    # The listing must still REFUSE -- a partial site list presented as complete
+    # would understate the blast radius -- but it must name the mode that can
+    # answer, or the refusal is the whole story again.
+    huge_list=$("$here/cs" fields _hugeprobefield --fleet 2>&1); huge_rc=$?
+    if [[ $huge_rc -eq 1 ]] \
+       && printf '%s' "$huge_list" | grep -q 'too many sites' \
+       && printf '%s' "$huge_list" | grep -q '\-\-count'; then
+      ok "a field too large to list refuses, and names the mode that answers"
+      pass=$((pass + 1))
+    else
+      err "an unlistable field refused without pointing anywhere (exit $huge_rc)"
+      fail=$((fail + 1)); failed_ids+=("fields-overflow-hint")
+    fi
+
+    # And --count answers it, with TRUE totals. 121 writes (120 setters plus
+    # __init__) and 200 reads -- asserted exactly, because the failure this
+    # guards against is a count that tracks a limit instead of a total.
+    huge_cnt=$("$here/cs" fields _hugeprobefield --fleet --count 2>&1); huge_cnt_rc=$?
+    if [[ $huge_cnt_rc -eq 0 ]] \
+       && printf '%s' "$huge_cnt" | grep -q 'writes 121, reads 200' \
+       && printf '%s' "$huge_cnt" | grep -q 'total: writes 121, reads 200'; then
+      ok "--count answers where listing overflows, with true totals"
+      pass=$((pass + 1))
+    else
+      err "cs fields --count did not report true totals (exit $huge_cnt_rc)"
+      fail=$((fail + 1)); failed_ids+=("fields-count-totals")
+    fi
+
+    # The counts must be the graph's own totals, NOT a returned-row count. The
+    # union graph was rejected for exactly this: its write_count came back as 20
+    # with limit 20 and 21 with limit 21, so it tracked the limit and nothing
+    # distinguished "21 exist" from "21 of many were returned". If the count
+    # route ever started counting emitted rows, this would drop to the cap.
+    # Captured first, then matched. `cs ... | grep -q` would be wrong here: grep
+    # -q exits on the first match and closes the pipe, cs takes SIGPIPE, and
+    # under `set -o pipefail` that non-zero status fails the whole pipeline even
+    # though the match succeeded.
+    cnt_capped=$(CS_MAX_RESULTS=2 "$here/cs" fields _hugeprobefield --fleet --count --quiet 2>&1)
+    if printf '%s' "$cnt_capped" | grep -q '^fulfillment-worker-python: writes 121, reads 200$'; then
+      ok "a count is the graph's total, not the number of rows returned"
+      pass=$((pass + 1))
+    else
+      err "the reported count moved with the result cap, so it is not a total"
+      fail=$((fail + 1)); failed_ids+=("fields-count-not-capped")
+    fi
+
+    # Same refusal discipline as the listing route: zero counts cannot be told
+    # apart from a field that does not exist.
+    "$here/cs" fields ZzzNoSuchFieldAnywhere --fleet --count >/dev/null 2>&1
+    if [[ $? -eq 1 ]]; then
+      ok "an empty count refuses too, for the same reason the listing does"
+      pass=$((pass + 1))
+    else
+      err "cs fields --count reported an empty tally as an answer"
+      fail=$((fail + 1)); failed_ids+=("fields-count-empty-refuses")
+    fi
+
+    rm -f "$fld_repo/fulfillment/hugeprobe.py"
+
     rm -f "$fld_repo/fulfillment/capprobe.py"
     (cd "$fld_repo" && tokensave sync >/dev/null 2>&1) || true
   fi
   rm -rf "$fld_repo/.tokensave"
 fi
 
+# A flag a subcommand cannot honour is refused, not dropped -- the rule --engine
+# already follows here. A silently ignored --count looks exactly like a --count
+# that was honoured and happened to change nothing.
+if "$here/cs" uses reservationId --fleet --count >/dev/null 2>&1; then
+  err "--count was silently accepted by a subcommand that cannot honour it"
+  fail=$((fail + 1)); failed_ids+=("count-flag-dropped")
+else
+  ok "--count is refused by the subcommands that return hits, not tallies"
+  pass=$((pass + 1))
+fi
 
 # ---- symbol mode: cs callers / cs callees / cs impact -----------------------
 # The graph route, asked directly rather than only as a fallback. Everything

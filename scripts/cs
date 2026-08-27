@@ -60,6 +60,11 @@
 #   --refresh        rebuild the cached symbol index instead of reusing it
 #   --porcelain      one JSON object on stdout instead of result lines
 #                    (CS_JSON=1 does the same; stderr is unaffected)
+#   --count          cs fields only: per-repo write/read TALLIES instead of the
+#                    site list. The counts are read from the head of the graph's
+#                    output and survive the truncation that makes a fleet-wide
+#                    listing impossible, so this is the mode the blast-radius
+#                    question actually has an answer in.
 #   --source-only    exclude data and doc files (.csv .json .txt .tsv .lock .log
 #                    .rst .md) from a text answer. OFF by default: a route in an
 #                    appsettings.json is a real seam. The composition of every
@@ -2163,6 +2168,7 @@ What calls this symbol?                          cs callers <symbol> <repo>
 What does this symbol call?                      cs callees <symbol> <repo>
 What breaks if I change this symbol?             cs impact <symbol> <repo>
 Who reads / writes this FIELD, fleet-wide?       cs fields <field> [repo]
+How BIG is that field's blast radius?            cs fields <field> --count
 What references this symbol (bridges DI)?        cs refs <symbol> <repo> <file>
 Which repo publishes this package?               cs provides <coordinate>
 Which repos depend on which?                     cs deps [repo]
@@ -3086,6 +3092,70 @@ cmd_impact() {
 # smaller question than the one asked. Graphs are still per-repo, so the union
 # is assembled here and the repos with no graph are NAMED -- a field read in an
 # unindexed repo looks exactly like a field nobody reads.
+# The summary half of the same question. For an impact review the first thing
+# you need is not every site but HOW BIG and WHERE -- and at fleet scale the
+# full listing cannot be produced at all: a common field name overflows
+# tokensave's own 15000-character output even with reads limited to 1, so the
+# listing route correctly refuses and the fleet-wide question is left with no
+# answer. Counts have no such ceiling, because they are read from the JSON HEAD
+# and survive the truncation that destroys the arrays.
+#
+# Deliberately NOT the union graph. A fleet-wide union graph answers promptly
+# where the per-repo fan-out refuses, but it silently CAPS instead of refusing:
+# write_count came back as 20 with limit 20 and 21 with limit 21, so it tracks
+# the limit and nothing distinguishes "21 sites exist" from "21 of many were
+# returned". The fan-out's honest refusal is better behaviour than that, and a
+# summary built on a capped count would be a total nobody established.
+fields_count_via_tokensave() {  # <field> [only-repo]
+  local field="$1" only="${2:-}" d name rows="" rc n_graph=0 no_graph="" oldest="" age
+  for d in $(real_dirs); do
+    name=$(basename "$d")
+    [[ -n "$only" && "$name" != "$only" ]] && continue
+    if ! tokensave_graph_at "$d"; then no_graph="$no_graph $name"; continue; fi
+    n_graph=$((n_graph + 1))
+    age=$(tokensave_graph_age_days "$d") || age=""
+    if [[ -n "$age" && ( -z "$oldest" || "$age" -gt "$oldest" ) ]]; then oldest="$age"; fi
+    local one
+    one=$(python3 "$lib_dir/tokensave_call.py" field-counts "$d" "$name" "$field"); rc=$?
+    case "$rc" in
+      3) die "cs fields --count: the qualifier in '$field' was parsed but not applied by tokensave, so the counts would be the bare name's
+  ask the broad question deliberately with: cs fields '${field##*::}' --count" ;;
+      4) die "cs fields --count: the tokensave graph for $name could not be queried
+  nothing was read there, so nothing was ruled out
+  check: cs engines   (graph presence and age)" ;;
+    esac
+    [[ -n "$one" ]] && rows="${rows:+$rows
+}$one"
+  done
+
+  [[ $n_graph -gt 0 ]] || die "cs fields: no repo in view has a tokensave graph
+  build one with: cd <repo> && tokensave init"
+
+  answer structural "tokensave (graph)" "$n_graph repo graph(s), per-repo counts"
+  [[ -n "$oldest" ]] && warn "answered from graph(s) last synced up to ${oldest} day(s) ago — changes made since are invisible (tokensave sync)"
+  [[ -n "$no_graph" ]] && warn "no tokensave graph, so NOT counted:$no_graph — a read or write in those repos is missing from these totals"
+
+  # Same refusal as the listing route, for the same reason: tokensave returns
+  # zero counts for a field that does not exist in the identical shape it
+  # returns for one that is never touched, and no probe here separates them.
+  if [[ -z "$rows" ]]; then
+    die "cs fields --count: no read or write site for '$field' in $n_graph graph(s) — this is NOT 'nothing uses it'
+  tokensave returns the same zero counts for a field that does not exist as for
+  one that exists and is never touched, and nothing here can separate them
+  confirm the name is real first: cs text '$field'"
+  fi
+
+  emit_capped "$rows"
+  local tw tr
+  tw=$(printf '%s\n' "$rows" | sed -n 's/.*writes \([0-9]*\).*/\1/p' | awk '{s+=$1} END {print s+0}')
+  tr=$(printf '%s\n' "$rows" | sed -n 's/.*reads \([0-9]*\).*/\1/p' | awk '{s+=$1} END {print s+0}')
+  info ""
+  info "${C_BOLD}total: writes $tw, reads $tr${C_OFF} across $(n_hits_in "$rows") repo(s) with a graph"
+  info "  writes observe an added field or a changed default; reads break on a removal, rename or retype"
+  info "  drill in with: cs fields '$field' <repo>"
+  report_answer "$(n_hits_in "$rows")" "$(n_hits_in "$rows")"
+}
+
 fields_via_tokensave() {  # <field> [only-repo]
   local field="$1" only="${2:-}" d name out="" rc n_graph=0 no_graph="" oldest="" age
   local truncated_by_engine=""
@@ -3108,6 +3178,16 @@ fields_via_tokensave() {  # <field> [only-repo]
       4) die "cs fields: the tokensave graph for $name could not be queried
   nothing was read there, so nothing was ruled out
   check: cs engines   (graph presence and age)" ;;
+      6) # Not a failure to answer -- a failure to LIST. The graph holds so many
+         # sites for this field in $name that tokensave's own 15000-character
+         # output overflows on the write list alone, so no complete listing can
+         # be read. The blast-radius question still has an answer, and refusing
+         # without naming it would leave the fleet-wide case with none at all.
+         die "cs fields: too many sites for '$field' in $name to list — tokensave truncates its own output and a partial list would understate the blast radius
+  the COUNTS are unaffected -- they precede the sites in the graph's output and
+  survive the cut that destroys the arrays:
+    cs fields '$field' --count     per-repo writes and reads, fleet-wide
+  narrowing to $name does NOT help: it is the repo that overflows" ;;
       5) # Sites came back, but the engine cut its own output and the reads
          # below are a sample of an unknown total. PARTIAL, and said so in the
          # envelope as well as on stderr -- a read total that reads as complete
@@ -3220,7 +3300,11 @@ cmd_fields() {
   it answers from: tokensave (graph), and nothing else" ;;
   esac
   [[ -n "$only" && ! -d "$view/$only" ]] && die "no such repo: $only"
-  fields_via_tokensave "$1" "$only"
+  if [[ $count_mode -eq 1 ]]; then
+    fields_count_via_tokensave "$1" "$only"
+  else
+    fields_via_tokensave "$1" "$only"
+  fi
 }
 
 cmd_refs() {
@@ -3475,6 +3559,9 @@ word_match=0
 # .json is a genuine seam, and --source-only would drop it -- which is fine when
 # the caller asked for source, and not fine as a default.
 source_only=0
+# cs fields only. Refused rather than ignored on every other subcommand -- a
+# dropped flag looks exactly like a flag that was honoured and changed nothing.
+count_mode=0
 # Env as well as a flag: a caller wrapping cs in a script it does not control
 # can set CS_JSON=1 once rather than threading a flag through every call site.
 case "${CS_JSON:-0}" in 1|true|yes) porcelain=1 ;; esac
@@ -3497,6 +3584,7 @@ for a in "$@"; do
     --porcelain|--json) porcelain=1 ;;
     --word|-w) word_match=1 ;;
     --source-only) source_only=1 ;;
+    --count) count_mode=1 ;;
     *) args+=("$a") ;;
   esac
 done
@@ -3505,6 +3593,7 @@ done
 # printed from in there (stderr escapes a subshell; an assignment does not),
 # which is exactly the shape of bug that leaves a narrowing visible to a human
 # and invisible to a machine caller.
+[[ $count_mode -eq 1 && "${args[0]:-}" != "fields" ]] && { printf 'cs: --count is only meaningful for cs fields\n  every other subcommand returns hits, not per-repo tallies\n' >&2; exit 1; }
 [[ $source_only -eq 1 ]] && CS_EXCLUSION_NOTE="${CS_EXCLUSION_NOTE:+$CS_EXCLUSION_NOTE, }--source-only (data/doc extensions)"
 
 # --engine names a text backend as well as a structural one; the text side is

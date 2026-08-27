@@ -100,7 +100,7 @@ SCOPE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 CS_FLAGS = {
     "--fleet", "--why", "--quiet", "-q", "--all", "--touched",
     "--refresh", "--porcelain", "--json", "--word", "-w",
-    "--source-only",
+    "--source-only", "--count",
 }
 
 
@@ -262,7 +262,12 @@ TOOLS = [
                    "parses the qualifier without applying it, and cs refuses "
                    "rather than return the unnarrowed answer under it."),
       SCOPE_ARG,
-      arg("repo", "Limit to this repo directory name.", required=False)]),
+      arg("repo", "Limit to this repo directory name.", required=False),
+      arg("count", "Return per-repo write/read TALLIES instead of the site "
+                   "list. Use this fleet-wide: a common field name overflows "
+                   "the graph's own output and the listing then refuses, while "
+                   "the counts survive that truncation and are true totals.",
+          required=False, type_="boolean")]),
 
     ("cs_refs", "refs",
      "What references this symbol, resolved by a language server — bridges "
@@ -670,6 +675,8 @@ def call_tool(name, arguments):
         flags.append("--touched")
     if arguments.get("source_only"):
         flags.append("--source-only")
+    if arguments.get("count"):
+        flags.append("--count")
 
     env = run_cs(sub, positional(spec, arguments), scope=scope, flags=flags)
     return render(env)
