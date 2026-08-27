@@ -28,7 +28,7 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 182 checks against a throwaway fixture fleet
+scripts/verify-search              # 185 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only
@@ -306,11 +306,19 @@ tokensave 7.9.0:
 
   ```
   $ cs fields chargeAmount --fleet --count
-  repo-a: writes 9, reads 41
+  repo-a: writes 9, reads 41 (refs: 9 write, 63 read)
   repo-b: writes 3, reads 12
 
-  total: writes 12, reads 53 across 2 repo(s) with a graph
+  total: writes 12, reads 53 site(s) across 2 repo(s) with a graph
   ```
+
+  The headline numbers are **sites** — distinct `file:line`, the same quantity
+  the listing reports, so the two modes agree. tokensave counts *occurrences*,
+  which overstates a blast radius: three references on one line are one place a
+  human edits, not three. The occurrence counts are kept alongside, and printed
+  only where they differ. Where the output was truncated the arrays are
+  incomplete, sites cannot be derived at all, and the row says it is counting
+  references instead.
 
   These are the graph's own totals, not a returned-row count. That distinction
   is why this fans out per repo rather than querying the fleet-wide union graph:

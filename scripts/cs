@@ -60,11 +60,13 @@
 #   --refresh        rebuild the cached symbol index instead of reusing it
 #   --porcelain      one JSON object on stdout instead of result lines
 #                    (CS_JSON=1 does the same; stderr is unaffected)
-#   --count          cs fields only: per-repo write/read TALLIES instead of the
-#                    site list. The counts are read from the head of the graph's
-#                    output and survive the truncation that makes a fleet-wide
-#                    listing impossible, so this is the mode the blast-radius
-#                    question actually has an answer in.
+#   --count          cs fields only: per-repo write/read SITE tallies instead of
+#                    the site list -- the same quantity the listing reports, so
+#                    the two modes agree. Survives the output truncation that
+#                    makes a fleet-wide listing impossible, which is why the
+#                    blast-radius question has an answer in this mode. Where the
+#                    output WAS truncated, distinct sites cannot be derived and
+#                    the row says it is counting references instead.
 #   --source-only    exclude data and doc files (.csv .json .txt .tsv .lock .log
 #                    .rst .md) from a text answer. OFF by default: a route in an
 #                    appsettings.json is a real seam. The composition of every
@@ -3108,6 +3110,7 @@ cmd_impact() {
 # summary built on a capped count would be a total nobody established.
 fields_count_via_tokensave() {  # <field> [only-repo]
   local field="$1" only="${2:-}" d name rows="" rc n_graph=0 no_graph="" oldest="" age
+  local refs_only=""
   for d in $(real_dirs); do
     name=$(basename "$d")
     [[ -n "$only" && "$name" != "$only" ]] && continue
@@ -3123,6 +3126,14 @@ fields_count_via_tokensave() {  # <field> [only-repo]
       4) die "cs fields --count: the tokensave graph for $name could not be queried
   nothing was read there, so nothing was ruled out
   check: cs engines   (graph presence and age)" ;;
+      5) # Counted, but as REFERENCES rather than sites: the engine truncated
+         # its output, so the site arrays are incomplete and distinct file:line
+         # cannot be derived. tokensave has no paging to page around it -- it
+         # accepts an unknown --offset silently and ignores it. References still
+         # bound the magnitude, and are labelled in the row so nobody compares
+         # them against a listing's site count.
+         CS_SOURCE_PARTIAL=1
+         refs_only="$refs_only $name" ;;
     esac
     [[ -n "$one" ]] && rows="${rows:+$rows
 }$one"
@@ -3145,12 +3156,21 @@ fields_count_via_tokensave() {  # <field> [only-repo]
   confirm the name is real first: cs text '$field'"
   fi
 
+  [[ -n "$refs_only" ]] && warn "PARTIAL: tokensave truncated its output for:$refs_only — those rows count REFERENCES, not sites, and are not comparable with a listing's site count (three references on one line are one place to edit)"
+
   emit_capped "$rows"
+  # Parsed from the head of each row, anchored, rather than with a loose `.*`:
+  # a row can carry a trailing `(refs: N write, M read)` and a greedy match
+  # would be one rename away from summing the wrong numbers.
   local tw tr
-  tw=$(printf '%s\n' "$rows" | sed -n 's/.*writes \([0-9]*\).*/\1/p' | awk '{s+=$1} END {print s+0}')
-  tr=$(printf '%s\n' "$rows" | sed -n 's/.*reads \([0-9]*\).*/\1/p' | awk '{s+=$1} END {print s+0}')
+  tw=$(printf '%s\n' "$rows" | awk -F'writes ' 'NF>1 {split($2, a, ","); s += a[1]} END {print s+0}')
+  tr=$(printf '%s\n' "$rows" | awk -F'reads ' 'NF>1 {split($2, a, " "); s += a[1]} END {print s+0}')
   info ""
-  info "${C_BOLD}total: writes $tw, reads $tr${C_OFF} across $(n_hits_in "$rows") repo(s) with a graph"
+  # The unit is named. These are SITES -- distinct file:line, the same quantity
+  # the listing mode reports -- because that is what a reviewer means by blast
+  # radius. tokensave counts occurrences, which overstates it.
+  info "${C_BOLD}total: writes $tw, reads $tr${C_OFF} site(s) across $(n_hits_in "$rows") repo(s) with a graph"
+  [[ -n "$refs_only" ]] && info "  NOT all of that total is sites: the rows marked above count references, so this figure is an upper bound"
   info "  writes observe an added field or a changed default; reads break on a removal, rename or retype"
   info "  drill in with: cs fields '$field' <repo>"
   report_answer "$(n_hits_in "$rows")" "$(n_hits_in "$rows")"
@@ -3183,7 +3203,10 @@ fields_via_tokensave() {  # <field> [only-repo]
          # output overflows on the write list alone, so no complete listing can
          # be read. The blast-radius question still has an answer, and refusing
          # without naming it would leave the fleet-wide case with none at all.
-         die "cs fields: too many sites for '$field' in $name to list — tokensave truncates its own output and a partial list would understate the blast radius
+         die "cs fields: the site list for '$field' in $name does not fit in tokensave's output, and a partial list would understate the blast radius
+  the limit is output BYTES (15000 chars), not a number of sites — long
+  snippets overflow it at a few dozen sites, so a small site count here is
+  expected rather than surprising
   the COUNTS are unaffected -- they precede the sites in the graph's output and
   survive the cut that destroys the arrays:
     cs fields '$field' --count     per-repo writes and reads, fleet-wide

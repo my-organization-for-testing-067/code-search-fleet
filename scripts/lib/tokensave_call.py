@@ -321,10 +321,11 @@ def field_sites(project, repo, field):
     if doc is None:
         # read_limit carries the reason when doc is None.
         if read_limit == "truncated":
-            print("tokensave truncated its own output at 15000 characters even "
-                  "with reads limited to 1, so the WRITE list alone overflows "
-                  "and no complete list can be read from this graph",
-                  file=sys.stderr)
+            print("tokensave truncated its own output at 15000 CHARACTERS even "
+                  "with reads limited to 1, so the write list's snippets alone "
+                  "overflow it and no complete list can be read from this "
+                  "graph. The limit is bytes, not a number of sites: a few "
+                  "dozen long lines are enough.", file=sys.stderr)
             # 6, not 4: the graph answered fine and the SITE LIST is what does
             # not fit. Counting still works, because the counts precede the
             # arrays in the JSON and survive the cut -- so the caller has an
@@ -417,10 +418,22 @@ _QUAL_OK = re.compile(r'"qualifier_applied"\s*:\s*(true|false)')
 
 
 def field_counts(project, repo, field):
-    """cs fields --count: one `repo: writes N, reads M` line, from the head.
+    """cs fields --count: one summary line per repo.
 
-    Exit: 0 counted, 1 the field has no sites at all, 3 a qualifier that was not
-    applied, 4 the tool failed.
+    The headline numbers are SITES -- distinct file:line -- because that is what
+    the listing mode reports and what a reviewer means by blast radius. Three
+    references on one line are one place a human edits, not three.
+
+    tokensave emits one entry per OCCURRENCE, so the raw write_count/read_count
+    are reference counts and overstate the sites. Deduping needs the arrays, so
+    it is possible only when the document actually parses; when the engine
+    truncated its own output the arrays are incomplete and site counts are not
+    derivable at all. That case reports references, says so in the line, and
+    exits 5 so the caller can mark it.
+
+    Exit: 0 counted as sites, 1 no sites at all, 3 a qualifier that was not
+    applied, 4 the tool failed, 5 counted as REFERENCES because the output was
+    truncated and sites could not be derived.
     """
     out, err = _run(["tokensave", "tool", "field_sites", "--field", field,
                      "--project", project])
@@ -436,20 +449,50 @@ def field_counts(project, repo, field):
               file=sys.stderr)
         return 3
 
-    nums = {}
+    # The reference counts, read from the JSON HEAD. They precede the site
+    # arrays, so they survive the truncation that destroys them -- which is the
+    # whole reason a count mode can answer where a listing cannot.
+    refs = {}
     for key, pat in _NUM.items():
         m = pat.search(out)
         if not m:
-            # No count in the head means the head itself did not arrive -- a
-            # different fault from a truncated tail, and not one to report a
-            # zero for.
             print(f"tokensave field_sites returned no {key}", file=sys.stderr)
             return 4
-        nums[key] = int(m.group(1))
+        refs[key] = int(m.group(1))
 
-    if nums["write_count"] == 0 and nums["read_count"] == 0:
+    if refs["write_count"] == 0 and refs["read_count"] == 0:
         return 1
-    print(f"{repo}: writes {nums['write_count']}, reads {nums['read_count']}")
+
+    # Sites, when the arrays are all there. Same dedupe key as the listing path,
+    # so the two modes report the same quantity -- they disagreed before, and
+    # both claimed to be complete.
+    try:
+        doc = json.loads(out)
+    except json.JSONDecodeError:
+        print(f"{repo}: writes {refs['write_count']}, reads {refs['read_count']}"
+              f" (references, not sites — output truncated)")
+        return 5
+    if not isinstance(doc, dict):
+        return 4
+
+    sites = {}
+    for kind in ("write", "read"):
+        seen = set()
+        for r in doc.get(f"{kind}_sites") or []:
+            if isinstance(r, dict) and r.get("file"):
+                seen.add((r["file"], r.get("line")))
+        sites[kind] = len(seen)
+
+    line = f"{repo}: writes {sites['write']}, reads {sites['read']}"
+    # The reference counts are kept alongside rather than dropped: they are
+    # strictly more information, and printing them ONLY when they differ makes
+    # the difference self-evident instead of visible only to someone who runs
+    # both modes.
+    if (sites["write"] != refs["write_count"]
+            or sites["read"] != refs["read_count"]):
+        line += (f" (refs: {refs['write_count']} write, "
+                 f"{refs['read_count']} read)")
+    print(line)
     return 0
 
 

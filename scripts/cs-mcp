@@ -263,10 +263,13 @@ TOOLS = [
                    "rather than return the unnarrowed answer under it."),
       SCOPE_ARG,
       arg("repo", "Limit to this repo directory name.", required=False),
-      arg("count", "Return per-repo write/read TALLIES instead of the site "
-                   "list. Use this fleet-wide: a common field name overflows "
+      arg("count", "Return per-repo write/read SITE tallies instead of the site "
+                   "list — the same quantity the listing reports, so the two "
+                   "agree. Use this fleet-wide: a common field name overflows "
                    "the graph's own output and the listing then refuses, while "
-                   "the counts survive that truncation and are true totals.",
+                   "the counts survive that truncation. Where the output was "
+                   "truncated, sites cannot be derived and the row says it is "
+                   "counting references instead.",
           required=False, type_="boolean")]),
 
     ("cs_refs", "refs",

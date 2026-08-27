@@ -1392,6 +1392,72 @@ assert d["kind"] == "structural", d["kind"]
     fi
 
 
+    # ---- the two modes must report the SAME quantity ------------------------
+    # They did not. tokensave emits one entry per OCCURRENCE, the listing path
+    # dedupes to one row per file:line and the count path did not -- so the same
+    # field, repo and graph gave `reads 8` from --count and `read sites: 4` from
+    # the listing, with both claiming to be complete.
+    #
+    # The asymmetry hid it: writes agreed only because no write line happened to
+    # carry two references, so a spot-check on the write column looked
+    # reassuring while the read column was inflated. This probe puts THREE
+    # references on one read line for exactly that reason.
+    #
+    # Sites, not occurrences, is the right headline: --count answers "how big is
+    # this change", and three references on one line are one place a human
+    # edits, not three.
+    python3 - "$fld_repo/fulfillment/dupprobe.py" <<'PROBE'
+import sys
+open(sys.argv[1], "w").write(
+    "class DupProbe:\n"
+    "    def __init__(self):\n"
+    "        self._dupprobefield = 0\n"
+    "\n"
+    "    def one(self):\n"
+    "        return self._dupprobefield\n"
+    "\n"
+    "    def three(self):\n"
+    "        if self._dupprobefield and self._dupprobefield != 0:"
+    " return self._dupprobefield\n")
+PROBE
+    (cd "$fld_repo" && tokensave sync >/dev/null 2>&1) || true
+
+    dup_list=$("$here/cs" fields _dupprobefield --fleet --quiet 2>&1)
+    dup_cnt=$("$here/cs" fields _dupprobefield --fleet --count --quiet 2>&1)
+    # 1 write line, 2 read lines -- but 4 read OCCURRENCES (1 + 3).
+    if printf '%s' "$dup_list" | grep -q 'write sites: 1 ' \
+       && printf '%s' "$dup_list" | grep -q 'read sites:  2 ' \
+       && printf '%s' "$dup_cnt" | grep -q ': writes 1, reads 2'; then
+      ok "--count and the listing report the same quantity: sites, not occurrences"
+      pass=$((pass + 1))
+    else
+      err "the two cs fields modes disagree on what they count"
+      fail=$((fail + 1)); failed_ids+=("fields-count-site-parity")
+    fi
+
+    # The occurrence counts are kept ALONGSIDE rather than dropped -- strictly
+    # more information than either number alone -- and printed only when they
+    # differ, which makes the difference self-evident instead of visible only to
+    # someone who runs both modes.
+    if printf '%s' "$dup_cnt" | grep -q 'refs: 1 write, 4 read'; then
+      ok "occurrence counts are reported beside the site counts, when they differ"
+      pass=$((pass + 1))
+    else
+      err "the occurrence counts were dropped rather than disclosed"
+      fail=$((fail + 1)); failed_ids+=("fields-count-refs-shown")
+    fi
+
+    # And NOT printed when they agree, because a suffix on every row is noise.
+    if ! "$here/cs" fields _threshold --fleet --count --quiet 2>&1 | grep -q 'refs:'; then
+      ok "no occurrence suffix when every site holds one reference"; pass=$((pass + 1))
+    else
+      err "the refs suffix printed even where it carried no information"
+      fail=$((fail + 1)); failed_ids+=("fields-count-refs-noise")
+    fi
+
+    rm -f "$fld_repo/fulfillment/dupprobe.py"
+    (cd "$fld_repo" && tokensave sync >/dev/null 2>&1) || true
+
     # ---- --count: the fleet-wide question, where listing cannot answer ------
     # A common field name overflows tokensave's own 15000-character output even
     # with reads limited to 1 -- the WRITE list alone does not fit -- so the
@@ -1414,10 +1480,16 @@ PROBE
     # would understate the blast radius -- but it must name the mode that can
     # answer, or the refusal is the whole story again.
     huge_list=$("$here/cs" fields _hugeprobefield --fleet 2>&1); huge_rc=$?
+    # The refusal must also describe its own cause correctly. It used to say
+    # "too many sites to list", which sends a reader looking for a volume of
+    # sites that is not there -- the constraint is output BYTES, and long
+    # snippets overflow it at a few dozen sites.
     if [[ $huge_rc -eq 1 ]] \
-       && printf '%s' "$huge_list" | grep -q 'too many sites' \
+       && printf '%s' "$huge_list" | grep -q 'does not fit' \
+       && printf '%s' "$huge_list" | grep -q 'BYTES' \
+       && ! printf '%s' "$huge_list" | grep -q 'too many sites' \
        && printf '%s' "$huge_list" | grep -q '\-\-count'; then
-      ok "a field too large to list refuses, and names the mode that answers"
+      ok "a field too large to list refuses, names its real cause and the mode that answers"
       pass=$((pass + 1))
     else
       err "an unlistable field refused without pointing anywhere (exit $huge_rc)"
@@ -1427,11 +1499,16 @@ PROBE
     # And --count answers it, with TRUE totals. 121 writes (120 setters plus
     # __init__) and 200 reads -- asserted exactly, because the failure this
     # guards against is a count that tracks a limit instead of a total.
+    # This probe's output overflows, so its sites cannot be derived and the row
+    # reports REFERENCES -- labelled as such, and flagged PARTIAL. Asserting the
+    # label as well as the numbers is the point: the failure being guarded is a
+    # reference count presented as a site count.
     huge_cnt=$("$here/cs" fields _hugeprobefield --fleet --count 2>&1); huge_cnt_rc=$?
     if [[ $huge_cnt_rc -eq 0 ]] \
        && printf '%s' "$huge_cnt" | grep -q 'writes 121, reads 200' \
-       && printf '%s' "$huge_cnt" | grep -q 'total: writes 121, reads 200'; then
-      ok "--count answers where listing overflows, with true totals"
+       && printf '%s' "$huge_cnt" | grep -q 'references, not sites' \
+       && printf '%s' "$huge_cnt" | grep -q 'PARTIAL'; then
+      ok "--count answers where listing overflows, and says its numbers are references"
       pass=$((pass + 1))
     else
       err "cs fields --count did not report true totals (exit $huge_cnt_rc)"
@@ -1448,7 +1525,7 @@ PROBE
     # under `set -o pipefail` that non-zero status fails the whole pipeline even
     # though the match succeeded.
     cnt_capped=$(CS_MAX_RESULTS=2 "$here/cs" fields _hugeprobefield --fleet --count --quiet 2>&1)
-    if printf '%s' "$cnt_capped" | grep -q '^fulfillment-worker-python: writes 121, reads 200$'; then
+    if printf '%s' "$cnt_capped" | grep -q '^fulfillment-worker-python: writes 121, reads 200 '; then
       ok "a count is the graph's total, not the number of rows returned"
       pass=$((pass + 1))
     else
