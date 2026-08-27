@@ -2405,6 +2405,129 @@ rm -rf "$nohash"
 # The constant-path index the old code wrote, in case this machine has one.
 rm -f "${TMPDIR:-/tmp}/cs-tags-.tags"
 
+# ---- cs strictness ---------------------------------------------------------
+# "If I add a field to this response, which consumers REJECT it and crash?" The
+# expensive half of an API-impact review, and the half that was entirely manual.
+# Declared tier: strictness lives in config and model metadata, not control flow.
+info ""
+info "${C_BOLD}cs strictness${C_OFF}"
+mkdir -p "$FLEET_ROOT/kit-service-python/strictprobe" \
+         "$FLEET_ROOT/checkout-service-kotlin/src/main/resources" \
+         "$FLEET_ROOT/web-monorepo-node/strictprobe"
+# BOTH quotings of the same setting. That is the normalisation argument in one
+# fixture: a caller grepping extra="forbid" silently misses extra='forbid',
+# which is the same silent-under-selection class as the composition gap.
+cat > "$FLEET_ROOT/kit-service-python/strictprobe/models.py" <<'PROBE'
+from pydantic import BaseModel, ConfigDict
+from dataclasses import dataclass
+
+
+class DoubleQuoted(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    a: str
+
+
+class SingleQuoted(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    b: str
+
+
+class KeepsExtras(BaseModel):
+    model_config = ConfigDict(extra='allow')
+    c: str
+
+
+@dataclass
+class LegacyPayload:
+    x: str
+
+
+def build(payload):
+    return LegacyPayload(**payload)
+PROBE
+printf 'pydantic==2.6.1\n' > "$FLEET_ROOT/kit-service-python/requirements.txt"
+printf 'spring:\n  jackson:\n    deserialization:\n      fail-on-unknown-properties: true\n' \
+  > "$FLEET_ROOT/checkout-service-kotlin/src/main/resources/application.yaml"
+
+strict_out=$("$here/cs" strictness --fleet 2>&1); strict_rc=$?
+# Four verdicts, and UNKNOWN present as its own row rather than folded in.
+if [[ $strict_rc -eq 0 ]] \
+   && printf '%s' "$strict_out" | grep -q 'checkout-service-kotlin: STRICT' \
+   && printf '%s' "$strict_out" | grep -q 'kit-service-python: MIXED' \
+   && printf '%s' "$strict_out" | grep -q 'pricing-lib-java: UNKNOWN'; then
+  ok "cs strictness reports a per-repo posture, including UNKNOWN"
+  pass=$((pass + 1))
+else
+  err "cs strictness did not classify the fleet (exit $strict_rc)"
+  fail=$((fail + 1)); failed_ids+=("strictness-verdicts")
+fi
+
+# UNKNOWN must be distinguishable from LENIENT in WORDS, not only as a label --
+# collapsing them manufactures exactly the false comfort the tool exists to
+# avoid, and a reader skimming verdicts is the one who needs telling.
+if printf '%s' "$strict_out" | grep -q 'UNKNOWN is NOT lenient'; then
+  ok "UNKNOWN is stated not to mean lenient"; pass=$((pass + 1))
+else
+  err "an undetermined posture was reported without distinguishing it from lenient"
+  fail=$((fail + 1)); failed_ids+=("strictness-unknown-not-lenient")
+fi
+
+# The normalisation this verb exists for: one setting, two quotings, both
+# counted. A regex that handles only one spelling would report 2 strict here.
+detail=$("$here/cs" strictness kit-service-python --fleet 2>&1)
+# Counted, not matched at fixed line numbers: exactly TWO forbid models exist in
+# the probe, one per quoting, so a regex handling a single spelling reports one.
+n_forbid=$(printf '%s' "$detail" | grep -c 'pydantic extra=forbid')
+if [[ "$n_forbid" -eq 2 ]]; then
+  ok "both quotings of extra=forbid are recognised as one setting"
+  pass=$((pass + 1))
+else
+  err "a quoting variant of extra=forbid was missed (found $n_forbid of 2)"
+  fail=$((fail + 1)); failed_ids+=("strictness-quoting-variants")
+fi
+
+# extra=allow is a THIRD state, not a synonym for ignore: unknown fields are
+# RETAINED on the model, so a consumer persisting it verbatim stores them.
+# Collapsing it loses a real downstream effect.
+# Anchored to the EVIDENCE line -- the one naming the file and line -- not to
+# the output as a whole. Two looser versions of this check passed against a
+# sabotaged scanner: the roll-up summary says "(fields RETAINED)", and cs's own
+# standing warning says "RETAINED on the model", so either phrase can be found
+# in the output while the per-model line a reviewer actually reads has lost it.
+if printf '%s' "$detail" | grep 'models\.py:.*extra=allow' | grep -qi 'RETAINED'; then
+  ok "extra=allow is reported as retaining unknown fields, not as plain lenient"
+  pass=$((pass + 1))
+else
+  err "extra=allow was collapsed into lenient, losing the retention effect"
+  fail=$((fail + 1)); failed_ids+=("strictness-allow-third-state")
+fi
+
+# The incident case, and the nastiest one: a plain @dataclass built as
+# Cls(**payload) raises TypeError on an unknown key, and NOTHING in the class
+# declares it. It takes both halves -- the dataclass and the splat -- to see.
+if printf '%s' "$detail" | grep -q 'LegacyPayload(\*\*payload) on a @dataclass'; then
+  ok "a dataclass splatted from a dict is caught, though nothing declares it"
+  pass=$((pass + 1))
+else
+  err "the dataclass-splat strictness case was missed"
+  fail=$((fail + 1)); failed_ids+=("strictness-dataclass-splat")
+fi
+
+# A MIXED repo's model list is what decides the review, so the per-model detail
+# has to be reachable rather than only the roll-up.
+if [[ "$(printf '%s' "$detail" | grep -c 'strictprobe/models.py:')" -ge 4 ]]; then
+  ok "a MIXED repo's per-model evidence is reachable, not just the roll-up"
+  pass=$((pass + 1))
+else
+  err "cs strictness answered the easy question and hid the per-model detail"
+  fail=$((fail + 1)); failed_ids+=("strictness-per-model-detail")
+fi
+
+rm -rf "$FLEET_ROOT/kit-service-python/strictprobe" \
+       "$FLEET_ROOT/kit-service-python/requirements.txt" \
+       "$FLEET_ROOT/checkout-service-kotlin/src/main/resources/application.yaml" \
+       "$FLEET_ROOT/web-monorepo-node/strictprobe"
+
 # ---- cs constructs ---------------------------------------------------------
 # "I am changing the DEFAULT of field X -- who is affected?" A default is only
 # observable where the object is CONSTRUCTED without the field. cs calls answers

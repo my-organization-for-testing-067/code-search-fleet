@@ -44,6 +44,9 @@
 #   cs fields <field|Type::field> [repo]  every read and write site of a field,
 #                                  split by kind -- the API-impact question
 #                                  (graph)
+#   cs strictness [repo]           which repos REJECT unknown fields on
+#                                  deserialization -- the other half of an
+#                                  API-impact review (declared)
 #   cs history <string> [repo]     when a seam entered or left history (git -S)
 #   cs repos                       what is in the current view, and from where
 #   cs scopes                      which workspaces exist to be searched
@@ -2182,6 +2185,7 @@ Which repo publishes this package?               cs provides <coordinate>
 Which repos depend on which?                     cs deps [repo]
 Which version does each repo pin?                cs versions [coordinate]
 Who owns this repo, or this file?                cs owns [repo|repo/path]
+Who CRASHES if I add a field to a response?      cs strictness [repo]
 When did this seam appear, or last change?       cs history <string> [repo]
 What am I actually searching right now?           cs repos
 Which workspaces are there to search at all?     cs scopes
@@ -3504,6 +3508,60 @@ cmd_constructs() {
   report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
 }
 
+# ---- cs strictness ---------------------------------------------------------
+# "If I add a field to this response, which consumers REJECT unknown fields and
+# crash?" That is the expensive half of an API-impact review. Finding the
+# consumers is well served (cs uses, cs fields); classifying each one's parser
+# strictness was entirely manual -- open every consumer, find its
+# deserialization site, work out whether the model forbids extras -- and it is
+# the half where being wrong costs most. The incident behind this class of
+# review is an "additive, non-breaking" field addition that crashed a consumer
+# whose model was a plain dataclass splatted from a dict.
+#
+# It belongs here, and at the `declared` tier, for the same reason cs deps and
+# cs owns do: strictness is declared in config and model metadata rather than
+# inferred from control flow, and the raw signal is plentiful. What was missing
+# is normalisation -- `extra="forbid"` and `extra='forbid'` are one setting in
+# two quotings, and a caller grepping one silently misses the other. Same
+# silent-under-selection class as the composition gap in cs uses.
+cmd_strictness() {
+  require_python3 strictness "reading model metadata and parser configuration"
+  local mode="audit" arg="${1:-}"
+  [[ -n "$arg" ]] && mode="repo"
+  [[ -n "$arg" && ! -d "$view/$arg" ]] && die "no such repo: $arg"
+  answer declared "parser config + model metadata" "$mode"
+
+  # Captured separately rather than with 2>&1, for the reason cs owns does it:
+  # strictness.py writes the UNKNOWN roll-up to stderr on purpose -- "we could
+  # not tell" is a finding about the scan, not a posture a repo declared -- and
+  # merging the streams would put it on stdout as though it were an answer.
+  local out rc err_file
+  err_file=$(cs_tmp cs-strict)
+  out=$(python3 "$lib_dir/strictness.py" "$view" "$mode" ${arg:+"$arg"} 2>"$err_file"); rc=$?
+  [[ "$rc" -eq 2 ]] && { cat "$err_file" >&2; rm -f "$err_file"; die "cs strictness: the scan did not run, so no repo's posture was determined
+  nothing here is a verdict -- an absent answer is not a lenient one"; }
+  if [[ -s "$err_file" ]]; then cat "$err_file" >&2; fi
+  rm -f "$err_file"
+
+  if [[ -z "$out" ]]; then
+    report_answer 0 0
+    hint "cs strictness           (the fleet-wide audit, if you asked about one repo)" \
+         "cs uses 'JsonIgnoreProperties'   (the raw markers, unnormalised)"
+    return $CS_EXIT_NO_HITS
+  fi
+  emit_capped "$out"
+
+  # Every caveat here is about the same thing: a verdict is a summary, and the
+  # decisions it feeds are per-consumer.
+  warn "UNKNOWN is NOT lenient. It means no recognised parser configuration was found, and a repo whose posture is undetermined can still crash on an added field."
+  warn "extra=allow is not simply lenient either: unknown fields are RETAINED on the model, so a consumer that persists the object verbatim (a JSONB column, say) stores them."
+  if [[ "$mode" == "audit" ]]; then
+    warn "a repo-level verdict is a ROLL-UP, not a per-consumer answer — for a MIXED repo the model list is what decides the review: cs strictness <repo>"
+  fi
+  warn "declared, not resolved: this reports what the config and model metadata SAY. A parser configured at runtime, a custom deserializer, or a framework default overridden in code is invisible here."
+  report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
+}
+
 cmd_refs() {
   [[ $# -ge 3 ]] || die "cs refs <symbol> <repo> <file-relative-to-repo>"
   have uvx || die "serena needs uv installed"
@@ -3834,6 +3892,7 @@ case "$sub" in
   impact)  cmd_impact "$@" ;;
   fields)  cmd_fields "$@" ;;
   constructs) cmd_constructs "$@" ;;
+  strictness) cmd_strictness "$@" ;;
   refs)    cmd_refs "$@" ;;
   history) cmd_history "$@" ;;
   repos)   cmd_repos ;;

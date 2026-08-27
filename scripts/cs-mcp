@@ -289,6 +289,17 @@ TOOLS = [
                         "matched construction, not a resolved argument list.",
           required=False)]),
 
+    # The other half of an API-impact review, and the half a search verb cannot
+    # answer: WHO CRASHES if the field is added. Declared tier, like cs_owns.
+    ("cs_strictness", "strictness",
+     "Which repos REJECT unknown fields when deserializing — the 'who crashes "
+     "if I add a field' half of an API-impact review. STRICT / LENIENT / MIXED "
+     "/ UNKNOWN per repo; name a repo for the per-model evidence. UNKNOWN is "
+     "not lenient, it means undetermined.",
+     [SCOPE_ARG,
+      arg("repo", "Limit to this repo, and list its per-model evidence "
+                  "instead of the roll-up.", required=False)]),
+
     ("cs_refs", "refs",
      "What references this symbol, resolved by a language server — bridges "
      "dependency injection that text search cannot follow.",
