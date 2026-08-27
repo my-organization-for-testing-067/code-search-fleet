@@ -129,26 +129,52 @@ SCOPE_ARG = arg(
     '"fleet" answers from main only.',
 )
 
+# `word` is declared on every verb that takes an identifier, not just cs_text.
+# The flag was always passed through (see the flags block in call_tool) and
+# always accepted by the CLI, so the capability was present and only the
+# DECLARATION was missing -- which over MCP is the same as not having it, since
+# a caller can only send what the schema names.
+#
+# The cost of the omission is asymmetric, which is why it is worth a comment.
+# cs_uses substring-matches, so a compound identifier matches every longer
+# identifier containing it: the reported case returned 1,305 hits across 6
+# repos where the whole-word answer was 2 call sites. A malformed query of this
+# shape does not error and does not return a suspicious zero -- it returns
+# false ABUNDANCE, and a large hit count reads as thorough coverage.
+WORD_ARG = arg(
+    "word",
+    "Match whole identifiers only, not substrings of longer ones. Use this "
+    "whenever the query is a compound identifier (a type or method name) "
+    "rather than a string-shaped seam such as a route, topic or config key.",
+    required=False,
+    type_="boolean",
+)
+
 TOOLS = [
     # --- the questions ------------------------------------------------------
     ("cs_uses", "uses",
      "Who uses this string in CODE across every repo — comments excluded. The "
-     "cross-repo caller question: start here for an endpoint, topic or config key.",
+     "cross-repo caller question: start here for an endpoint, topic or config "
+     "key. For a compound IDENTIFIER rather than a string-shaped seam, pass "
+     "word: this substring-matches by default, and a compound name then "
+     "matches every longer name containing it.",
      [arg("query", "The string to find: an endpoint path, topic name, config key."),
-      SCOPE_ARG]),
+      SCOPE_ARG,
+      WORD_ARG]),
 
     ("cs_seam", "seam",
      "Which repos share this string, comments included — and warns when only "
      "one does, which is how a dead seam looks.",
-     [arg("query", "The string that would form the seam."), SCOPE_ARG]),
+     [arg("query", "The string that would form the seam."),
+      SCOPE_ARG,
+      WORD_ARG]),
 
     ("cs_text", "text",
      "Plain text or regex across every repo, comments included. The fallback "
      "when no sharper question fits.",
      [arg("pattern", "A literal string or regex."),
       SCOPE_ARG,
-      arg("word", "Match whole identifiers only, not substrings of longer ones.",
-          required=False, type_="boolean")]),
+      WORD_ARG]),
 
     ("cs_def", "def",
      "Where a symbol is defined, across the fleet or within one repo.",

@@ -2580,6 +2580,72 @@ else
 fi
 rm -rf "$mcp_stub"
 
+# A flag the CLI honours but the MCP schema does not NAME is, over MCP, a flag
+# that does not exist: a caller can only send what the schema declares. `word`
+# was declared on cs_text alone while the passthrough and the CLI accepted it
+# everywhere, so the two verbs most likely to be handed an identifier could not
+# ask for whole-identifier matching.
+#
+# The cost runs in the dangerous direction. cs_uses substring-matches, so a
+# compound identifier matches every longer identifier containing it -- the
+# answer is not an error and not a suspicious zero but false ABUNDANCE, and a
+# big hit count reads as thorough coverage.
+#
+# The two-repo probe from the whole-identifier section is re-seeded here: it is
+# torn down where it was used, and this check needs a query whose whole-word
+# and substring answers DIFFER, or it would pass against a verb that silently
+# ignored the flag.
+#
+# Asserted as a RULE rather than as a list of three tool names: every tool
+# whose cs subcommand changes its answer under --word must declare `word`.
+# Written the other way it would go stale the next time a verb is added.
+printf 'class AccessionUpdateIn { }\nvar handler = new AccessionUpdateIn();\n' \
+  > "$FLEET_ROOT/inventory-api-dotnet/src/AccessionUpdateIn.cs"
+mkdir -p "$FLEET_ROOT/web-monorepo-node/schemas"
+printf 'input AccessionUpdateInput {\n  id: ID!\n}\n' \
+  > "$FLEET_ROOT/web-monorepo-node/schemas/data.graphql"
+
+word_bad=()
+for wsub in uses seam text; do
+  wa=$("$here/cs" "$wsub" 'AccessionUpdateIn' --fleet --quiet 2>/dev/null | grep -c '[^[:space:]]')
+  wb=$("$here/cs" "$wsub" 'AccessionUpdateIn' --fleet --word --quiet 2>/dev/null | grep -c '[^[:space:]]')
+  [[ "$wa" -ne "$wb" ]] || { word_bad+=("cs $wsub ignores --word (probe is wrong)"); continue; }
+  printf '%s\n' "$mcp_list" | CS_SUB="$wsub" python3 -c '
+import json, os, sys
+sub = os.environ["CS_SUB"]
+lines = [l for l in sys.stdin.read().splitlines() if l.startswith("meta\t")]
+tools = json.loads(lines[1].split("\t", 1)[1])["tools"]
+t = next(t for t in tools if t["name"] == "cs_" + sub)
+props = t["inputSchema"]["properties"]
+assert "word" in props, "cs_%s does not declare word" % sub
+assert props["word"]["type"] == "boolean", "cs_%s word is not boolean" % sub
+assert "word" not in t["inputSchema"].get("required", []), \
+    "cs_%s makes word required" % sub
+' 2>/dev/null || word_bad+=("cs_$wsub")
+done
+if [[ ${#word_bad[@]} -eq 0 ]]; then
+  ok "every verb whose answer --word changes declares word over MCP"
+  pass=$((pass + 1))
+else
+  err "a --word-sensitive verb does not declare it over MCP: ${word_bad[*]}"
+  fail=$((fail + 1)); failed_ids+=("mcp-word-declared")
+fi
+
+# Declaring it is half the fix; the value has to reach cs and change the
+# answer. Asserted end to end rather than by reading the flags block, because
+# the passthrough being generic is exactly what made the omission easy to miss.
+mcp_wide=$(mcp_req cs_uses '{"query":"AccessionUpdateIn","scope":"fleet"}' | mcp_drive "$FLEET_ROOT")
+mcp_word=$(mcp_req cs_uses '{"query":"AccessionUpdateIn","scope":"fleet","word":true}' | mcp_drive "$FLEET_ROOT")
+if printf '%s' "$mcp_wide" | grep -q '3 hit' \
+   && printf '%s' "$mcp_word" | grep -q '2 hit'; then
+  ok "word=true over MCP narrows cs_uses to whole identifiers"; pass=$((pass + 1))
+else
+  err "word=true over MCP did not change the answer: $mcp_word"
+  fail=$((fail + 1)); failed_ids+=("mcp-word-effective")
+fi
+rm -f "$FLEET_ROOT/inventory-api-dotnet/src/AccessionUpdateIn.cs"
+rm -rf "$FLEET_ROOT/web-monorepo-node/schemas"
+
 # ---- query log -------------------------------------------------------------
 # An opt-in JSONL line per query, recording the outcome. Two of the properties
 # below are not "does the feature work" but "does it fail safe", and they are
