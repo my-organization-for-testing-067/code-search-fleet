@@ -39,6 +39,8 @@
 #   cs callees <symbol> <repo>     what this symbol calls (graph)
 #   cs impact <symbol> <repo>      what depends on it, transitively (graph)
 #   cs refs   <symbol> <repo> <file>   references to a symbol (LSP)
+#   cs constructs <Type> [repo]    every construction site, across the shapes a
+#                                  type can be built by (graph-free, ast-grep)
 #   cs fields <field|Type::field> [repo]  every read and write site of a field,
 #                                  split by kind -- the API-impact question
 #                                  (graph)
@@ -60,6 +62,9 @@
 #   --refresh        rebuild the cached symbol index instead of reusing it
 #   --porcelain      one JSON object on stdout instead of result lines
 #                    (CS_JSON=1 does the same; stderr is unaffected)
+#   --field=<name>   cs constructs only: mark each construction site present or
+#                    ABSENT for this field. ABSENT sites inherit its default,
+#                    which is where a default change is observable.
 #   --count          cs fields only: per-repo write/read SITE tallies instead of
 #                    the site list -- the same quantity the listing reports, so
 #                    the two modes agree. Survives the output truncation that
@@ -2165,6 +2170,7 @@ Which repos share this string?                   cs seam <string>
 Any text or regex, including comments            cs text <pattern>
 Where is this symbol defined?                    cs def <symbol> [repo]
 What calls look like X, or take literal Y?       cs calls '<pattern>' [lang]
+Where is this type CONSTRUCTED (all idioms)?     cs constructs <Type> [repo]
 What implements this interface?                  cs impls <symbol> <repo>
 What calls this symbol?                          cs callers <symbol> <repo>
 What does this symbol call?                      cs callees <symbol> <repo>
@@ -2730,6 +2736,24 @@ cmd_calls() {
     return $CS_EXIT_NO_HITS
   fi
   emit_capped "$out"
+  # ONE pattern is one shape, and the answer otherwise reads as complete. The
+  # reported case: `cs calls '<Type>($$$ARGS)' python` returned 2 of 3 known
+  # construction sites -- the third went through a classmethod factory -- and
+  # nothing said a whole shape had never been looked at. This line is the cheap
+  # half of cs constructs, and it is worth having on its own: it turns an
+  # incomplete answer into an obviously incomplete one.
+  #
+  # Said only when the pattern looks like a CONSTRUCTION, because that is the
+  # question with a known set of sibling shapes. A general pattern has no such
+  # set, and a warning that fires on every query stops being read.
+  case "$pattern" in
+    *'($$$'*|*'( $$$'*)
+      info ""
+      info "this matched ONE shape: $pattern"
+      info "  sibling shapes were NOT searched — a factory method, a builder chain, a"
+      info "  copy/clone, or a deserializer constructs without matching this pattern"
+      info "  ${C_BOLD}cs constructs <Type>${C_OFF} unions those shapes and says which it covered" ;;
+  esac
   report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
 }
 
@@ -3330,6 +3354,156 @@ cmd_fields() {
   fi
 }
 
+# ---- cs constructs ---------------------------------------------------------
+# "I am changing the DEFAULT of field X -- who is affected?" A default is only
+# observable where the object is CONSTRUCTED, and specifically at the sites that
+# OMIT the field and inherit it. Every site that passes a value is unaffected.
+#
+# cs calls answers this well for one shape and silently misses the rest. The
+# reported case: `cs calls '<Type>($$$ARGS)' python` returned 2 of 3 known
+# construction sites -- the third went through a classmethod factory -- and
+# nothing in the answer indicated a whole construction shape had never been
+# looked at. "7 hit(s)" reads as thorough. That is the silent under-selection
+# class: the sensor answered the question it was asked, and the question was
+# narrower than the caller's intent. Worse, writing enough patterns requires
+# already knowing which idioms the codebase uses, and a caller who knew that
+# would not need the search.
+#
+# So this verb OWNS the enumeration. The shapes it searches and the shapes it
+# cannot are both part of the answer, every time -- the disclosure is the
+# feature, not a footnote on it.
+#
+# Priority order matters: `new T(...)` also contains `T(...)`, so the more
+# specific shape is tried first and a location already claimed is not re-listed
+# under a weaker label.
+CS_CONSTRUCT_SHAPES='ctor-new|new %s($$$ARGS)
+ctor|%s($$$ARGS)
+builder?|%s.builder($$$ARGS)
+factory?|%s.$M($$$ARGS)'
+
+# Named in every answer. These are constructions no pattern here can find, and
+# a caller who does not know that will read the result as the complete set.
+construct_blind_spots() {
+  warn "shapes NOT searched, and a construction in any of them is missing from this answer:"
+  warn "  cls(…) / self.__class__(…) inside the type's own module — a factory's own body"
+  warn "  clone and copy: x.copy(…), x.model_copy(…), {...obj} — the receiver's type is not known to a pattern matcher"
+  warn "  deserialization: json.loads → model, ORM row hydration — these construct without naming any field, so a default change is invisible at the call site"
+  warn "  reflection, DI containers, and generated code"
+}
+
+constructs_via_ast_grep() {  # <type> [only-repo]
+  local type="$1" only="${2:-}" shape pat out="" line loc
+  local seen_f; seen_f=$(cs_tmp cs-constr-seen)
+  local searched=""
+  : > "$seen_f"
+
+  while IFS='|' read -r shape pat; do
+    [[ -n "$shape" ]] || continue
+    # ONE argument, not two: every pattern carries a single %s, and printf
+    # repeats its format for each extra argument -- two here rendered
+    # `new T($$$ARGS)new T($$$ARGS)`, which matches nothing anywhere.
+    # shellcheck disable=SC2059
+    local rendered; rendered=$(printf "$pat" "$type")
+    local raw rc err_f
+    err_f=$(cs_tmp cs-engerr)
+    raw=$( (cd "$view" && run_timed ast-grep --follow -p "$rendered") 2>"$err_f" ); rc=$?
+    note_search_result "$rc" "$err_f" ast-grep "matching the $shape shape for '$type'"
+    rm -f "$err_f"
+    searched="$searched $shape"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      # `repo/path:line`, split at the FIRST `:digits:` -- the same rule
+      # json_results learned the hard way, since a matched line's TEXT can
+      # carry `:NN:` and a path almost never does.
+      loc=$(printf '%s' "$line" | sed -n 's/^\([^:]*:[0-9][0-9]*\):.*/\1/p')
+      [[ -n "$loc" ]] || loc="$line"
+      grep -qxF "$loc" "$seen_f" && continue
+      printf '%s\n' "$loc" >> "$seen_f"
+      out="${out:+$out
+}$(printf '%s' "$line" | sed "s|^\([^:]*:[0-9][0-9]*\): *|\1: [$shape] |")"
+    done < <(printf '%s\n' "$raw" | normalize)
+  done <<EOF
+$CS_CONSTRUCT_SHAPES
+EOF
+  rm -f "$seen_f"
+
+  if [[ -n "$only" ]]; then
+    out=$(printf '%s\n' "$out" | grep "^$only/" || true)
+  fi
+  printf '%s' "$out"
+}
+
+# Read from the shape table rather than reported back from the search function:
+# that runs inside `$(...)`, and a variable set in a subshell never reaches the
+# caller -- the same trap that left --source-only's exclusion out of the
+# envelope. The list is static, so there is nothing to report back.
+construct_shape_names() {
+  printf '%s\n' "$CS_CONSTRUCT_SHAPES" | cut -d'|' -f1 | tr '\n' ' ' | sed 's/ $//'
+}
+
+cmd_constructs() {
+  [[ $# -ge 1 ]] || die "cs constructs <Type> [repo]
+  every construction site of a type, across the shapes it can be built by"
+  local type="$1" only="${2:-}" out
+  have ast-grep || die "cs constructs needs ast-grep, and it is not installed
+  semgrep is not a substitute here: this verb runs several patterns and unions
+  them, and the two engines take different pattern dialects
+  weaker but available now: cs uses '$type', cs calls '$type(\$\$\$ARGS)'"
+  case "${force_engine:-}" in
+    ""|ast-grep) ;;
+    *) die "cs constructs has no engine named '$force_engine'
+  it answers from: ast-grep, and nothing else" ;;
+  esac
+  [[ -n "$only" && ! -d "$view/$only" ]] && die "no such repo: $only"
+
+  answer structural "ast-grep" "construction shapes, unioned"
+  out=$(constructs_via_ast_grep "$type" "$only")
+
+  if [[ -z "$out" ]]; then
+    engines_ok_or_die constructs
+    report_answer 0 0
+    # The disclosure matters MORE on an empty answer than on a full one: this is
+    # exactly where "no construction sites" would be read as "nothing builds
+    # this", and the unsearched shapes are the reason that reading is unsafe.
+    construct_blind_spots
+    hint "cs uses '$type'         (a construction in an unsearched shape is still a mention)" \
+         "cs def $type            (confirm the type exists and is spelled this way)"
+    return $CS_EXIT_NO_HITS
+  fi
+
+  # --field turns "who constructs it" into "who inherits the default", which is
+  # the question a default change is actually reviewed against. The test is
+  # textual -- does the matched construction mention the field -- so it is a
+  # heuristic marker on a structural hit, and is labelled as one rather than
+  # silently upgraded to the answer.
+  if [[ -n "$construct_field" ]]; then
+    out=$(printf '%s\n' "$out" | awk -v f="$construct_field" '
+      {
+        body = $0
+        sub(/^[^:]*:[0-9]+: /, "", body)
+        mark = (index(body, f) > 0) ? "present" : "ABSENT"
+        sub(/\] /, "] " mark " ", $0)
+        print
+      }')
+  fi
+
+  emit_capped "$out"
+  info ""
+  info "${C_BOLD}shapes searched:${C_OFF} $(construct_shape_names)"
+  if [[ -n "$construct_field" ]]; then
+    local n_absent
+    n_absent=$(printf '%s\n' "$out" | grep -c 'ABSENT' || true)
+    info "${C_BOLD}$n_absent site(s) do not mention '$construct_field'${C_OFF} — those inherit its default and are what a default change is observable at"
+    warn "present/ABSENT is a TEXTUAL test on the matched construction, not a resolved argument list: a field passed via **kwargs, a spread, or a variable holding the name reads as ABSENT"
+  fi
+  construct_blind_spots
+  # `factory?` and `builder?` carry a question mark because a pattern matcher
+  # cannot check the return type: `T.parse(x)` and `T.of(x)` match the same
+  # shape, and only one of them constructs.
+  warn "a hit labelled factory? or builder? matched the SHAPE of a construction; nothing here verifies the method returns a $type"
+  report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
+}
+
 cmd_refs() {
   [[ $# -ge 3 ]] || die "cs refs <symbol> <repo> <file-relative-to-repo>"
   have uvx || die "serena needs uv installed"
@@ -3585,6 +3759,8 @@ source_only=0
 # cs fields only. Refused rather than ignored on every other subcommand -- a
 # dropped flag looks exactly like a flag that was honoured and changed nothing.
 count_mode=0
+# cs constructs only: which field to mark present/ABSENT on each site.
+construct_field=""
 # Env as well as a flag: a caller wrapping cs in a script it does not control
 # can set CS_JSON=1 once rather than threading a flag through every call site.
 case "${CS_JSON:-0}" in 1|true|yes) porcelain=1 ;; esac
@@ -3608,6 +3784,7 @@ for a in "$@"; do
     --word|-w) word_match=1 ;;
     --source-only) source_only=1 ;;
     --count) count_mode=1 ;;
+    --field=*) construct_field="${a#--field=}" ;;
     *) args+=("$a") ;;
   esac
 done
@@ -3656,6 +3833,7 @@ case "$sub" in
   callees) cmd_callees "$@" ;;
   impact)  cmd_impact "$@" ;;
   fields)  cmd_fields "$@" ;;
+  constructs) cmd_constructs "$@" ;;
   refs)    cmd_refs "$@" ;;
   history) cmd_history "$@" ;;
   repos)   cmd_repos ;;

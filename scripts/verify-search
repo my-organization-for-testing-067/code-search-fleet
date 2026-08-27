@@ -2405,6 +2405,141 @@ rm -rf "$nohash"
 # The constant-path index the old code wrote, in case this machine has one.
 rm -f "${TMPDIR:-/tmp}/cs-tags-.tags"
 
+# ---- cs constructs ---------------------------------------------------------
+# "I am changing the DEFAULT of field X -- who is affected?" A default is only
+# observable where the object is CONSTRUCTED without the field. cs calls answers
+# that for ONE shape: the reported case returned 2 of 3 known sites, because the
+# third went through a classmethod factory, and nothing in the answer said a
+# whole shape had never been looked at. "7 hit(s)" reads as thorough.
+#
+# The enumeration is the feature. A caller who could write enough patterns would
+# have to already know which idioms the codebase uses -- and if they knew that,
+# they would not need the search.
+info ""
+info "${C_BOLD}cs constructs${C_OFF}"
+if ! command -v ast-grep >/dev/null 2>&1; then
+  skip "cs constructs" "ast-grep not installed"
+else
+  # Three shapes on one type, which is the reported shape of the miss: a direct
+  # constructor in a test (the most informative hit for a default change) and a
+  # factory the constructor pattern cannot see.
+  cat > "$FLEET_ROOT/fulfillment-worker-python/fulfillment/ctorprobe.py" <<'PROBE'
+from dataclasses import dataclass
+
+
+@dataclass
+class CtorProbe:
+    alpha: str
+    beta: str = "d"
+
+    @classmethod
+    def from_record(cls, rec):
+        return cls(alpha=rec["a"], beta=rec["b"])
+
+
+def direct():
+    return CtorProbe(alpha="x", beta="y")
+
+
+def without_beta():
+    return CtorProbe(alpha="x")
+
+
+def via_factory(rec):
+    return CtorProbe.from_record(rec)
+PROBE
+
+  ctor_out=$("$here/cs" constructs CtorProbe --fleet 2>&1); ctor_rc=$?
+  # The constructor sites AND the factory call, which `CtorProbe($$$ARGS)`
+  # alone does not match -- that gap is the whole report.
+  if [[ $ctor_rc -eq 0 ]] \
+     && printf '%s' "$ctor_out" | grep -q 'ctorprobe.py:15: \[ctor\]' \
+     && printf '%s' "$ctor_out" | grep -q 'ctorprobe.py:19: \[ctor\]' \
+     && printf '%s' "$ctor_out" | grep -q 'ctorprobe.py:23: \[factory?\]'; then
+    ok "cs constructs finds the factory shape a constructor pattern misses"
+    pass=$((pass + 1))
+  else
+    err "cs constructs did not union the construction shapes (exit $ctor_rc)"
+    fail=$((fail + 1)); failed_ids+=("constructs-shape-union")
+  fi
+
+  # A single ast-grep pattern is what the report used, and it finds two of the
+  # three. Asserted so the probe itself is known to reproduce the gap -- without
+  # this, the check above could pass against a fixture that never had one.
+  if [[ "$("$here/cs" calls 'CtorProbe($$$ARGS)' python --fleet --quiet 2>/dev/null | grep -c 'ctorprobe.py')" -eq 2 ]]; then
+    ok "the single-pattern route still finds only 2 of the 3, as reported"
+    pass=$((pass + 1))
+  else
+    err "the probe does not reproduce the reported single-pattern gap"
+    fail=$((fail + 1)); failed_ids+=("constructs-probe-valid")
+  fi
+
+  # Both halves of the disclosure: what WAS searched, and what could not be.
+  # The second matters more on an empty answer than a full one, which is why it
+  # is printed either way.
+  if printf '%s' "$ctor_out" | grep -q 'shapes searched:' \
+     && printf '%s' "$ctor_out" | grep -q 'shapes NOT searched' \
+     && printf '%s' "$ctor_out" | grep -q 'deserialization'; then
+    ok "cs constructs names the shapes it searched and the ones it cannot"
+    pass=$((pass + 1))
+  else
+    err "cs constructs answered without disclosing its shape coverage"
+    fail=$((fail + 1)); failed_ids+=("constructs-disclosure")
+  fi
+
+  # The blind spots have to be on the ZERO answer too. That is precisely where
+  # "no construction sites" gets read as "nothing builds this".
+  none_out=$("$here/cs" constructs ZzzNoSuchTypeAnywhere --fleet 2>&1)
+  if printf '%s' "$none_out" | grep -q 'shapes NOT searched'; then
+    ok "a zero-hit construct answer still names what it did not search"
+    pass=$((pass + 1))
+  else
+    err "an empty cs constructs answer read as complete"
+    fail=$((fail + 1)); failed_ids+=("constructs-zero-disclosure")
+  fi
+
+  # --field is the half that closes the question: which sites OMIT the field and
+  # therefore inherit its default.
+  fld_out=$("$here/cs" constructs CtorProbe --fleet --field=beta 2>&1)
+  if printf '%s' "$fld_out" | grep -q 'ctorprobe.py:15: \[ctor\] present' \
+     && printf '%s' "$fld_out" | grep -q 'ctorprobe.py:19: \[ctor\] ABSENT' \
+     && printf '%s' "$fld_out" | grep -q "do not mention 'beta'"; then
+    ok "--field marks the sites that omit it, which inherit the default"
+    pass=$((pass + 1))
+  else
+    err "--field did not separate present from ABSENT construction sites"
+    fail=$((fail + 1)); failed_ids+=("constructs-field-absent")
+  fi
+
+  # It is a TEXTUAL test on a structural hit, and must say so rather than let
+  # present/ABSENT read as a resolved argument list.
+  if printf '%s' "$fld_out" | grep -q 'TEXTUAL test'; then
+    ok "present/ABSENT is labelled a textual test, not a resolved one"
+    pass=$((pass + 1))
+  else
+    err "--field presented a heuristic marker as resolved evidence"
+    fail=$((fail + 1)); failed_ids+=("constructs-field-heuristic")
+  fi
+
+  # The cheap half of the same report, on cs calls itself: one pattern is one
+  # shape, and saying so turns an incomplete answer into an obviously
+  # incomplete one. Only for construction-shaped patterns -- a warning on every
+  # query stops being read.
+  calls_out=$("$here/cs" calls 'CtorProbe($$$ARGS)' python --fleet 2>&1)
+  plain_out=$("$here/cs" calls 'json.loads($X)' python --fleet 2>&1)
+  if printf '%s' "$calls_out" | grep -q 'matched ONE shape' \
+     && printf '%s' "$calls_out" | grep -q 'cs constructs' \
+     && ! printf '%s' "$plain_out" | grep -q 'matched ONE shape'; then
+    ok "cs calls says a construction pattern is one shape, and stays quiet otherwise"
+    pass=$((pass + 1))
+  else
+    err "cs calls did not disclose that it matched a single construction shape"
+    fail=$((fail + 1)); failed_ids+=("calls-one-shape-note")
+  fi
+
+  rm -f "$FLEET_ROOT/fulfillment-worker-python/fulfillment/ctorprobe.py"
+fi
+
 # ---- source vs data in a text answer ---------------------------------------
 # A measured `cs uses` answer was 1,295 hits, of which 1,271 were data files and
 # 1,192 came from ONE test-resources CSV. The 24 source hits were the answer:
