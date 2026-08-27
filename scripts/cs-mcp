@@ -225,6 +225,23 @@ TOOLS = [
       arg("repo", "The repo directory name holding it."),
       SCOPE_ARG]),
 
+    # Fleet-wide, unlike the three above it: the field-level impact question
+    # stops making sense at a repo boundary, so `repo` here NARROWS rather than
+    # being required. The read/write split is named in the description because
+    # it is the reason to reach for this instead of cs_uses, and a caller
+    # reading only the tool list would otherwise see "another search verb".
+    ("cs_fields", "fields",
+     "Every READ and WRITE site of a field, across every repo with a graph, "
+     "split by access kind — the API-impact question. Writes observe an added "
+     "field or a changed default; reads break on a removal, rename or retype. "
+     "Prefer this over cs_uses for a field: text search cannot tell the two "
+     "apart.",
+     [arg("field", "The field name. Type::field is accepted but tokensave 7.9.0 "
+                   "parses the qualifier without applying it, and cs refuses "
+                   "rather than return the unnarrowed answer under it."),
+      SCOPE_ARG,
+      arg("repo", "Limit to this repo directory name.", required=False)]),
+
     ("cs_refs", "refs",
      "What references this symbol, resolved by a language server — bridges "
      "dependency injection that text search cannot follow.",

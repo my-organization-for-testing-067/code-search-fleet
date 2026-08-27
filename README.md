@@ -28,7 +28,7 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 163 checks against a throwaway fixture fleet
+scripts/verify-search              # 172 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only
@@ -38,11 +38,11 @@ Every *engine* is optional; `cs engines` reports what is present and `cs` routes
 around what is missing rather than failing silently.
 
 **`python3` is the one hard requirement** — `uses`, `provides`, `deps`,
-`publishes`, `versions`, `owns`, `impls`, `refs` and symbol mode all run through
-it. It is
-separate from the engines because it does not degrade: those commands refuse
-rather than answer without it. Nothing installs it for you (a system python is
-the OS's business), but `bootstrap` and `cs engines` both report it.
+`publishes`, `versions`, `owns`, `impls`, `refs`, `fields` and symbol mode all
+run through it. It is separate from the engines because it does not degrade:
+those commands refuse rather than answer without it. Nothing installs it for you
+(a system python is the OS's business), but `bootstrap` and `cs engines` both
+report it.
 
 `timeout(1)` is worth having too. Without it a hung language server hangs `cs`
 with no upper bound, and a search that never returns is the one outcome worse
@@ -61,6 +61,7 @@ than a wrong one, because nothing reports it. `brew install coreutils` on macOS.
 | What calls this symbol | `cs callers <symbol> <repo>` |
 | What this symbol calls | `cs callees <symbol> <repo>` |
 | What breaks if I change this symbol | `cs impact <symbol> <repo>` |
+| Who reads or writes this field, fleet-wide | `cs fields <field> [repo]` |
 | What references this symbol (bridges DI) | `cs refs <symbol> <repo> <file>` |
 | Which repo publishes this package | `cs provides <coordinate>` |
 | Which repos depend on which | `cs deps [repo]` |
@@ -252,10 +253,62 @@ Without that line a definition living in an unindexed repo would look exactly
 like a symbol that does not exist, which is the failure this whole project is
 organised against.
 
+### The field-level impact question, split by access kind
+
+`cs uses` answers *"who is affected if I change field X"* textually, which is
+the one shape text cannot express: it has no read/write distinction. That
+matters because a field change has **two different blast radii**, and which one
+you care about depends on the change:
+
+- an **additive** change, or a changed **default**, can only be observed where
+  the field is **written** — it is invisible anywhere the object is merely read
+- a **removal, rename or retype** breaks where the field is **read**
+
+A grep collapses both into one list, so reviewing a default-value change with a
+text sweep returns precisely the sites where the change is *not* observable.
+
+```
+$ cs fields _threshold --fleet
+fulfillment-worker-python/fulfillment/discounts.py:14: [write] in DiscountEngine::__init__ self._threshold = waiver_threshold_cents
+fulfillment-worker-python/fulfillment/discounts.py:17: [read] in DiscountEngine::handling_fee_cents if subtotal_cents >= self._threshold:
+
+write sites: 1 (shown 1) — these observe an added field or a changed default
+read sites:  1 (shown 1) — these break on a removal, rename or retype
+answer: structural via tokensave (graph) (2 repo graph(s), read/write split) · 2 hit(s) · 1 repo(s)
+```
+
+Unlike `cs callers` / `cs callees` / `cs impact`, this one is **fleet-wide**:
+"who is affected" stops making sense at a repo boundary. Graphs are still
+per-repo, so the union is assembled across them and the repos with no graph are
+named — a field read in an unindexed repo looks exactly like a field nobody
+reads.
+
+Three things it refuses or discloses rather than guessing, all measured against
+tokensave 7.9.0:
+
+- **An empty answer refuses.** `field_sites` returns zero counts with exit 0 for
+  a field that does not exist, in the identical shape it returns for a field
+  that exists and is never touched — and `find_exact_symbol` reports count 0 for
+  a *real* field too, because field nodes are not in that index. Nothing can
+  separate the two, and *"nothing reads this field"* is the answer someone
+  deletes a field on.
+- **A `Type::field` qualifier that is not applied refuses.** The qualifier is
+  parsed and then dropped, and the *bare-name* results come back regardless:
+  `DiscountEngine::_threshold` and a fabricated `NoSuchClass::_threshold` return
+  identical sites. Answering would put the broad question's result under the
+  narrow question's heading.
+- **The cap is per access kind, and engine truncation is `PARTIAL`.** Reads
+  outnumber writes heavily, so one cap over the combined stream would spend the
+  budget on reads and truncate the writes away. Separately, `tokensave tool`
+  cuts its own stdout at 15000 characters — mid-token, leaving invalid JSON — so
+  above roughly 75 sites the reads are re-requested with a limit and become a
+  sample of an unknown total. That is reported as `PARTIAL` with the read count
+  spelled `≥N`, never as a complete answer.
+
 ### And the same graph answers the symbol half of a question
 
 `cs uses`, `cs seam` and `cs history` ask about **names**. `cs callers`,
-`cs callees`, `cs impact` and `cs impls` ask about **symbols**. Both are here
+`cs callees`, `cs impact`, `cs impls` and `cs fields` ask about **symbols**. Both are here
 because a real question crosses between them — *"I am renaming this route, what
 breaks"* starts as a seam question and ends as a symbol one — and the handoff to
 a second tool with a second scoping model is the cost worth removing.

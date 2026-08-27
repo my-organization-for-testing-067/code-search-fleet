@@ -39,6 +39,9 @@
 #   cs callees <symbol> <repo>     what this symbol calls (graph)
 #   cs impact <symbol> <repo>      what depends on it, transitively (graph)
 #   cs refs   <symbol> <repo> <file>   references to a symbol (LSP)
+#   cs fields <field|Type::field> [repo]  every read and write site of a field,
+#                                  split by kind -- the API-impact question
+#                                  (graph)
 #   cs history <string> [repo]     when a seam entered or left history (git -S)
 #   cs repos                       what is in the current view, and from where
 #   cs scopes                      which workspaces exist to be searched
@@ -142,6 +145,9 @@ root="${FLEET_ROOT:-$PWD}"
 #
 # 1 stays the refusal so that anything already checking "did this fail" keeps
 # working; 2 is the newly distinguishable case.
+# Set when an ENGINE returned a knowingly incomplete answer -- distinct from a
+# timeout or an unreadable file, and folded into the same PARTIAL flag.
+CS_SOURCE_PARTIAL=0
 CS_EXIT_REFUSED=1
 CS_EXIT_NO_HITS=2
 
@@ -348,10 +354,11 @@ cs_emit_porcelain() {
   [[ $porcelain -eq 1 ]] || return 0
   local refused=false
   [[ "$rc" -eq "$CS_EXIT_REFUSED" ]] && refused=true
-  # PARTIAL covers both ways a result can be a subset of the truth: an engine
-  # that ran out of time, and files it could not read.
+  # PARTIAL covers every way a result can be a subset of the truth: an engine
+  # that ran out of time, files it could not read, and an engine that truncated
+  # its own output (cs fields -- tokensave cuts stdout at 15000 characters).
   local partial=false
-  { timed_out || files_skipped; } && partial=true
+  { timed_out || files_skipped || [[ "${CS_SOURCE_PARTIAL:-0}" -eq 1 ]]; } && partial=true
   printf '{'
   printf '"cs":1,'
   printf '"subcommand":%s,' "$(json_str "$CS_SUB")"
@@ -2035,6 +2042,7 @@ What implements this interface?                  cs impls <symbol> <repo>
 What calls this symbol?                          cs callers <symbol> <repo>
 What does this symbol call?                      cs callees <symbol> <repo>
 What breaks if I change this symbol?             cs impact <symbol> <repo>
+Who reads / writes this FIELD, fleet-wide?       cs fields <field> [repo]
 What references this symbol (bridges DI)?        cs refs <symbol> <repo> <file>
 Which repo publishes this package?               cs provides <coordinate>
 Which repos depend on which?                     cs deps [repo]
@@ -2066,6 +2074,15 @@ Symbol mode answers from a per-repo graph, so it sees ONE repo at ONE layer and
 there is no union of your ticket workspace and the fleet. Every such answer says
 which index answered and how old it is; read that line. The cross-repo half of
 the same question is cs uses, which searches the layered view.
+
+cs fields is the field-level half of the impact question, and it is the one
+graph verb that is FLEET-wide rather than per-repo: "who is affected if I change
+X" stops making sense at a repo boundary. It splits the sites by ACCESS KIND
+because that is two different blast radii from one query -- an added field or a
+changed default can only be observed where the field is WRITTEN, while a
+removal, rename or retype breaks where it is READ. A text sweep collapses both,
+which is why grepping a default-value change returns precisely the sites where
+the change is not observable.
 
 Symbol mode fronts three graph questions on purpose, not ninety. Dead code,
 coupling, complexity, blame, test mapping, call chains, inheritance depth: those
@@ -2916,6 +2933,167 @@ cmd_impact() {
   symbol_graph_query impact "$1" "$2"
 }
 
+# ---- cs fields -------------------------------------------------------------
+# "If I change, remove, rename or re-default field X, who is affected?" -- the
+# core question of an API-impact review, and the one shape the other verbs
+# cannot express. cs uses / cs text / cs seam answer it TEXTUALLY: no read/write
+# distinction, no enclosing symbol, and no way to separate the code that SETS a
+# field from the code that reads it. cs callers / cs callees / cs impact answer
+# structurally but are symbol-scoped, and a field is not a symbol they take.
+#
+# The write/read split is the whole value, because it is two different blast
+# radii from one query:
+#
+#   - an additive change, or a changed DEFAULT, can only be observed by the
+#     WRITE sites; it is unobservable anywhere the object is merely read
+#   - a removal, rename or retype breaks the READ sites
+#
+# A text sweep collapses both into one list, which is why reviewing a
+# default-value change with grep returns precisely the sites where the change
+# is NOT observable.
+#
+# Unlike cs callers/callees/impact this is fleet-wide rather than per-repo: the
+# question is "who is affected", and stopping at a repo boundary answers a
+# smaller question than the one asked. Graphs are still per-repo, so the union
+# is assembled here and the repos with no graph are NAMED -- a field read in an
+# unindexed repo looks exactly like a field nobody reads.
+fields_via_tokensave() {  # <field> [only-repo]
+  local field="$1" only="${2:-}" d name out="" rc n_graph=0 no_graph="" oldest="" age
+  local truncated_by_engine=""
+  for d in $(real_dirs); do
+    name=$(basename "$d")
+    [[ -n "$only" && "$name" != "$only" ]] && continue
+    if ! tokensave_graph_at "$d"; then no_graph="$no_graph $name"; continue; fi
+    n_graph=$((n_graph + 1))
+    age=$(tokensave_graph_age_days "$d") || age=""
+    if [[ -n "$age" && ( -z "$oldest" || "$age" -gt "$oldest" ) ]]; then oldest="$age"; fi
+    local one
+    one=$(python3 "$lib_dir/tokensave_call.py" fields "$d" "$name" "$field"); rc=$?
+    case "$rc" in
+      3) die "cs fields: the qualifier in '$field' was parsed but not applied by tokensave, so the query was NOT narrowed
+  the sites it would have returned are the ones for the bare field name, which
+  is the broad answer under a narrow heading -- refused rather than shown
+  measured on tokensave 7.9.0: a real type and a fabricated one return the
+  identical result, so the qualifier does not even spell-check
+  ask the broad question deliberately with: cs fields '${field##*::}'" ;;
+      4) die "cs fields: the tokensave graph for $name could not be queried
+  nothing was read there, so nothing was ruled out
+  check: cs engines   (graph presence and age)" ;;
+      5) # Sites came back, but the engine cut its own output and the reads
+         # below are a sample of an unknown total. PARTIAL, and said so in the
+         # envelope as well as on stderr -- a read total that reads as complete
+         # would understate exactly the blast radius this verb is for.
+         CS_SOURCE_PARTIAL=1
+         truncated_by_engine="$truncated_by_engine $name" ;;
+    esac
+    [[ -n "$one" ]] && out="${out:+$out
+}$one"
+  done
+
+  [[ $n_graph -gt 0 ]] || die "cs fields: no repo in view has a tokensave graph
+  this question has no second engine -- a text search cannot tell a read from a
+  write, which is the distinction the answer is for
+  build one with: cd <repo> && tokensave init
+  weaker but available now: cs uses '$field'"
+
+  answer structural "tokensave (graph)" "$n_graph repo graph(s), read/write split"
+  [[ -n "$oldest" ]] && warn "answered from graph(s) last synced up to ${oldest} day(s) ago — changes made since are invisible (tokensave sync)"
+  [[ -n "$no_graph" ]] && warn "no tokensave graph, so NOT searched:$no_graph — a read or write in those repos cannot be found this way"
+  warn "this is a GRAPH answer, not a language server: it cannot see reflection, DI registration, serialization by name, or generated code — all of which touch fields without a site the graph records."
+  # Named per repo, because the sampling happened per graph and the read counts
+  # printed below are true for the other repos.
+  [[ -n "$truncated_by_engine" ]] && warn "PARTIAL: tokensave truncated its own output for:$truncated_by_engine — the reads from those repos are a SAMPLE and their true read total is not recoverable. The write lists are complete. Narrow with: cs fields '$field' <repo>"
+
+  # An empty result REFUSES rather than reporting zero. tokensave's field_sites
+  # returns write_count 0 / read_count 0 with exit 0 for a field that does not
+  # exist, in exactly the shape it returns for a field that exists and is never
+  # touched -- and there is no second probe that separates them:
+  # find_exact_symbol reports count 0 for a real field too, because field nodes
+  # are not in that index at all.
+  #
+  # So "nothing reads this field" here would be a negative nobody established,
+  # about the question people delete a field on. The two commands that actually
+  # disambiguate are named instead.
+  if [[ -z "$out" ]]; then
+    die "cs fields: no read or write site for '$field' in $n_graph graph(s) — this is NOT 'nothing uses it'
+  tokensave returns the same empty answer for a field that does not exist as
+  for one that exists and is never touched, and nothing here can separate them
+  confirm the name is real first: cs text '$field'   (or: cs def '$field')
+  if it is real and this is still empty, the field is genuinely untouched in
+  the indexed repos -- but read the not-searched list above before concluding it"
+  fi
+
+  # Capped PER KIND, not per answer. Reads outnumber writes heavily (~7:1 in the
+  # reported case), so a single cap over the combined stream would spend the
+  # whole budget on reads and truncate the writes away -- and the writes are the
+  # half that answers "who observes a changed default". Each kind gets an equal
+  # share, and a kind that does not use its share donates the remainder to the
+  # other, so a query with no writes still shows the full budget of reads.
+  local writes reads n_w n_r cap half budget_w budget_r shown_w shown_r
+  writes=$(printf '%s\n' "$out" | grep -F ': [write]' || true)
+  reads=$(printf '%s\n' "$out" | grep -F ': [read]' || true)
+  n_w=$(printf '%s' "$writes" | grep -c '[^[:space:]]' || true)
+  n_r=$(printf '%s' "$reads" | grep -c '[^[:space:]]' || true)
+
+  cap="${CS_MAX_RESULTS:-200}"
+  if [[ "$cap" -le 0 ]]; then
+    budget_w=$n_w; budget_r=$n_r
+  else
+    half=$(( cap / 2 ))
+    budget_w=$half; budget_r=$(( cap - half ))
+    if [[ "$n_w" -lt "$budget_w" ]]; then budget_r=$(( cap - n_w )); budget_w=$n_w; fi
+    if [[ "$n_r" -lt "$budget_r" ]]; then budget_w=$(( cap - n_r )); budget_r=$n_r; fi
+  fi
+
+  local capped=""
+  # awk rather than head, for the reason emit_capped uses it: head closes the
+  # pipe at the cap and the builtin printf reports EPIPE on stderr.
+  [[ "$n_w" -gt 0 ]] && capped=$(printf '%s\n' "$writes" | awk -v n="$budget_w" 'NR<=n')
+  if [[ "$n_r" -gt 0 ]]; then
+    local rpart; rpart=$(printf '%s\n' "$reads" | awk -v n="$budget_r" 'NR<=n')
+    capped="${capped:+$capped
+}$rpart"
+  fi
+  shown_w=$(( n_w < budget_w ? n_w : budget_w ))
+  shown_r=$(( n_r < budget_r ? n_r : budget_r ))
+
+  emit_plain "$capped"
+  # Disclosed per kind, for the same reason the cap is per kind: one combined
+  # "showing 200 of 900" would hide which half was cut.
+  info ""
+  # When the engine sampled the reads, n_r is a floor and not a total, and it
+  # is spelled that way. "read sites: 30" beside a truncation warning would
+  # still be read as thirty -- the number is what a reader takes away, not the
+  # caveat three lines up.
+  local r_total="$n_r"
+  [[ -n "$truncated_by_engine" ]] && r_total="≥$n_r (true total unknown — engine sampled)"
+  info "${C_BOLD}write sites: $n_w${C_OFF} (shown $shown_w) — these observe an added field or a changed default"
+  info "${C_BOLD}read sites:  $r_total${C_OFF} (shown $shown_r) — these break on a removal, rename or retype"
+  if [[ "$shown_w" -lt "$n_w" || "$shown_r" -lt "$n_r" ]]; then
+    CS_TRUNCATED=$(( n_w + n_r ))
+    info "raise the cap with CS_MAX_RESULTS, or narrow with: cs fields '$field' <repo>"
+  fi
+  report_answer "$(n_hits_in "$capped")" "$(n_repos_in "$capped")"
+}
+
+cmd_fields() {
+  [[ $# -ge 1 ]] || die "cs fields <field|Type::field> [repo]
+  every read and write site of a field, across every repo with a graph"
+  local only="${2:-}"
+  require_python3 fields "querying the graph and splitting reads from writes"
+  have_tokensave || die "cs fields needs tokensave, and it is not installed
+  no second engine answers this: a text search cannot tell a read from a write
+  install it, then: cd <repo> && tokensave init
+  weaker but available now: cs uses '$1'"
+  case "${force_engine:-}" in
+    ""|tokensave) ;;
+    *) die "cs fields has no engine named '$force_engine'
+  it answers from: tokensave (graph), and nothing else" ;;
+  esac
+  [[ -n "$only" && ! -d "$view/$only" ]] && die "no such repo: $only"
+  fields_via_tokensave "$1" "$only"
+}
+
 cmd_refs() {
   [[ $# -ge 3 ]] || die "cs refs <symbol> <repo> <file-relative-to-repo>"
   have uvx || die "serena needs uv installed"
@@ -3223,6 +3401,7 @@ case "$sub" in
   callers) cmd_callers "$@" ;;
   callees) cmd_callees "$@" ;;
   impact)  cmd_impact "$@" ;;
+  fields)  cmd_fields "$@" ;;
   refs)    cmd_refs "$@" ;;
   history) cmd_history "$@" ;;
   repos)   cmd_repos ;;

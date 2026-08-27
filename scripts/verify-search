@@ -1249,6 +1249,154 @@ else
 fi
 rm -rf "$FLEET_ROOT/inventory-api-dotnet/.tokensave"
 
+# ---- cs fields: the field-level impact question ----------------------------
+# "If I change, remove, rename or re-default field X, who is affected?" The
+# other verbs answer it TEXTUALLY -- no read/write distinction -- and a text
+# sweep is the one shape that cannot express it: an additive change or a changed
+# DEFAULT is observable only where the field is WRITTEN, while a removal or
+# rename breaks where it is READ. Collapsing the two returns precisely the sites
+# where a default change is NOT observable.
+#
+# Everything below was measured against tokensave 7.9.0 rather than taken from
+# the tool's documentation, and three of the four checks exist because the
+# measurement disagreed with it.
+info ""
+info "${C_BOLD}cs fields${C_OFF}"
+if ! command -v tokensave >/dev/null 2>&1; then
+  skip "cs fields" "tokensave not installed"
+else
+  # A PYTHON repo, not the C# one: writes are what make the split observable,
+  # and `self._x = y` in __init__ is a write the extractor records. The C# graph
+  # produced read sites and no writes at all, which would have let a broken
+  # split pass.
+  fld_repo="$FLEET_ROOT/fulfillment-worker-python"
+  (cd "$fld_repo" && tokensave init >/dev/null 2>&1) || true
+  if [[ ! -f "$fld_repo/.tokensave/tokensave.db" ]]; then
+    skip "cs fields" "could not build a tokensave graph here"
+  else
+    fld_out=$("$here/cs" fields _threshold --fleet 2>&1); fld_rc=$?
+    # DiscountEngine.__init__ writes it; handling_fee_cents reads it. Both
+    # halves asserted, because a route that emitted only one kind would still
+    # look like a working answer.
+    if [[ $fld_rc -eq 0 ]] \
+       && printf '%s' "$fld_out" | grep -q 'discounts.py:14: \[write\]' \
+       && printf '%s' "$fld_out" | grep -q 'discounts.py:17: \[read\]'; then
+      ok "cs fields splits a field's sites into writes and reads"; pass=$((pass + 1))
+    else
+      err "cs fields did not return both a write and a read site (exit $fld_rc)"
+      fail=$((fail + 1)); failed_ids+=("fields-read-write-split")
+    fi
+
+    # Structural, never resolved, and the uncovered repos NAMED -- a field read
+    # in a repo with no graph looks exactly like a field nobody reads.
+    if printf '%s' "$fld_out" | grep -q 'answer:.*structural via tokensave' \
+       && printf '%s' "$fld_out" | grep -q 'NOT searched'; then
+      ok "cs fields is structural and names the repos it could not cover"
+      pass=$((pass + 1))
+    else
+      err "cs fields misreported its kind or hid its coverage gap"
+      fail=$((fail + 1)); failed_ids+=("fields-provenance")
+    fi
+
+    # An empty answer REFUSES. field_sites returns write_count 0 / read_count 0
+    # with exit 0 for a field that does not exist, in the identical shape it
+    # returns for a field that exists and is never touched -- and there is no
+    # second probe that separates them, because find_exact_symbol reports count
+    # 0 for a REAL field too (field nodes are not in that index at all).
+    # "Nothing reads this field" is the answer someone deletes a field on.
+    fld_none=$("$here/cs" fields ZzzNoSuchFieldAnywhere --fleet 2>&1); fld_none_rc=$?
+    if [[ $fld_none_rc -eq 1 ]] \
+       && printf '%s' "$fld_none" | grep -q 'NOT .nothing uses it'; then
+      ok "an empty field answer refuses instead of reporting zero"; pass=$((pass + 1))
+    else
+      err "cs fields reported an empty result as an answer (exit $fld_none_rc)"
+      fail=$((fail + 1)); failed_ids+=("fields-empty-refuses")
+    fi
+
+    # A `Type::field` query is parsed into a qualifier and then NOT applied on
+    # 7.9.0 -- and the results returned are the BARE-name results. Measured:
+    # `DiscountEngine::_threshold` (a real class) and `NoSuchClass::_threshold`
+    # (a fabricated one) return identical sites and identical counts, so the
+    # qualifier does not even spell-check. Answering would put the broad
+    # question's result under the narrow question's heading.
+    fld_q=$("$here/cs" fields 'DiscountEngine::_threshold' --fleet 2>&1); fld_q_rc=$?
+    if [[ $fld_q_rc -eq 1 ]] && printf '%s' "$fld_q" | grep -q 'NOT narrowed'; then
+      ok "a qualifier the engine drops refuses rather than answering broadly"
+      pass=$((pass + 1))
+    else
+      err "cs fields returned an unnarrowed answer for a qualified query (exit $fld_q_rc)"
+      fail=$((fail + 1)); failed_ids+=("fields-qualifier-dropped")
+    fi
+
+    # The cap is PER KIND. Reads outnumber writes heavily (~7:1 in the reported
+    # case), so one cap over the combined stream spends the whole budget on
+    # reads and truncates the writes away -- and the writes are the half that
+    # answers "who observes a changed default". Probe: 40 writes, 60 reads,
+    # cap 10. An even split would show 5 and 5; the donation rule is what makes
+    # a kind under its share give the remainder to the other.
+    mkdir -p "$fld_repo/fulfillment"
+    python3 - "$fld_repo/fulfillment/capprobe.py" <<'PROBE'
+import sys
+L = ["class CapProbe:", "    def __init__(self):", "        self._capprobefield = 0"]
+for i in range(40):
+    L += [f"    def w{i}(self):", f"        self._capprobefield = {i}"]
+for i in range(60):
+    L += [f"    def r{i}(self):", f"        return self._capprobefield"]
+open(sys.argv[1], "w").write("\n".join(L) + "\n")
+PROBE
+    (cd "$fld_repo" && tokensave sync >/dev/null 2>&1) || true
+    cap_w=$(CS_MAX_RESULTS=10 "$here/cs" fields _capprobefield --fleet --quiet 2>/dev/null | grep -c '\[write\]')
+    cap_r=$(CS_MAX_RESULTS=10 "$here/cs" fields _capprobefield --fleet --quiet 2>/dev/null | grep -c '\[read\]')
+    if [[ "$cap_w" -eq 5 && "$cap_r" -eq 5 ]]; then
+      ok "the result cap is applied per access kind, not across the answer"
+      pass=$((pass + 1))
+    else
+      err "capping did not split by kind (writes=$cap_w reads=$cap_r, wanted 5/5)"
+      fail=$((fail + 1)); failed_ids+=("fields-cap-per-kind")
+    fi
+
+    # tokensave truncates its OWN stdout at 15000 characters -- it is built for
+    # MCP token budgets and the cut lands mid-token, leaving invalid JSON rather
+    # than a short answer. At ~200 bytes a site that trips around 75 sites, so
+    # the 100-site probe above hits it every run. `--limit N` bounds read_sites
+    # only (write_sites is never capped by it) AND reports the CAPPED number as
+    # read_count, so the true read total is unrecoverable. That has to surface
+    # as PARTIAL: a read total that reads as complete understates exactly the
+    # blast radius this verb exists to measure.
+    trunc_out=$(CS_MAX_RESULTS=0 "$here/cs" fields _capprobefield --fleet 2>&1)
+    trunc_json=$(CS_MAX_RESULTS=0 "$here/cs" fields _capprobefield --fleet --porcelain --quiet 2>/dev/null)
+    if printf '%s' "$trunc_out" | grep -q 'PARTIAL' \
+       && printf '%s' "$trunc_out" | grep -q 'true total unknown' \
+       && printf '%s' "$trunc_json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["partial"] is True, "partial not set in the envelope"
+assert d["kind"] == "structural", d["kind"]
+' 2>/dev/null; then
+      ok "an engine that truncates its own output is reported as PARTIAL"
+      pass=$((pass + 1))
+    else
+      err "a truncated graph answer was presented as complete"
+      fail=$((fail + 1)); failed_ids+=("fields-engine-truncation")
+    fi
+
+    # The writes survive that truncation. They are the half `--limit` does not
+    # touch, so a complete write list is exactly what is still trustworthy --
+    # and it is the half a changed default is reviewed against.
+    if [[ "$(CS_MAX_RESULTS=0 "$here/cs" fields _capprobefield --fleet --quiet 2>/dev/null | grep -c '\[write\]')" -eq 41 ]]; then
+      ok "the write list stays complete when the engine samples the reads"
+      pass=$((pass + 1))
+    else
+      err "writes were lost to the engine's own truncation"
+      fail=$((fail + 1)); failed_ids+=("fields-writes-complete")
+    fi
+
+    rm -f "$fld_repo/fulfillment/capprobe.py"
+    (cd "$fld_repo" && tokensave sync >/dev/null 2>&1) || true
+  fi
+  rm -rf "$fld_repo/.tokensave"
+fi
+
 # ---- symbol mode: cs callers / cs callees / cs impact -----------------------
 # The graph route, asked directly rather than only as a fallback. Everything
 # here is about the two traps that come with it:

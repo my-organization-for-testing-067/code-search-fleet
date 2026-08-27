@@ -38,7 +38,7 @@ Four traps, all reproduced against tokensave 7.9.0 rather than taken on trust:
      and the interface method did not. Every exact-name node is asked, and the
      set is named on stderr so the reader can see what was actually queried.
 
-Usage: tokensave_call.py <impls|def|callers|callees|impact> <repo-dir>
+Usage: tokensave_call.py <impls|def|callers|callees|impact|fields> <repo-dir>
                          <repo-name> <symbol>
 Exit:  0 found, 1 nothing found (an honest negative), 3 the symbol does not
        resolve to a node this question can be asked of, 4 the tool itself failed.
@@ -253,6 +253,142 @@ def defs(project, repo, symbol):
     return 0 if found else 1
 
 
+
+# `tokensave tool` truncates its own stdout at 15000 characters -- it is built
+# for MCP token budgets, and the cut lands mid-token, leaving INVALID JSON
+# rather than a short answer. Measured: ~200 bytes per site, so this trips at
+# roughly 75 sites and the reported 160-site case would hit it every time.
+#
+# `--limit N` bounds read_sites only; write_sites is never capped by it. That
+# asymmetry decides the ladder below -- reads can be sacrificed to get an
+# answer, writes cannot, and if the writes alone overflow there is nothing
+# trustworthy to return.
+#
+# The cost of using --limit is that `read_count` comes back as the CAPPED
+# number, not the true one, so the true read total is unrecoverable. That is
+# disclosed rather than papered over: a read total that silently reads as
+# complete would understate a blast radius, which is the failure this verb
+# exists to prevent.
+TRUNCATION_MARK = "[... truncated at"
+READ_LIMITS = (None, 30, 10, 1)
+
+
+def _field_doc(project, field):
+    """(doc, applied_read_limit) -- or (None, reason) if nothing usable came back.
+
+    applied_read_limit is None when the full answer parsed, and an int when
+    reads had to be capped to make the output fit.
+    """
+    for limit in READ_LIMITS:
+        args = ["tokensave", "tool", "field_sites", "--field", field,
+                "--project", project]
+        if limit is not None:
+            args += ["--limit", str(limit)]
+        out, err = _run(args)
+        if out is None:
+            return None, err
+        try:
+            doc = json.loads(out)
+        except json.JSONDecodeError:
+            # Only the engine's own truncation is worth retrying smaller. Any
+            # other unparseable output is a different fault and is reported as
+            # one rather than retried three more times.
+            if TRUNCATION_MARK in out:
+                continue
+            return None, "returned no parseable JSON"
+        if not isinstance(doc, dict):
+            return None, "returned JSON that is not an object"
+        return doc, limit
+    return None, "truncated"
+
+
+def field_sites(project, repo, field):
+    """cs fields: read and write sites of a named field, as cs result lines.
+
+    Emitted as `repo/path:line: [write] snippet` / `[read] snippet` -- the cs
+    line shape, with the access kind where the node kind goes for the other
+    modes. Nothing is capped here: the caller caps the two kinds SEPARATELY,
+    which it can only do if it is handed both in full.
+
+    Exit: 0 sites found, 1 no sites at all, 3 a qualifier that was not applied,
+    4 the tool failed, 5 sites found but the engine truncated its own output so
+    the reads are a sample. `1` is deliberately NOT treated as an answer by the
+    caller -- see below.
+    """
+    doc, read_limit = _field_doc(project, field)
+    if doc is None:
+        # read_limit carries the reason when doc is None.
+        if read_limit == "truncated":
+            print("tokensave truncated its own output at 15000 characters even "
+                  "with reads limited to 1, so the WRITE list alone overflows "
+                  "and no complete list can be read from this graph",
+                  file=sys.stderr)
+            return 4
+        print(f"tokensave field_sites failed: {read_limit}", file=sys.stderr)
+        return 4
+
+    # A `Type::field` query is PARSED into a qualifier and then, on tokensave
+    # 7.9.0, not applied -- `qualifier_applied` came back false for every real
+    # type probed, in C# and in Python. The results returned are the bare-name
+    # results, so a caller who qualified because the bare name was ambiguous
+    # gets the ambiguous answer back while believing it was narrowed.
+    #
+    # Measured, not assumed: `DiscountEngine::_threshold` (a real class) and
+    # `NoSuchClass::_threshold` (a fabricated one) returned identical sites and
+    # identical counts. A wrong type name is not an error here, so the
+    # qualifier cannot even be used as a spell-check.
+    #
+    # So a qualified query whose qualifier was dropped is refused rather than
+    # answered. Answering would return the broader question's result under the
+    # narrower question's heading, and the caller asked to narrow precisely
+    # because they did not want that. If a later tokensave applies it, this
+    # path simply stops triggering.
+    if doc.get("qualifier") and not doc.get("qualifier_applied"):
+        print(f"tokensave: the qualifier '{doc['qualifier']}' was parsed but "
+              f"NOT applied, so these would be the results for the bare field "
+              f"name '{doc.get('field', field).split('::')[-1]}' — the broad "
+              f"answer under a narrow heading", file=sys.stderr)
+        return 3
+
+    found = 0
+    # write before read: the two have different blast radii and the writes are
+    # the smaller, more surprising set. Within a kind, source order.
+    for kind in ("write", "read"):
+        seen = set()
+        for r in doc.get(f"{kind}_sites") or []:
+            if not isinstance(r, dict) or not r.get("file"):
+                continue
+            # tokensave lists one entry per REFERENCE, so two mentions of the
+            # field on one line arrive as two identical entries (measured:
+            # read_count 3 over 2 distinct lines). In cs's line format those
+            # would print as duplicate rows, which reads as a display bug --
+            # and would inflate the hit count the caller weighs the answer by.
+            key = (r["file"], r.get("line"), kind)
+            if key in seen:
+                continue
+            seen.add(key)
+            snippet = " ".join((r.get("snippet") or "").split())
+            # The graph's `enclosing` is `file::file::Class::Member`; only the
+            # last two carry information the path does not already give.
+            enclosing = "::".join(
+                [x for x in (r.get("enclosing") or "").split("::") if x][-2:])
+            where = f" in {enclosing}" if enclosing else ""
+            print(f"{repo}/{r['file']}:{r.get('line', '?')}: "
+                  f"[{kind}]{where} {snippet}")
+            found += 1
+    if not found:
+        return 1
+    if read_limit is not None:
+        # Exit 5, not 0: the caller has to mark this PARTIAL, and a warning on
+        # stderr alone would be a fact the porcelain envelope does not carry.
+        print(f"tokensave: output was truncated by the engine, so reads were "
+              f"re-requested with --limit {read_limit}. The read sites below "
+              f"are a SAMPLE and the true read total is not recoverable from "
+              f"this graph; the write list is complete.", file=sys.stderr)
+        return 5
+    return 0
+
+
 def main():
     if len(sys.argv) < 5:
         print(__doc__, file=sys.stderr)
@@ -261,6 +397,8 @@ def main():
 
     if mode == "def":
         return defs(project, repo, symbol)
+    if mode == "fields":
+        return field_sites(project, repo, symbol)
     if mode in ("callers", "callees", "impact"):
         return graph_edges(project, repo, symbol, mode)
     if mode != "impls":
