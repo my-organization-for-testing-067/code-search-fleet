@@ -1759,7 +1759,12 @@ emit_capped() {
   local out="$1" total
   total=$(printf '%s\n' "$out" | grep -c '' )
   if [[ "${CS_MAX_RESULTS:-200}" -gt 0 && "$total" -gt "${CS_MAX_RESULTS}" ]]; then
-    emit_plain "$(printf '%s\n' "$out" | head -n "$CS_MAX_RESULTS")"
+    # awk, not `head`: head closes the pipe at the cap and bash's builtin
+    # printf still had the rest of $out to write, so every over-cap query --
+    # i.e. every fleet-wide one -- printed "printf: write error: Broken pipe"
+    # on stderr, beside a correct answer, in the one channel that carries
+    # PARTIAL/INCOMPLETE. awk reads to EOF, so there is nothing to report.
+    emit_plain "$(printf '%s\n' "$out" | awk -v n="$CS_MAX_RESULTS" 'NR<=n')"
     CS_TRUNCATED="$total"
     # When truncating, the distribution is the useful part of what was cut.
     info ""

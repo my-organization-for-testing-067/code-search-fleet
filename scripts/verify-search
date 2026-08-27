@@ -2236,6 +2236,53 @@ fi
 
 rm -rf "$FLEET_ROOT/inventory-api-dotnet/tests/payloads"
 
+# Capping reads $out twice, and the second reader used to be `head`, which
+# closes the pipe at the cap while bash's builtin printf still has lines to
+# write: "printf: write error: Broken pipe" on stderr, on every query with more
+# hits than the cap -- i.e. every fleet-wide one. cs-mcp forwards stderr, so an
+# agent saw a write error beside a correct answer, in the one channel this tool
+# trains its callers to read for PARTIAL and INCOMPLETE.
+#
+# Two conditions have to hold together for it to fire, and BOTH are arranged
+# here rather than hoped for:
+#
+#   - SIGPIPE must be IGNORED, or printf dies on the signal instead of living
+#     to report EPIPE. cs inherits that disposition from whatever launched it,
+#     which is why the bug shows up under a server parent and not at a terminal.
+#     `trap "" PIPE` before exec reproduces the inherited SIG_IGN exactly.
+#   - The un-emitted remainder must exceed the pipe buffer (64K here). The
+#     fixture fleet's widest query yields ~74K, which leaves 10K of margin and
+#     makes the race go either way between runs -- a check that reports the bug
+#     one run in three is not a check. The probe below is ~1MB, so printf is
+#     still writing long after head has gone.
+info ""
+info "${C_BOLD}capping: no pipe error beside a correct answer${C_OFF}"
+mkdir -p "$FLEET_ROOT/web-monorepo-node/probe"
+awk 'BEGIN { for (i = 1; i <= 5000; i++)
+  printf "const capProbeToken_%d = \"%s\";\n", i, sprintf("%0*d", 180, i) }' \
+  > "$FLEET_ROOT/web-monorepo-node/probe/cap_probe.js"
+
+cap_err=$(/bin/bash -c 'trap "" PIPE; exec "$0" text capProbeToken --fleet --quiet' \
+  "$here/cs" 2>&1 >/dev/null)
+if ! printf '%s' "$cap_err" | grep -qi 'write error\|broken pipe'; then
+  ok "an over-cap query reports no write error on stderr"; pass=$((pass + 1))
+else
+  err "capping leaked a pipe write error onto stderr: $(printf '%s' "$cap_err" | grep -i 'write error\|broken pipe' | head -1)"
+  fail=$((fail + 1)); failed_ids+=("cap-broken-pipe")
+fi
+
+# And the cap must still cap: silencing the error by not truncating at all would
+# pass the check above and defeat the feature it is guarding.
+cap_n=$("$here/cs" text capProbeToken --fleet --quiet 2>/dev/null | grep -c '[^[:space:]]')
+if [[ "$cap_n" -eq "${CS_MAX_RESULTS:-200}" ]]; then
+  ok "the cap still truncates to exactly CS_MAX_RESULTS lines"; pass=$((pass + 1))
+else
+  err "CS_MAX_RESULTS no longer bounds the result stream (got $cap_n)"
+  fail=$((fail + 1)); failed_ids+=("cap-not-enforced")
+fi
+
+rm -rf "$FLEET_ROOT/web-monorepo-node/probe"
+
 # ---- the MCP surface -------------------------------------------------------
 # scripts/cs-mcp exposes the same subcommands over MCP, as an additional
 # surface. It is a second door to the same engine room, and the danger of a
