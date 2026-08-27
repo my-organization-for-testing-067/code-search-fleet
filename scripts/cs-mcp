@@ -397,10 +397,25 @@ def run_cs(sub, argv, scope=None, flags=()):
     try:
         return json.loads(out)
     except ValueError:
-        # cs emits its envelope from an EXIT trap, so no envelope means it died
-        # in a way that skipped the trap. That is not a zero-hit answer and must
-        # not be allowed to read like one.
+        # Neither branch below is a zero-hit answer, and neither may be allowed
+        # to read like one. They are told apart because they are different
+        # faults with opposite advice.
         tail = "\n".join(err.splitlines()[-15:]) or "(no output)"
+        # Corrupt stdout. A zero exit with bytes on stdout means cs searched,
+        # found, and then mangled its own envelope. Calling that "did not run"
+        # contradicts the stderr printed directly beneath it -- the hits-per-repo
+        # breakdown of the very search being reported as not having happened --
+        # and hands the agent a successful search as a negative result.
+        if proc.returncode == 0 and out:
+            raise ToolError(
+                "cs exited 0 and produced output, but its result envelope is "
+                "not valid JSON, so the hits could not be read. The search "
+                "itself ran -- this is a formatting bug in cs, not a negative "
+                f"result, and nothing here rules anything out:\n{tail}"
+            )
+        # No envelope at all. cs emits it from an EXIT trap, so its absence
+        # means cs died in a way that skipped the trap: nothing was searched to
+        # completion, so nothing is ruled out.
         raise ToolError(
             f"cs exited {proc.returncode} without a result envelope, so this "
             f"search did not run:\n{tail}"

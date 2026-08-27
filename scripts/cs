@@ -181,7 +181,20 @@ json_str() {
 }
 # A number, or `null` when the value is unknown -- never an empty string, which
 # would make `hits` unreadable without a type check on the far side.
-json_num() { case "${1:-}" in ''|*[!0-9]*) printf 'null' ;; *) printf '%s' "$1" ;; esac; }
+#
+# Leading zeros are stripped, not passed through. JSON forbids them, so `00`
+# was all-digits by this function's own test and still not a number: it emitted
+# `"line":00` and took the entire envelope down with it. A helper whose whole
+# job is "emit something that parses as a number" has to hold for every
+# all-digit string, not for the ones that happen to be canonical.
+json_num() {
+  case "${1:-}" in
+    ''|*[!0-9]*) printf 'null'; return ;;
+  esac
+  local n="$1"
+  while [[ ${#n} -gt 1 && "$n" == 0* ]]; do n="${n#0}"; done
+  printf '%s' "$n"
+}
 
 # Result lines are `repo/path:line: text` for every search subcommand, so they
 # are split into fields rather than handed over as strings a caller would have
@@ -197,11 +210,20 @@ json_results() {
     [[ -n "$line" ]] || continue
     [[ $first -eq 1 ]] || printf ','
     first=0
-    if [[ "$line" =~ ^([^/]+)/(.+):([0-9]+):\ ?(.*)$ ]]; then
+    # `[^:]+` for the path, not `.+`: a greedy `.+` binds `:([0-9]+):` to the
+    # LAST `:digits:` on the line, so any hit whose TEXT carries one (an ISO
+    # timestamp, `host:8080:`) was split at the wrong colon -- path swallowing
+    # the real line number, and `line` taking digits out of the text. Anchoring
+    # to the first `:digits:` after the repo is right for every path without a
+    # colon, and a path containing one is already ambiguous in `path:line:text`.
+    if [[ "$line" =~ ^([^/]+)/([^:]+):([0-9]+):\ ?(.*)$ ]]; then
       repo="${BASH_REMATCH[1]}"; path="${BASH_REMATCH[2]}"
       lineno="${BASH_REMATCH[3]}"; text="${BASH_REMATCH[4]}"
+      # json_num, not the bare capture: a leading zero (`:00:`) is a valid bash
+      # match but not valid JSON, and one of those made the WHOLE envelope
+      # unparseable. Degrade a bad line number to null, never to a syntax error.
       printf '{"repo":%s,"path":%s,"line":%s,"text":%s}' \
-        "$(json_str "$repo")" "$(json_str "$path")" "$lineno" "$(json_str "$text")"
+        "$(json_str "$repo")" "$(json_str "$path")" "$(json_num "$lineno")" "$(json_str "$text")"
     else
       printf '{"repo":null,"path":null,"line":null,"text":%s}' "$(json_str "$line")"
     fi

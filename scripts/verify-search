@@ -2190,6 +2190,52 @@ else
   fail=$((fail + 1)); failed_ids+=("porcelain-escaping")
 fi
 
+# A `:NN:` token INSIDE the matched text -- an ISO timestamp, `host:8080:` --
+# used to be read as the line number, because the path pattern was greedy `.+`
+# and so bound to the LAST `:digits:` on the line rather than the first. Two
+# failures came out of the one bug: a parseable envelope pointing at a location
+# that does not exist, and -- when those digits carried a leading zero, which
+# `00` seconds always does -- `"line":00`, invalid JSON, which took the WHOLE
+# envelope down. cs-mcp then reported a search that exited 0 with hits as one
+# that "did not run": a manufactured negative, arriving through the porcelain.
+info ""
+info "${C_BOLD}porcelain: a colon-digit token in the matched text${C_OFF}"
+mkdir -p "$FLEET_ROOT/inventory-api-dotnet/tests/payloads"
+printf '{\n  "collectedOnProbe": "2024-01-01T12:00:00Z"\n}\n' \
+  > "$FLEET_ROOT/inventory-api-dotnet/tests/payloads/probe_response.json"
+
+ts_json=$("$here/cs" uses 'collectedOnProbe' --porcelain --quiet 2>/dev/null)
+if printf '%s' "$ts_json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+rs = [r for r in d["results"] if r["path"] and "probe_response.json" in r["path"]]
+assert rs, "the timestamp hit is missing from the envelope"
+r = rs[0]
+assert r["repo"] == "inventory-api-dotnet", "repo=%r" % (r["repo"],)
+assert r["path"] == "tests/payloads/probe_response.json", "path=%r" % (r["path"],)
+assert r["line"] == 2, "line=%r (a :NN: in the text was read as the line number)" % (r["line"],)
+assert "12:00:00Z" in r["text"], "text lost the timestamp: %r" % (r["text"],)
+' 2>/dev/null; then
+  ok "a :NN: token in the matched text does not corrupt repo/path/line"
+  pass=$((pass + 1))
+else
+  err "a :NN: token in the matched text broke the porcelain envelope"
+  fail=$((fail + 1)); failed_ids+=("porcelain-colon-digits")
+fi
+
+# The loud half, asserted separately from the silent half: whatever the split
+# produces, stdout must still be ONE parseable object. `line` is emitted through
+# json_num precisely so that a bad split degrades to null instead of to a syntax
+# error that loses every OTHER hit in the same answer.
+if printf '%s' "$ts_json" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+  ok "a leading-zero :00: token leaves the envelope parseable"; pass=$((pass + 1))
+else
+  err "a :00: token in the matched text made the whole envelope unparseable"
+  fail=$((fail + 1)); failed_ids+=("porcelain-leading-zero")
+fi
+
+rm -rf "$FLEET_ROOT/inventory-api-dotnet/tests/payloads"
+
 # ---- the MCP surface -------------------------------------------------------
 # scripts/cs-mcp exposes the same subcommands over MCP, as an additional
 # surface. It is a second door to the same engine room, and the danger of a
@@ -2419,6 +2465,73 @@ else
   err "something other than JSON-RPC reached the MCP server's stdout"
   fail=$((fail + 1)); failed_ids+=("mcp-stdout-clean")
 fi
+
+# "cs produced no envelope" and "cs produced an envelope that does not parse"
+# are different faults, and only the first is "the search did not run". The
+# server used to report both with the second wording -- so a query that exited
+# 0 with 266 hits came back to the agent as a search that never happened, with
+# cs's own hits-per-repo breakdown printed directly underneath it contradicting
+# the header. Wrong in the one direction this tool exists to prevent: a
+# manufactured negative, which is what makes a breaking change look safe.
+#
+# Driven against a STUB cs, because the real one no longer corrupts its
+# envelope -- the point is that the server reports whatever it is handed
+# honestly, not that cs still has the bug. CS is resolved beside the server, so
+# a copy of the server in a scratch directory picks up the stub there.
+mcp_stub=$(mktemp -d)
+cp "$here/cs-mcp" "$mcp_stub/cs-mcp"
+cat > "$mcp_stub/cs" <<'STUB'
+#!/bin/sh
+# Exit 0, with hits, and an envelope mangled the way a bad `line` field mangled
+# it: valid up to the point where a leading zero is not a JSON number.
+printf '%s' '{"hits":266,"returned":200,"results":[{"repo":"a","path":"b","line":00}]}'
+echo "hits per repo (all 266, not just those shown):" >&2
+echo "   109 repo-a" >&2
+exit 0
+STUB
+chmod +x "$mcp_stub/cs"
+stub_out=$(mcp_req cs_uses '{"query":"collected_on","scope":"fleet"}' \
+  | (cd "$FLEET_ROOT" && "$mcp_stub/cs-mcp" 2>/dev/null) \
+  | python3 -c '
+import json, sys
+d = json.loads(sys.stdin.readline())["result"]
+print(("isError" if d.get("isError") else "ok") + "\t" + d["content"][0]["text"])
+')
+if printf '%s' "$stub_out" | grep -q '^isError' \
+   && ! printf '%s' "$stub_out" | grep -q 'did not run' \
+   && printf '%s' "$stub_out" | grep -qi 'not valid JSON' \
+   && printf '%s' "$stub_out" | grep -qi 'rules anything out'; then
+  ok "a corrupt envelope is reported as a formatting bug, not as a search that did not run"
+  pass=$((pass + 1))
+else
+  err "a corrupt envelope was reported as a search that did not run: $stub_out"
+  fail=$((fail + 1)); failed_ids+=("mcp-corrupt-envelope")
+fi
+
+# The other branch must keep its old wording: a cs that really did die before
+# its EXIT trap really did not run, and that has to stay distinguishable.
+cat > "$mcp_stub/cs" <<'STUB'
+#!/bin/sh
+echo "cs: killed before the exit trap" >&2
+exit 137
+STUB
+chmod +x "$mcp_stub/cs"
+dead_out=$(mcp_req cs_uses '{"query":"x","scope":"fleet"}' \
+  | (cd "$FLEET_ROOT" && "$mcp_stub/cs-mcp" 2>/dev/null) \
+  | python3 -c '
+import json, sys
+d = json.loads(sys.stdin.readline())["result"]
+print(("isError" if d.get("isError") else "ok") + "\t" + d["content"][0]["text"])
+')
+if printf '%s' "$dead_out" | grep -q '^isError' \
+   && printf '%s' "$dead_out" | grep -q 'did not run'; then
+  ok "a cs that died before its exit trap is still reported as not having run"
+  pass=$((pass + 1))
+else
+  err "a dead cs was no longer reported as a search that did not run: $dead_out"
+  fail=$((fail + 1)); failed_ids+=("mcp-dead-cs")
+fi
+rm -rf "$mcp_stub"
 
 # ---- query log -------------------------------------------------------------
 # An opt-in JSONL line per query, recording the outcome. Two of the properties
