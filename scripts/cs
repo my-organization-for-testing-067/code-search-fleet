@@ -60,6 +60,12 @@
 #   --refresh        rebuild the cached symbol index instead of reusing it
 #   --porcelain      one JSON object on stdout instead of result lines
 #                    (CS_JSON=1 does the same; stderr is unaffected)
+#   --source-only    exclude data and doc files (.csv .json .txt .tsv .lock .log
+#                    .rst .md) from a text answer. OFF by default: a route in an
+#                    appsettings.json is a real seam. The composition of every
+#                    answer is reported either way. Draws the line at data vs
+#                    source, never test vs production -- a test file is often
+#                    the most informative hit for an impact question.
 #   --word, -w       match whole identifiers only, not substrings of longer
 #                    ones. Off by default: it would drop `reserve` inside
 #                    `reserveItem`, a real use. cs reports the distinction
@@ -1483,6 +1489,116 @@ require_serena_toolchain() {
 # Normalize "path:line:text" to "path:line: text" with the fleet prefix removed.
 normalize() { sed -e "s|^${view}/||" -e "s|^${root}/||" -e 's|^\./||'; }
 
+# ---- source vs data, in the hits that came back ----------------------------
+# A text answer's SIZE is the first thing a reader takes from it, and a large
+# hit count reads as thorough coverage. Measured on a real fleet: `cs uses` on a
+# CamelCase type returned 1,295 hits of which 24 were source and 1,271 were data
+# -- 1,192 of them in a single test-resources CSV. The 24 were the answer; they
+# were 1.9% of what came back, and under the default 200-line cap almost none of
+# them were shown.
+#
+# Nothing here was broken. filter_code.py lists these extensions in
+# NO_COMMENT_SYNTAX deliberately -- a CSV has no comment syntax, so there is
+# nothing to strip and every line legitimately passes. And `cs why heuristic`
+# already says a string in a test fixture counts as a use. The defect is that
+# the COMPOSITION was invisible in the answer: nothing distinguished
+# 24-code-plus-1271-fixture from 1295-code, and the caveat lived in a separate
+# command a caller had to already suspect they needed.
+#
+# The line drawn is DATA vs SOURCE, never test vs production. A test file is
+# often the single most informative hit for an impact question -- a test
+# constructing a request object WITHOUT a field is exactly where a changed
+# default becomes observable -- so test code stays in scope.
+#
+# .sql, .yaml, .xml and friends are SOURCE here. They have comment syntax, they
+# are executable or declarative logic, and a column named in a query is a real
+# use. Only files with no comment syntax at all, plus prose docs, are data. The
+# per-extension breakdown is printed either way, so a reader who disagrees with
+# where the line falls can see the extensions and judge for themselves.
+CS_DATA_EXTS=".json .txt .csv .tsv .lock .log .rst .md .markdown"
+
+# The extension of each hit's path, counted. Splits on the FIRST colon after the
+# repo prefix, not the last -- the same rule json_results learned the hard way,
+# since a hit's TEXT can contain `:NN:` and a path almost never does.
+hit_extensions() {  # hits on stdin -> "<count> <ext>" per line, most first
+  awk '
+    {
+      p = $0
+      sub(/:[0-9]+:.*$/, "", p)          # drop `:line: text`
+      n = split(p, seg, "/")
+      base = seg[n]
+      ext = (match(base, /\.[^.\/]+$/)) ? tolower(substr(base, RSTART)) : "(none)"
+      c[ext]++
+    }
+    END { for (e in c) printf "%d %s\n", c[e], e }
+  ' | sort -rn
+}
+
+is_data_ext() {  # <ext>
+  local e
+  for e in $CS_DATA_EXTS; do [[ "$1" == "$e" ]] && return 0; done
+  return 1
+}
+
+# Drop the data hits, for --source-only. Kept separate from the disclosure so
+# that the DEFAULT answer never silently loses a hit: this runs only when asked.
+source_only_hits() {  # hits on stdin
+  awk -v exts="$CS_DATA_EXTS" '
+    BEGIN { n = split(exts, a, " "); for (i = 1; i <= n; i++) drop[a[i]] = 1 }
+    {
+      p = $0
+      sub(/:[0-9]+:.*$/, "", p)
+      m = split(p, seg, "/")
+      base = seg[m]
+      ext = (match(base, /\.[^.\/]+$/)) ? tolower(substr(base, RSTART)) : "(none)"
+      if (!(ext in drop)) print
+    }
+  '
+}
+
+# The narrowing itself, applied only when asked and DISCLOSED when applied --
+# an exclusion nobody can see is the same hazard as CS_EXCLUDE_EXTRA, which is
+# why that one is announced too.
+apply_source_only() {  # <hits> -> hits, filtered when --source-only is on
+  [[ $source_only -eq 1 ]] || { printf '%s' "$1"; return 0; }
+  local kept n_before n_after
+  n_before=$(printf '%s\n' "$1" | grep -c '[^[:space:]]')
+  kept=$(printf '%s\n' "$1" | source_only_hits)
+  n_after=$(printf '%s\n' "$kept" | grep -c '[^[:space:]]')
+  warn "--source-only dropped $((n_before - n_after)) of $n_before hit(s) in data/doc files ($CS_DATA_EXTS) — a route in a .json config is a real seam and is gone from this answer too"
+  printf '%s' "$kept"
+}
+
+# Said on stdout's behalf, on stderr: how much of this answer is data. Printed
+# only when there IS data in it -- a line that fires on every query is noise and
+# stops being read, which is the rule report_answer already follows.
+disclose_composition() {  # <hits>
+  local exts n_data=0 n_src=0 c e data_list="" 
+  exts=$(printf '%s\n' "$1" | hit_extensions)
+  [[ -n "$exts" ]] || return 0
+  while read -r c e; do
+    [[ -n "$c" ]] || continue
+    if is_data_ext "$e"; then
+      n_data=$((n_data + c)); data_list="$data_list $e $c,"
+    else
+      n_src=$((n_src + c))
+    fi
+  done <<EOF
+$exts
+EOF
+  [[ "$n_data" -gt 0 ]] || return 0
+  data_list="${data_list%,}"
+  local total=$((n_src + n_data)) msg
+  msg="composition: $n_src in source, $n_data in data/doc files ($(printf '%s' "${data_list# }" | sed 's/ \([0-9]\)/ \1/g')) — --source-only excludes the data half"
+  # A warning when the data half DOMINATES, because that is the case where the
+  # hit count misrepresents the answer; otherwise a plain note.
+  if [[ $((n_data * 2)) -ge "$total" ]]; then
+    warn "most of this answer is NOT source: $msg"
+  else
+    info "$msg"
+  fi
+}
+
 # ---- answer provenance -----------------------------------------------------
 # Scoring 9/9 on a fixture means the test set is exhausted, not that search is
 # solved: on a real repo some questions are undecidable statically at any
@@ -1956,6 +2072,7 @@ cmd_text() {
   [[ $# -ge 1 ]] || die "cs text <pattern>"
   answer textual "$(text_engine)" "regex"
   local out; out=$(grep_fleet regex "$1" | normalize)
+  out=$(apply_source_only "$out")
   if [[ -z "$out" ]]; then
     engines_ok_or_die text
     report_answer 0 0
@@ -1964,6 +2081,7 @@ cmd_text() {
     return $CS_EXIT_NO_HITS
   fi
   emit_capped "$out"
+  disclose_composition "$out"
   report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
 }
 
@@ -1975,6 +2093,7 @@ cmd_seam() {
   answer textual "$(text_engine)" "literal, grouped by repo"
   local hits repos n
   hits=$(grep_fleet literal "$1" | normalize)
+  hits=$(apply_source_only "$hits")
   if [[ -z "$hits" ]]; then
     info "no repo mentions '$1'"
     engines_ok_or_die seam
@@ -1984,6 +2103,7 @@ cmd_seam() {
   repos=$(printf '%s\n' "$hits" | cut -d/ -f1 | sort -u)
   n=$(printf '%s\n' "$repos" | grep -c '')
   emit_capped "$hits"
+  disclose_composition "$hits"
   info ""
   info "${C_BOLD}$n repo(s):${C_OFF} $(printf '%s ' $repos)"
 
@@ -2124,6 +2244,9 @@ cmd_uses() {
   hits=$(python3 "$lib_dir/filter_code.py" --root "$view" --report-unsupported \
          < "$raw_hits" 2>"$unsup_file")
   filter_rc=$?
+  # After the comment filter, not before: --source-only is about the FILE kind,
+  # and stacking it on the prose filter keeps each stage's claim its own.
+  hits=$(apply_source_only "$hits")
   unsupported=$(cut -f1 "$unsup_file" | sort -u | tr '\n' ' ' | sed 's/ $//')
   rm -f "$unsup_file"
   # filter_code.py exits 0 on every legitimate outcome, including empty input,
@@ -2172,6 +2295,12 @@ cmd_uses() {
     warn "$((n_uses_all - n_uses_word)) of $n_uses_all hit(s) matched INSIDE a longer identifier — not a use of this name (use --word to exclude them)"
   fi
   emit_capped "$hits"
+  # The composition, next to the count. "In CODE" in this subcommand's own
+  # description reads as a guarantee about file KIND; what it actually promises
+  # is "with comments stripped where we know how", which is a different thing.
+  # This line is what closes that gap in the answer itself rather than in a
+  # separate command the caller has to already suspect they need.
+  disclose_composition "$hits"
   repos=$(printf '%s\n' "$hits" | cut -d/ -f1 | sort -u)
   info ""
   info "${C_BOLD}$(printf '%s\n' "$repos" | grep -c '') repo(s) use it:${C_OFF} $(printf '%s ' $repos)"
@@ -3341,6 +3470,11 @@ fleet_only=0
 show_why=0
 quiet=0
 word_match=0
+# Opt-in, never the default: dropping data hits is a NARROWING, and a narrowing
+# nobody asked for is how a real use goes missing. A route in an appsettings
+# .json is a genuine seam, and --source-only would drop it -- which is fine when
+# the caller asked for source, and not fine as a default.
+source_only=0
 # Env as well as a flag: a caller wrapping cs in a script it does not control
 # can set CS_JSON=1 once rather than threading a flag through every call site.
 case "${CS_JSON:-0}" in 1|true|yes) porcelain=1 ;; esac
@@ -3362,9 +3496,17 @@ for a in "$@"; do
     --refresh) refresh_index=1 ;;
     --porcelain|--json) porcelain=1 ;;
     --word|-w) word_match=1 ;;
+    --source-only) source_only=1 ;;
     *) args+=("$a") ;;
   esac
 done
+# Recorded HERE, not inside apply_source_only: that runs inside `$(...)`, and a
+# variable set in a subshell never reaches the envelope. The warning still
+# printed from in there (stderr escapes a subshell; an assignment does not),
+# which is exactly the shape of bug that leaves a narrowing visible to a human
+# and invisible to a machine caller.
+[[ $source_only -eq 1 ]] && CS_EXCLUSION_NOTE="${CS_EXCLUSION_NOTE:+$CS_EXCLUSION_NOTE, }--source-only (data/doc extensions)"
+
 # --engine names a text backend as well as a structural one; the text side is
 # read from the environment so grep_fleet stays free of the flag plumbing.
 case "$force_engine" in

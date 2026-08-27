@@ -28,7 +28,7 @@ Committing to one engine means accepting its blind spot permanently.
 ```sh
 scripts/bootstrap                  # install engines (--check to only report)
 export FLEET_ROOT=~/code/fleet     # a directory holding your repos
-scripts/verify-search              # 172 checks against a throwaway fixture fleet
+scripts/verify-search              # 177 checks against a throwaway fixture fleet
 
 scripts/cs which                   # which subcommand answers what
 scripts/cs uses "/api/v1/orders"   # who uses this string, in code only
@@ -304,6 +304,42 @@ tokensave 7.9.0:
   above roughly 75 sites the reads are re-requested with a limit and become a
   sample of an unknown total. That is reported as `PARTIAL` with the read count
   spelled `≥N`, never as a complete answer.
+
+### A text answer says how much of itself is data
+
+The size of a text answer is the first thing a reader takes from it, and a large
+hit count reads as thorough coverage. Measured on a 43-repo fleet, `cs uses` on a
+CamelCase type returned **1,295 hits** — of which 1,271 were data files and 1,192
+came from a single test-resources CSV. The 24 source hits were the answer, and
+under the 200-line cap almost none of them were shown.
+
+Nothing was filtering wrongly: a CSV has no comment syntax, so there is nothing
+to strip and every line legitimately passes. The defect was that the composition
+was invisible — the answer did not distinguish 24-code-plus-1271-fixture from
+1295-code, and `cs uses`'s own "in CODE" reads as a promise about file *kind*
+when what it means is "with comments stripped where we know how".
+
+Every text answer now reports its own composition, and warns when the data half
+dominates:
+
+```
+$ cs uses OrderLineItem --fleet
+...
+! most of this answer is NOT source: composition: 24 in source, 1271 in
+  data/doc files (.csv 1208, .json 19, .md 3) — --source-only excludes the data half
+```
+
+`--source-only` is the opt-in narrowing, and it is **not** the default: a route
+in an `appsettings.json` is a real seam, and dropping it silently would be the
+same class of error in the other direction. When used, it is declared in the
+porcelain envelope's `exclusions`, not only on stderr.
+
+The line is **data vs source, never test vs production**. A test file is often
+the single most informative hit for an impact question — a test constructing a
+request object *without* a field is exactly where a changed default becomes
+observable — so test code always stays in scope. `.sql`, `.yaml` and `.xml` count
+as source too: they have comment syntax, and a column named in a query is a real
+use.
 
 ### And the same graph answers the symbol half of a question
 

@@ -1391,11 +1391,13 @@ assert d["kind"] == "structural", d["kind"]
       fail=$((fail + 1)); failed_ids+=("fields-writes-complete")
     fi
 
+
     rm -f "$fld_repo/fulfillment/capprobe.py"
     (cd "$fld_repo" && tokensave sync >/dev/null 2>&1) || true
   fi
   rm -rf "$fld_repo/.tokensave"
 fi
+
 
 # ---- symbol mode: cs callers / cs callees / cs impact -----------------------
 # The graph route, asked directly rather than only as a fallback. Everything
@@ -2238,6 +2240,104 @@ fi
 rm -rf "$nohash"
 # The constant-path index the old code wrote, in case this machine has one.
 rm -f "${TMPDIR:-/tmp}/cs-tags-.tags"
+
+# ---- source vs data in a text answer ---------------------------------------
+# A measured `cs uses` answer was 1,295 hits, of which 1,271 were data files and
+# 1,192 came from ONE test-resources CSV. The 24 source hits were the answer:
+# 1.9% of what came back, and under the 200-line cap almost none were shown.
+#
+# Nothing was broken -- filter_code.py lists those extensions in
+# NO_COMMENT_SYNTAX deliberately, and `cs why heuristic` already says a fixture
+# string counts as a use. The defect was that the COMPOSITION was invisible: the
+# answer did not distinguish 24-code-plus-1271-fixture from 1295-code, and a
+# large hit count reads as thorough coverage.
+info ""
+info "${C_BOLD}source vs data composition${C_OFF}"
+mkdir -p "$FLEET_ROOT/web-monorepo-node/compositionprobe" "$FLEET_ROOT/web-monorepo-node/src"
+python3 - "$FLEET_ROOT/web-monorepo-node" <<'PROBE'
+import sys
+d = sys.argv[1]
+open(d + "/compositionprobe/rows.csv", "w").write(
+    "\n".join("id,name,CompositionProbeToken%d" % i for i in range(50)) + "\n")
+open(d + "/compositionprobe/notes.md", "w").write("CompositionProbeToken is documented here\n")
+open(d + "/compositionprobe/q.sql", "w").write("SELECT CompositionProbeToken FROM t;\n")
+open(d + "/src/compositionprobe.ts", "w").write("const x = CompositionProbeToken;\n")
+PROBE
+
+comp_out=$("$here/cs" uses CompositionProbeToken --fleet 2>&1)
+# The breakdown names the extensions AND both sides of the split, so a reader
+# can see that 51 of 53 are not source without running a second command.
+if printf '%s' "$comp_out" | grep -q 'composition:' \
+   && printf '%s' "$comp_out" | grep -q 'in source' \
+   && printf '%s' "$comp_out" | grep -q '\.csv 50'; then
+  ok "a text answer reports its source/data composition, by extension"
+  pass=$((pass + 1))
+else
+  err "cs uses did not disclose how much of its answer was data"
+  fail=$((fail + 1)); failed_ids+=("composition-disclosed")
+fi
+
+# A warning, not a note, when the data half DOMINATES -- that is the case where
+# the hit count misrepresents the answer, and the one the report was about.
+if printf '%s' "$comp_out" | grep -q 'most of this answer is NOT source'; then
+  ok "a data-dominated answer warns rather than merely noting"; pass=$((pass + 1))
+else
+  err "an answer that was 96% data was reported without a warning"
+  fail=$((fail + 1)); failed_ids+=("composition-warns")
+fi
+
+# The default must NOT have become source-only: dropping data hits is a
+# narrowing, and a route in an appsettings.json is a real seam.
+comp_n=$("$here/cs" uses CompositionProbeToken --fleet --quiet 2>/dev/null | grep -c '[^[:space:]]')
+comp_src=$("$here/cs" uses CompositionProbeToken --fleet --source-only --quiet 2>/dev/null | grep -c '[^[:space:]]')
+# .ts and .sql are SOURCE -- .sql has comment syntax and a column named in a
+# query is a real use. Only files with no comment syntax at all, plus prose
+# docs, are data. 53 hits in, 2 out.
+if [[ "$comp_n" -eq 53 && "$comp_src" -eq 2 ]]; then
+  ok "--source-only drops data and doc hits, and is not the default"
+  pass=$((pass + 1))
+else
+  err "--source-only filtered wrongly (default=$comp_n source-only=$comp_src, wanted 53/2)"
+  fail=$((fail + 1)); failed_ids+=("source-only-filter")
+fi
+
+# The narrowing has to be visible to a MACHINE caller too. It is applied inside
+# `$(...)`, and a variable set in a subshell never reaches the envelope -- the
+# first version of this warned on stderr while reporting exclusions:null, which
+# is a narrowing a human could see and a script could not.
+if "$here/cs" uses CompositionProbeToken --fleet --source-only --porcelain --quiet 2>/dev/null \
+   | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["exclusions"] and "source-only" in d["exclusions"], d["exclusions"]
+assert d["hits"] == 2, d["hits"]
+' 2>/dev/null; then
+  ok "--source-only is declared in the porcelain envelope, not only on stderr"
+  pass=$((pass + 1))
+else
+  err "--source-only narrowed the answer without saying so in the envelope"
+  fail=$((fail + 1)); failed_ids+=("source-only-envelope")
+fi
+
+# The line is data vs source, NEVER test vs production. A test file is often the
+# single most informative hit for an impact question -- a test constructing a
+# request object WITHOUT a field is exactly where a changed default becomes
+# observable -- so a path under tests/ must survive --source-only.
+mkdir -p "$FLEET_ROOT/web-monorepo-node/src/__tests__"
+printf 'expect(CompositionProbeToken).toBe(1);\n' \
+  > "$FLEET_ROOT/web-monorepo-node/src/__tests__/probe.test.ts"
+if "$here/cs" uses CompositionProbeToken --fleet --source-only --quiet 2>/dev/null \
+   | grep -q 'probe.test.ts'; then
+  ok "--source-only keeps test CODE, which is data-vs-source not test-vs-prod"
+  pass=$((pass + 1))
+else
+  err "--source-only excluded a test file, which hides the best impact evidence"
+  fail=$((fail + 1)); failed_ids+=("source-only-keeps-tests")
+fi
+
+rm -rf "$FLEET_ROOT/web-monorepo-node/compositionprobe" \
+       "$FLEET_ROOT/web-monorepo-node/src/compositionprobe.ts" \
+       "$FLEET_ROOT/web-monorepo-node/src/__tests__"
 
 # ---- porcelain -------------------------------------------------------------
 # The exit code separated a refusal from an honest zero; everything else needed

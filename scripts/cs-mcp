@@ -100,6 +100,7 @@ SCOPE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 CS_FLAGS = {
     "--fleet", "--why", "--quiet", "-q", "--all", "--touched",
     "--refresh", "--porcelain", "--json", "--word", "-w",
+    "--source-only",
 }
 
 
@@ -141,6 +142,24 @@ SCOPE_ARG = arg(
 # repos where the whole-word answer was 2 call sites. A malformed query of this
 # shape does not error and does not return a suspicious zero -- it returns
 # false ABUNDANCE, and a large hit count reads as thorough coverage.
+# Opt-in, and named on the verbs that return text hits. A measured `cs uses`
+# answer was 1,295 hits of which 1,271 were data files and 1,192 came from a
+# single fixture CSV -- the 24 source hits were the answer, and under the cap
+# almost none of them were shown. cs now reports the composition of every text
+# answer; this flag is for a caller who wants the data half gone.
+#
+# NOT a test-vs-production filter, deliberately: a test constructing a request
+# object WITHOUT a field is often the most informative hit for an impact
+# question, so test code stays in scope. The line is data vs source.
+SOURCE_ONLY_ARG = arg(
+    "source_only",
+    "Exclude data and doc files (.csv .json .txt .tsv .lock .log .rst .md) from "
+    "the hits. Off by default, because a route in an appsettings.json is a real "
+    "seam. Composition is reported either way.",
+    required=False,
+    type_="boolean",
+)
+
 WORD_ARG = arg(
     "word",
     "Match whole identifiers only, not substrings of longer ones. Use this "
@@ -160,21 +179,24 @@ TOOLS = [
      "matches every longer name containing it.",
      [arg("query", "The string to find: an endpoint path, topic name, config key."),
       SCOPE_ARG,
-      WORD_ARG]),
+      WORD_ARG,
+      SOURCE_ONLY_ARG]),
 
     ("cs_seam", "seam",
      "Which repos share this string, comments included — and warns when only "
      "one does, which is how a dead seam looks.",
      [arg("query", "The string that would form the seam."),
       SCOPE_ARG,
-      WORD_ARG]),
+      WORD_ARG,
+      SOURCE_ONLY_ARG]),
 
     ("cs_text", "text",
      "Plain text or regex across every repo, comments included. The fallback "
      "when no sharper question fits.",
      [arg("pattern", "A literal string or regex."),
       SCOPE_ARG,
-      WORD_ARG]),
+      WORD_ARG,
+      SOURCE_ONLY_ARG]),
 
     ("cs_def", "def",
      "Where a symbol is defined, across the fleet or within one repo.",
@@ -646,6 +668,8 @@ def call_tool(name, arguments):
         flags.append("--word")
     if arguments.get("touched"):
         flags.append("--touched")
+    if arguments.get("source_only"):
+        flags.append("--source-only")
 
     env = run_cs(sub, positional(spec, arguments), scope=scope, flags=flags)
     return render(env)
