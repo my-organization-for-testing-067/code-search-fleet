@@ -64,6 +64,7 @@ than a wrong one, because nothing reports it. `brew install coreutils` on macOS.
 | What breaks if I change this symbol | `cs impact <symbol> <repo>` |
 | Who reads or writes this field, fleet-wide | `cs fields <field> [repo]` |
 | How big is that field's blast radius | `cs fields <field> --count` |
+| Which repos even have this, before paying for hits | `cs text\|seam\|uses <q> --count` |
 | What references this symbol (bridges DI) | `cs refs <symbol> <repo> <file>` |
 | Which repo publishes this package | `cs provides <coordinate>` |
 | Which repos depend on which | `cs deps [repo]` |
@@ -254,7 +255,7 @@ only answer there. When a repo has a tokensave graph, `cs impls` now falls back
 to it:
 
 ```
-! answered from a tokensave graph last synced 3 day(s) ago — it cannot see changes made since
+! answered from a tokensave graph last synced 12m ago — it cannot see changes made since
 ! this is a GRAPH answer, not a language server: it cannot see reflection, DI
   registration, or generated code…
 answer: structural via tokensave (graph) · 2 hit(s) · 1 repo(s)
@@ -266,6 +267,25 @@ remains the only thing here that bridges a DI registration. The query is
 `fixtures/BASELINE.md`). `cs engines` reports graph age alongside the binaries,
 since a graph is the one engine that can be confidently *wrong* rather than
 merely blind.
+
+That age is read from the graph's `last_sync_at` — when it was last **verified**
+against the tree — and deliberately not from `last_updated`, which records when
+its **content last changed**. They are different questions, and a sync that
+finds nothing to change advances the first and not the second. On a fleet synced
+two minutes earlier:
+
+```
+last_sync_at        ->  0h  2m ago
+last_updated        -> 87h 46m ago
+```
+
+Reading the second made every graph answer tell the reader their graph was days
+stale and prescribe `tokensave sync` — minutes after a scheduled job had run it.
+It never self-corrected either: a repo whose commits touch only file types with
+no extractor keeps a stale `last_updated` indefinitely while being perfectly
+current, so the warning fired hardest on the repos that least needed it. Where
+the field is missing the age is reported as *unknown* rather than substituting
+the other one, for the same reason `cs strictness` keeps `UNKNOWN` distinct.
 
 `cs def` gets the same fallback: with no universal-ctags installed it reads the
 graphs instead, and `--engine=tokensave` asks for them deliberately. The
@@ -517,6 +537,47 @@ observable — so test code always stays in scope. `.sql`, `.yaml` and `.xml` co
 as source too: they have comment syntax, and a column named in a query is a real
 use.
 
+### Counts first, when hits cost something
+
+`--count` started on `cs fields`, where a fleet-wide listing overflows the
+graph's own output and the tallies are the only thing that survives. It now
+also answers on `cs text`, `cs seam` and `cs uses`, for a different reason: an
+**MCP caller pays per hit**.
+
+One exploratory `cs_text` over a 43-repo fleet returned:
+
+```
+answer: textual via ripgrep (regex) · 642 hit(s) · 12 repo(s)
+TRUNCATED: 200 of 642 hits shown. Narrow the query to see the rest.
+```
+
+Roughly 15,000 tokens, for a query whose only purpose was to find out *where to
+look*. The cap behaved correctly — it disclosed the denominator, which is what
+makes the cost visible — but the caller still paid 200 hit bodies to learn a
+distribution:
+
+```
+$ cs text 'reservationId' --fleet --count
+inventory-api-dotnet: 412
+checkout-service-kotlin: 187
+web-monorepo-node: 43
+
+total: 642 hit(s) across 12 repo(s)
+  counts only — no hit bodies were read into this answer
+```
+
+Two properties make the number worth reading. It comes from the **same search**
+the listing runs, so `--word`, `--source-only` and the prose filter all still
+apply and the totals agree with the listing's — a tally taken by a shortcut
+would be a wider question wearing this one's heading. And the findings survive:
+`cs seam --count` still reports the orphan warning, and every answer still
+discloses its composition, because those are computed from the hits rather than
+from what was printed.
+
+It is refused, not ignored, on the subcommands that return neither hits nor
+tallies. A dropped flag looks exactly like a flag that was honoured and changed
+nothing.
+
 ### Saved queries are consumers, and they fail silently
 
 One class of hit is neither source nor data: a **dashboard panel, alert rule or
@@ -627,12 +688,37 @@ reading.
 | `TICKETS_ROOT` | where per-ticket workspaces live |
 | `CS_MAX_RESULTS` | result cap, default 200 (`0` or `--all` for none) |
 | `CS_TIMEOUT` | per-engine wall-clock limit in seconds, default 120 |
-| `CS_TAGS_TTL` | how long `cs def` reuses its symbol index, default 60s |
+| `CS_TAGS_TTL` | how long `cs def` reuses its symbol index; default 60s with a ticket workspace layered, and unbounded for a fleet-only view, where the fingerprint is already a complete key |
 | `CS_TEXT_ENGINE` | force `rg` or `grep`, so the two can be compared rather than trusted |
 | `CS_EXCLUDE_EXTRA` | directories to skip, added to the built-in list |
 | `CS_EXCLUDE_REMOVE` | directories to **stop** skipping |
 | `CS_JSON` | `1` for one JSON object on stdout instead of result lines (same as `--porcelain`) |
 | `CS_CTAGS_BIN` | use exactly this universal-ctags; if it does not validate, ctags counts as absent |
+
+`CS_TAGS_TTL` is scoped, because the two scopes `cs def` answers for have
+different keys rather than different tastes in staleness. The symbol index is
+cached under a fingerprint of every repo in view and the commit each sits on, so
+the key already invalidates precisely when any repo's HEAD moves. On top of it
+sat a flat 60s TTL whose documented purpose is *uncommitted edits* — the one
+thing a commit hash cannot see.
+
+In a ticket workspace that is the normal state, and the TTL earns its keep. In a
+fleet-only view it does not: a read-only mirror reset to `origin/HEAD` on every
+refresh has no uncommitted edits, and the fingerprint is a complete key for
+tracked content. The flat TTL made it decorative. Measured on a 43-repo fleet:
+
+| call | time | answer line |
+|---|---|---|
+| cold `cs def <Symbol>` | **42.1s** | `ctags (fleet-wide symbol index, rebuilt now)` |
+| same call 6s later | **5.85s** | `ctags (…, cached 6s ago …)` |
+
+Any interactive use is more than 60 seconds apart, so nearly every `cs def` paid
+the 42s to rebuild an index the key had already proved current. So a fleet-only
+view now trusts the fingerprint, and a layered ticket keeps the 60s. The answer
+line names the gap that actually applies to each — under the fingerprint there
+is no time window to distrust, only files added by hand and never committed,
+which is what `--refresh` is for. Setting `CS_TAGS_TTL` overrides both, for a
+fleet root people edit in place rather than mirror.
 
 `CS_EXCLUDE_REMOVE` matters more than it looks. The built-in exclusion list is a
 guess about other people's repos, and some entries are wrong for some of them:

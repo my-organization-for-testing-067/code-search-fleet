@@ -79,13 +79,19 @@
 #   --field=<name>   cs constructs only: mark each construction site present or
 #                    ABSENT for this field. ABSENT sites inherit its default,
 #                    which is where a default change is observable.
-#   --count          cs fields only: per-repo write/read SITE tallies instead of
-#                    the site list -- the same quantity the listing reports, so
-#                    the two modes agree. Survives the output truncation that
-#                    makes a fleet-wide listing impossible, which is why the
-#                    blast-radius question has an answer in this mode. Where the
-#                    output WAS truncated, distinct sites cannot be derived and
-#                    the row says it is counting references instead.
+#   --count          per-repo tallies instead of the results, on the four verbs
+#                    where a distribution is the question.
+#                    cs fields: write/read SITE tallies -- the same quantity the
+#                    listing reports, so the two modes agree. Survives the output
+#                    truncation that makes a fleet-wide listing impossible, which
+#                    is why the blast-radius question has an answer in this mode.
+#                    Where the output WAS truncated, distinct sites cannot be
+#                    derived and the row says it is counting references instead.
+#                    cs text / seam / uses: per-repo HIT tallies and no hit
+#                    bodies, for a caller that pays per hit and does not yet know
+#                    where to look. Same pipeline as the listing, so --word,
+#                    --source-only and the prose filter all still apply and the
+#                    numbers are the ones the listing would have shown.
 #   --source-only    exclude data and doc files (.csv .json .txt .tsv .lock .log
 #                    .rst .md) from a text answer. OFF by default: a route in an
 #                    appsettings.json is a real seam. The composition of every
@@ -1455,17 +1461,55 @@ tokensave_graph_at() { [[ -f "$1/.tokensave/tokensave.db" ]]; }
 # about the code as of its last sync -- so its age is surfaced, not assumed.
 # `status` takes its path POSITIONALLY and rejects --project, unlike the `tool`
 # subcommands; and --json avoids ~36KB of ANSI art for a handful of numbers.
+#
+# `last_sync_at`, NOT `last_updated`. They are different questions and only one
+# of them is the one every message here asks:
+#
+#   last_sync_at   when the graph was last VERIFIED against the tree
+#   last_updated   when the graph's CONTENT last changed
+#
+# A sync that finds nothing to change advances the first and not the second, so
+# `last_updated` goes stale on a repo that is perfectly current -- and stays
+# stale indefinitely for a repo whose commits only touch file types with no
+# extractor. Measured on a fleet synced two minutes earlier: last_sync_at 0h2m,
+# last_updated 87h46m, and `cs engines` reporting "oldest 3 day(s) old". Every
+# sentence downstream of this says "last synced", which is exactly the claim
+# last_sync_at answers and last_updated does not.
+#
+# No fallback to last_updated when the field is absent. Substituting the field
+# that answers a different question is the bug being fixed, and the callers all
+# already have an honest "sync age unknown" branch to take instead.
 tokensave_graph_epoch() {
   have_tokensave || return 1
   tokensave status "$1" --json 2>/dev/null \
-    | sed -n 's/.*"last_updated"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1
+    | sed -n 's/.*"last_sync_at"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1
 }
-tokensave_graph_age_days() {
+tokensave_graph_age_secs() {
   local e now
   e=$(tokensave_graph_epoch "$1") || return 1
   [[ -n "$e" ]] || return 1
   now=$(date +%s)
-  printf '%s\n' $(( (now - e) / 86400 ))
+  # A clock that has gone backwards since the sync would otherwise print a
+  # negative age, which reads as a corrupt graph rather than a skewed clock.
+  [[ "$e" -gt "$now" ]] && { printf '0\n'; return 0; }
+  printf '%s\n' $(( now - e ))
+}
+
+# Seconds as something a reader can act on. Days alone were the unit before,
+# and once the fleet refreshes every 15 minutes every graph is "0 day(s)" --
+# accurate and useless, since the whole point of the number is to let a reader
+# decide whether to discount the answer.
+#
+# The seconds tier is not cosmetic. A scheduled sync every 15 minutes puts the
+# real answer under a minute most of the time, and "0m" is the same string a
+# rounding bug would print -- so the one number that tells a stale graph from a
+# current one would have had no resolution in the range it is normally read in.
+format_age() {  # <seconds> -> 8s | 2m | 3h | 4d
+  local s="$1"
+  if   [[ "$s" -lt 60    ]]; then printf '%ds' "$s"
+  elif [[ "$s" -lt 3600  ]]; then printf '%dm' $(( s / 60 ))
+  elif [[ "$s" -lt 172800 ]]; then printf '%dh' $(( s / 3600 ))
+  else printf '%dd' $(( s / 86400 )); fi
 }
 
 # ---- which graph answered, and what it therefore cannot see ------------------
@@ -1517,8 +1561,8 @@ real_dir_of() {  # <dir> -> the path it resolves to
 graph_note() {  # <repo> <graph-dir> [extra] -> the note for answer()
   local repo="$1" dir="$2" extra="${3:-}" age note
   note="scoped to $repo; $(graph_layer_of "$dir") layer"
-  if age=$(tokensave_graph_age_days "$dir") && [[ -n "$age" ]]; then
-    note="$note, synced ${age}d ago"
+  if age=$(tokensave_graph_age_secs "$dir") && [[ -n "$age" ]]; then
+    note="$note, synced $(format_age "$age") ago"
   else
     note="$note, sync age unknown"
   fi
@@ -1533,8 +1577,8 @@ graph_note() {  # <repo> <graph-dir> [extra] -> the note for answer()
 # caller reading the envelope has no stderr to read.
 graph_caveats() {  # <repo> <graph-dir> <substituted:0|1>
   local repo="$1" dir="$2" substituted="$3" age
-  if age=$(tokensave_graph_age_days "$dir") && [[ -n "$age" ]]; then
-    warn "answered from a tokensave graph last synced ${age} day(s) ago — it cannot see changes made since (cd $(real_dir_of "$dir") && tokensave sync)"
+  if age=$(tokensave_graph_age_secs "$dir") && [[ -n "$age" ]]; then
+    warn "answered from a tokensave graph last synced $(format_age "$age") ago — it cannot see changes made since (cd $(real_dir_of "$dir") && tokensave sync)"
   else
     warn "could not read this graph's sync age — a graph answers about the code as of its last sync, and this one will not say when that was"
   fi
@@ -2268,6 +2312,43 @@ whole_word_hits() {  # <pattern>, hit lines on stdin
 n_repos_in() { printf '%s\n' "$1" | cut -d/ -f1 | sort -u | grep -c ''; }
 n_hits_in()  { printf '%s\n' "$1" | grep -c ''; }
 
+# --count for a TEXT answer: the per-repo tally, and no hit bodies.
+#
+# The reason it exists is a caller that pays per hit. A human at a terminal
+# scrolls past 200 lines for free; an MCP caller reads them into a context
+# window and is charged by the token. One measured exploratory `cs text` over a
+# 43-repo fleet returned 642 hits in 12 repos, showed 200 of them, and cost
+# roughly 15,000 tokens -- for a query whose only purpose was to find out WHICH
+# REPO to look in. That is the question a tally answers in a few hundred.
+#
+# It runs the SAME pipeline the listing does and only changes what is emitted,
+# so the numbers here are the numbers that mode would have shown -- including
+# every narrowing (--word, --source-only, the prose filter) that already
+# applied. A count computed by a shortcut would be a different question wearing
+# this one's heading, which is the failure cs fields --count was built to avoid.
+#
+# Uncapped, deliberately. The rows are bounded by the fleet -- one line per repo
+# -- so there is no budget to spend, and truncating a tally would destroy the
+# one property that makes it worth asking for: that it is a complete
+# denominator. emit_plain, not emit_capped, for that reason.
+emit_repo_counts() {  # <hits> <unit> <the same query, listing the hits>
+  local hits="$1" unit="$2" listing="$3" rows total n_repos
+  rows=$(printf '%s\n' "$hits" | cut -d/ -f1 | sort | uniq -c \
+         | sort -rn | awk '{printf "%s: %s\n", $2, $1}')
+  emit_plain "$rows"
+  total=$(n_hits_in "$hits")
+  n_repos=$(n_repos_in "$hits")
+  info ""
+  info "${C_BOLD}total: $total $unit across $n_repos repo(s)${C_OFF}"
+  info "  counts only — no hit bodies were read into this answer"
+  # Named rather than implied. None of the three text verbs takes a repo
+  # argument, so a hint offering to narrow to one would name a command that
+  # does not exist -- and the repo names above are still the answer: they say
+  # where to point cs def, cs refs, or an editor.
+  info "  the hits themselves: $listing"
+  info "  the repo names are the useful half — cs text/seam/uses search the whole view, so narrow by asking a sharper question there (cs def, cs refs, cs callers)"
+}
+
 # Print the comment header verbatim, so usage cannot drift from the file.
 usage() {
   awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
@@ -2303,14 +2384,14 @@ cmd_engines() {
     for d in $(real_dirs); do
       tokensave_graph_at "$d" || continue
       g_n=$((g_n + 1))
-      g_age=$(tokensave_graph_age_days "$d") || continue
+      g_age=$(tokensave_graph_age_secs "$d") || continue
       [[ -n "$g_age" ]] || continue
       if [[ -z "$g_oldest" || "$g_age" -gt "$g_oldest" ]]; then g_oldest="$g_age"; fi
     done
     if [[ $g_n -eq 0 ]]; then
       printf '%-12s %s\n' "tokensave" "ok, but no repo has a graph (cd <repo> && tokensave init) — cs callers/callees/impact refuse, and cs impls has no fallback where a toolchain is missing"
     else
-      printf '%-12s %s\n' "tokensave" "ok ($g_n repo graph(s), oldest ${g_oldest:-?} day(s) old; answers cs callers/callees/impact, and cs impls where no language server can run)"
+      printf '%-12s %s\n' "tokensave" "ok ($g_n repo graph(s), oldest last synced $( [[ -n "$g_oldest" ]] && format_age "$g_oldest" || printf '?' ) ago; answers cs callers/callees/impact, and cs impls where no language server can run)"
     fi
   else
     printf '%-12s %s\n' "tokensave" "MISSING — cs callers / cs callees / cs impact refuse (nothing else here answers a call graph); cs impls loses its fallback where a language toolchain cannot be installed"
@@ -2416,7 +2497,14 @@ cmd_text() {
          "cs calls '<pattern>'   (it may only appear as a call shape)"
     return $CS_EXIT_NO_HITS
   fi
-  emit_capped "$(annotate_observability "$out")"
+  # The disclosures stay in BOTH modes: they are per-answer facts on stderr,
+  # they cost a handful of lines, and a tally with the composition hidden would
+  # be the cheap answer that is also the misleading one.
+  if [[ $count_mode -eq 1 ]]; then
+    emit_repo_counts "$out" "hit(s)" "cs text '$1'"
+  else
+    emit_capped "$(annotate_observability "$out")"
+  fi
   disclose_composition "$out"
   disclose_observability
   report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
@@ -2440,7 +2528,14 @@ cmd_seam() {
   fi
   repos=$(printf '%s\n' "$hits" | cut -d/ -f1 | sort -u)
   n=$(printf '%s\n' "$repos" | grep -c '')
-  emit_capped "$(annotate_observability "$hits")"
+  # The orphan warning below is the point of this verb, and it is computed from
+  # the hits either way -- so --count changes what is PRINTED and nothing about
+  # what is concluded.
+  if [[ $count_mode -eq 1 ]]; then
+    emit_repo_counts "$hits" "mention(s)" "cs seam '$1'"
+  else
+    emit_capped "$(annotate_observability "$hits")"
+  fi
   disclose_composition "$hits"
   disclose_observability
   info ""
@@ -2648,7 +2743,11 @@ cmd_uses() {
   elif [[ "$n_uses_word" -lt "$n_uses_all" ]]; then
     warn "$((n_uses_all - n_uses_word)) of $n_uses_all hit(s) matched INSIDE a longer identifier — not a use of this name (use --word to exclude them)"
   fi
-  emit_capped "$(annotate_observability "$hits")"
+  if [[ $count_mode -eq 1 ]]; then
+    emit_repo_counts "$hits" "use(s) in code" "cs uses '$1'"
+  else
+    emit_capped "$(annotate_observability "$hits")"
+  fi
   # The composition, next to the count. "In CODE" in this subcommand's own
   # description reads as a guarantee about file KIND; what it actually promises
   # is "with comments stripped where we know how", which is a different thing.
@@ -2707,7 +2806,7 @@ def_via_tokensave() {  # <symbol> [only-repo]
     [[ -n "$only" && "$name" != "$only" ]] && continue
     if ! tokensave_graph_at "$d"; then no_graph="$no_graph $name"; continue; fi
     n_graph=$((n_graph + 1))
-    age=$(tokensave_graph_age_days "$d") || age=""
+    age=$(tokensave_graph_age_secs "$d") || age=""
     if [[ -n "$age" && ( -z "$oldest" || "$age" -gt "$oldest" ) ]]; then oldest="$age"; fi
     local one
     one=$(python3 "$lib_dir/tokensave_call.py" def "$d" "$name" "$sym"); rc=$?
@@ -2721,7 +2820,7 @@ def_via_tokensave() {  # <symbol> [only-repo]
   build one with: cd <repo> && tokensave init
   or install universal-ctags, which indexes the whole view in one pass"
   answer structural "tokensave (graph)" "$n_graph repo graph(s), no ctags index"
-  [[ -n "$oldest" ]] && warn "answered from graph(s) last synced up to ${oldest} day(s) ago — changes made since are invisible (tokensave sync)"
+  [[ -n "$oldest" ]] && warn "answered from graph(s) last synced up to $(format_age "$oldest") ago — changes made since are invisible (tokensave sync)"
   # The uncovered repos, named. A symbol defined in one of them looks exactly
   # like a symbol that does not exist.
   [[ -n "$no_graph" ]] && warn "no tokensave graph, so NOT searched:$no_graph — a definition in those repos cannot be found this way"
@@ -2770,7 +2869,40 @@ cmd_def() {
   # a short TTL as the backstop for uncommitted edits -- which refs cannot see
   # and which are exactly what you have while working a ticket. The staleness
   # window is bounded and stated rather than hidden; --refresh forces a rebuild.
-  local fp tags age ttl="${CS_TAGS_TTL:-60}" cached="" no_cache=0
+  #
+  # The TTL is SCOPED, because the two scopes this command answers for have
+  # different keys, not different tastes in staleness.
+  #
+  #   ticket layered   uncommitted edits are the normal state, and a commit
+  #                    hash cannot see one. 60s, as before.
+  #   fleet only       the fingerprint is already a complete key for tracked
+  #                    content: it holds every repo's HEAD, so it changes on
+  #                    exactly the events that can invalidate the index.
+  #
+  # A flat 60s made the fingerprint decorative in the fleet case. Measured on a
+  # 43-repo fleet: a cold `cs def` cost 42.1s and the same call six seconds
+  # later cost 5.85s -- and since any interactive use is more than a minute
+  # apart, nearly every `cs def` paid the 42s to rebuild an index the key had
+  # already proved current.
+  #
+  # The residual gap in the fleet case is UNTRACKED files hand-dropped into a
+  # mirror, which no fingerprint built from refs can see. --refresh is the
+  # answer to that, and the answer line says so rather than implying the index
+  # is unconditionally fresh.
+  #
+  # CS_TAGS_TTL still wins when it is set, in both scopes. It is the escape
+  # hatch for a fleet root that is NOT a read-only mirror -- somewhere people
+  # edit in place -- and setting it to 0 asks for the fingerprint alone.
+  local fp tags age ttl cached="" no_cache=0
+  if [[ -n "${CS_TAGS_TTL:-}" ]]; then
+    ttl="$CS_TAGS_TTL"
+  elif [[ -z "$view_tmp" ]]; then
+    # No ticket workspace is layered, so nothing in view is a branch someone is
+    # editing. -1 is "no time bound"; the fingerprint is the whole key.
+    ttl=-1
+  else
+    ttl=60
+  fi
   if fp=$(view_fingerprint); then
     tags="${TMPDIR:-/tmp}/cs-tags-${fp}.tags"
   else
@@ -2784,7 +2916,11 @@ cmd_def() {
 
   if [[ $no_cache -eq 0 && $refresh_index -eq 0 && -s "$tags" ]]; then
     age=$(( $(date +%s) - $(file_mtime "$tags") ))
-    if [[ $age -ge 0 && $age -lt $ttl ]]; then cached="cached ${age}s ago"; fi
+    # A negative age is a clock that moved, not a fresh index, and is rebuilt
+    # under every TTL rather than trusted under the unbounded one.
+    if [[ $age -ge 0 ]] && { [[ $ttl -lt 0 ]] || [[ $age -lt $ttl ]]; }; then
+      cached="cached $(format_age "$age") ago"
+    fi
   fi
 
   # Built to a private path and moved into place, never written where a reader
@@ -2818,7 +2954,15 @@ cmd_def() {
     mv -f "$tmp_tags" "$tags" 2>/dev/null || { rm -f "$tmp_tags"; die "could not install the symbol index at $tags"; }
     answer structural "ctags" "fleet-wide symbol index, rebuilt now"
   else
-    answer structural "ctags" "fleet-wide symbol index, $cached — uncommitted edits within ${ttl}s may be missing (--refresh)"
+    # What the caller can and cannot conclude from a cache hit, which differs
+    # by which key allowed it. Naming the wrong gap is worse than naming none:
+    # under the fingerprint there is no time window to distrust, and under the
+    # TTL there is.
+    if [[ $ttl -lt 0 ]]; then
+      answer structural "ctags" "fleet-wide symbol index, $cached — every repo is on the same commit as then, so only files added by hand and never committed are missing (--refresh)"
+    else
+      answer structural "ctags" "fleet-wide symbol index, $cached — uncommitted edits within ${ttl}s may be missing (--refresh)"
+    fi
   fi
   # A concurrent --refresh can replace the file between the check above and the
   # read below; both are complete indexes, so re-checking is enough.
@@ -3181,8 +3325,8 @@ impls_via_tokensave() {  # <symbol> <repo-name> <repo-dir> <toolchain-missing|fo
   esac
   # A graph answers about the code as of its last sync, which makes staleness a
   # correctness problem rather than a tidiness one. Always stated.
-  age=$(tokensave_graph_age_days "$dir") && [[ -n "$age" ]] && \
-    warn "answered from a tokensave graph last synced ${age} day(s) ago — it cannot see changes made since (cd $(real_dir_of "$dir") && tokensave sync)"
+  age=$(tokensave_graph_age_secs "$dir") && [[ -n "$age" ]] && \
+    warn "answered from a tokensave graph last synced $(format_age "$age") ago — it cannot see changes made since (cd $(real_dir_of "$dir") && tokensave sync)"
   # Names the real prerequisite, or says nothing specific rather than something
   # untrue: the reader cannot learn what cs refs needs from anywhere else here.
   if [[ -n "$tc" ]]; then
@@ -3481,7 +3625,7 @@ fields_count_via_tokensave() {  # <field> [only-repo]
     [[ -n "$only" && "$name" != "$only" ]] && continue
     if ! tokensave_graph_at "$d"; then no_graph="$no_graph $name"; continue; fi
     n_graph=$((n_graph + 1))
-    age=$(tokensave_graph_age_days "$d") || age=""
+    age=$(tokensave_graph_age_secs "$d") || age=""
     if [[ -n "$age" && ( -z "$oldest" || "$age" -gt "$oldest" ) ]]; then oldest="$age"; fi
     local one
     one=$(python3 "$lib_dir/tokensave_call.py" field-counts "$d" "$name" "$field"); rc=$?
@@ -3508,7 +3652,7 @@ fields_count_via_tokensave() {  # <field> [only-repo]
   build one with: cd <repo> && tokensave init"
 
   answer structural "tokensave (graph)" "$n_graph repo graph(s), per-repo counts"
-  [[ -n "$oldest" ]] && warn "answered from graph(s) last synced up to ${oldest} day(s) ago — changes made since are invisible (tokensave sync)"
+  [[ -n "$oldest" ]] && warn "answered from graph(s) last synced up to $(format_age "$oldest") ago — changes made since are invisible (tokensave sync)"
   [[ -n "$no_graph" ]] && warn "no tokensave graph, so NOT counted:$no_graph — a read or write in those repos is missing from these totals"
 
   # Same refusal as the listing route, for the same reason: tokensave returns
@@ -3549,7 +3693,7 @@ fields_via_tokensave() {  # <field> [only-repo]
     [[ -n "$only" && "$name" != "$only" ]] && continue
     if ! tokensave_graph_at "$d"; then no_graph="$no_graph $name"; continue; fi
     n_graph=$((n_graph + 1))
-    age=$(tokensave_graph_age_days "$d") || age=""
+    age=$(tokensave_graph_age_secs "$d") || age=""
     if [[ -n "$age" && ( -z "$oldest" || "$age" -gt "$oldest" ) ]]; then oldest="$age"; fi
     local one
     one=$(python3 "$lib_dir/tokensave_call.py" fields "$d" "$name" "$field"); rc=$?
@@ -3594,7 +3738,7 @@ fields_via_tokensave() {  # <field> [only-repo]
   weaker but available now: cs uses '$field'"
 
   answer structural "tokensave (graph)" "$n_graph repo graph(s), read/write split"
-  [[ -n "$oldest" ]] && warn "answered from graph(s) last synced up to ${oldest} day(s) ago — changes made since are invisible (tokensave sync)"
+  [[ -n "$oldest" ]] && warn "answered from graph(s) last synced up to $(format_age "$oldest") ago — changes made since are invisible (tokensave sync)"
   [[ -n "$no_graph" ]] && warn "no tokensave graph, so NOT searched:$no_graph — a read or write in those repos cannot be found this way"
   warn "this is a GRAPH answer, not a language server: it cannot see reflection, DI registration, serialization by name, or generated code — all of which touch fields without a site the graph records."
   # Named per repo, because the sampling happened per graph and the read counts
@@ -4477,7 +4621,15 @@ done
 # printed from in there (stderr escapes a subshell; an assignment does not),
 # which is exactly the shape of bug that leaves a narrowing visible to a human
 # and invisible to a machine caller.
-[[ $count_mode -eq 1 && "${args[0]:-}" != "fields" ]] && { printf 'cs: --count is only meaningful for cs fields\n  every other subcommand returns hits, not per-repo tallies\n' >&2; exit 1; }
+# Still refused rather than ignored everywhere else -- a dropped flag looks
+# exactly like a flag that was honoured and changed nothing. The list grew from
+# `fields` alone to the three text verbs: those return hits into a caller's
+# context and are charged by the token, and a per-repo tally is how you find out
+# where to look without paying for 200 hit bodies to learn it.
+case "${args[0]:-}" in
+  fields|text|seam|uses) ;;
+  *) [[ $count_mode -eq 1 ]] && { printf 'cs: --count is not meaningful for cs %s\n  it answers on: fields (write/read site tallies), text, seam, uses (per-repo hit tallies)\n  every other subcommand returns a structured answer, not a per-repo count\n' "${args[0]:-<no subcommand>}" >&2; exit 1; } ;;
+esac
 [[ $source_only -eq 1 ]] && CS_EXCLUSION_NOTE="${CS_EXCLUSION_NOTE:+$CS_EXCLUSION_NOTE, }--source-only (data/doc extensions)"
 
 # --engine names a text backend as well as a structural one; the text side is

@@ -728,6 +728,69 @@ else
   err "'cs def' did not answer at all"; fail=$((fail + 1)); failed_ids+=("def-cache-hit")
 fi
 
+# The TTL is SCOPED. In a fleet-only view the fingerprint -- every repo's HEAD
+# -- is already a complete key for tracked content, so a flat 60s made it
+# decorative: measured on a 43-repo fleet a cold `cs def` cost 42.1s and the
+# same call six seconds later cost 5.85s, and since any interactive use is more
+# than a minute apart, nearly every call paid the rebuild to reproduce an index
+# the key had already proved current.
+#
+# The check is what happens PAST the old TTL, which is the whole bug. The index
+# is backdated rather than waited on: sleeping 61s in a suite is the reason this
+# went untested.
+ttl_fp=$("$here/cs" def Reserve --fleet --refresh >/dev/null 2>&1; \
+         ls -t "${TMPDIR:-/tmp}"/cs-tags-*.tags 2>/dev/null | head -1)
+if [[ -z "$ttl_fp" || ! -s "$ttl_fp" ]]; then
+  skip "scoped tags TTL" "no cached symbol index was written"
+else
+  # Two hours back: past the old 60s TTL by any margin, and still inside the
+  # 1440-minute sweep so the rebuild path cannot delete it out from under us.
+  touch -t "$(date -v-2H '+%Y%m%d%H%M' 2>/dev/null || date -d '2 hours ago' '+%Y%m%d%H%M')" "$ttl_fp"
+  ttl_out=$("$here/cs" def Reserve --fleet 2>&1)
+  if printf '%s' "$ttl_out" | grep -q 'ReservationController' \
+     && printf '%s' "$ttl_out" | grep -q 'cached' \
+     && printf '%s' "$ttl_out" | grep -q 'same commit as then'; then
+    ok "a fleet-only view trusts the fingerprint past the old 60s TTL"
+    pass=$((pass + 1))
+  else
+    err "a fleet-scoped 'cs def' rebuilt an index its fingerprint had already validated"
+    fail=$((fail + 1)); failed_ids+=("tags-ttl-fleet-scope")
+  fi
+
+  # And the fingerprint is still a KEY, not a blanket: a moved HEAD must
+  # invalidate it however old the file is. Otherwise "trust the fingerprint"
+  # would just be "never rebuild".
+  touch -t "$(date -v-2H '+%Y%m%d%H%M' 2>/dev/null || date -d '2 hours ago' '+%Y%m%d%H%M')" "$ttl_fp"
+  ttl_probe="$FLEET_ROOT/pricing-lib-java/ttl-probe.txt"
+  printf 'ttl probe\n' > "$ttl_probe"
+  (cd "$FLEET_ROOT/pricing-lib-java" && git add -A && git commit -qm 'ttl probe') >/dev/null 2>&1
+  ttl_moved=$("$here/cs" def Reserve --fleet 2>&1)
+  if printf '%s' "$ttl_moved" | grep -q 'rebuilt now'; then
+    ok "a moved HEAD invalidates the index whatever its age"
+    pass=$((pass + 1))
+  else
+    err "a fleet-scoped 'cs def' reused an index from before a commit moved HEAD"
+    fail=$((fail + 1)); failed_ids+=("tags-ttl-fingerprint-key")
+  fi
+  (cd "$FLEET_ROOT/pricing-lib-java" && git reset -q --hard HEAD~1) >/dev/null 2>&1
+
+  # An explicit CS_TAGS_TTL still wins, in both scopes. It is the escape hatch
+  # for a fleet root people edit in place rather than a read-only mirror, so
+  # losing it to the new default would take the answer away from the only case
+  # that still needs it.
+  ttl_env_tags=$("$here/cs" def Reserve --fleet --refresh >/dev/null 2>&1; \
+                 ls -t "${TMPDIR:-/tmp}"/cs-tags-*.tags 2>/dev/null | head -1)
+  touch -t "$(date -v-2H '+%Y%m%d%H%M' 2>/dev/null || date -d '2 hours ago' '+%Y%m%d%H%M')" "$ttl_env_tags"
+  ttl_env=$(CS_TAGS_TTL=60 "$here/cs" def Reserve --fleet 2>&1)
+  if printf '%s' "$ttl_env" | grep -q 'rebuilt now'; then
+    ok "an explicit CS_TAGS_TTL still bounds a fleet-only view"
+    pass=$((pass + 1))
+  else
+    err "CS_TAGS_TTL was ignored once the fleet scope trusted the fingerprint"
+    fail=$((fail + 1)); failed_ids+=("tags-ttl-env-override")
+  fi
+fi
+
 # Agents issue tool calls in parallel. `cs def` cached its symbol index at a
 # path derived from the fleet, so concurrent runs raced on the same file and
 # roughly half returned nothing -- each labelled a normal structural answer.
@@ -1306,6 +1369,80 @@ else
       fail=$((fail + 1)); failed_ids+=("def-ctags-seam-default")
     fi
 
+    # ---- graph freshness reads the field that answers the claim ------------
+    # Every message about a graph says "last synced", and that is `last_sync_at`
+    # -- when the graph was last VERIFIED against the tree. `last_updated` is a
+    # different question: when its CONTENT last changed. A sync that finds
+    # nothing to change advances the first and not the second, so a repo whose
+    # recent commits touch only file types with no extractor reports a stale
+    # `last_updated` indefinitely while being perfectly current.
+    #
+    # Measured on a fleet synced two minutes earlier: last_sync_at 0h2m,
+    # last_updated 87h46m, and `cs engines` printing "oldest 3 day(s) old" -- a
+    # staleness warning prescribing `tokensave sync` to someone who had just run
+    # it. The no-op sync below reproduces that divergence in miniature.
+    #
+    # Asserted by ARITHMETIC, not by matching a rendered string. The divergence
+    # a suite can manufacture is seconds wide, so "does the output look fresh"
+    # would pass on either field and prove nothing -- which is how the first
+    # version of this check passed against a deliberate revert. Instead the age
+    # cs prints is compared against both candidate fields, and the check is
+    # which one it is CLOSER to.
+    fresh_field() {  # <json field> -> its epoch
+      tokensave status "$ts_repo" --json 2>/dev/null | tr ',' '\n' \
+        | sed -n "s/.*\"$1\"[^0-9]*\\([0-9][0-9]*\\).*/\\1/p" | head -1
+    }
+    fresh_u0=$(fresh_field last_updated)
+    # Wide enough that the two fields cannot be confused for one another after
+    # rounding, and short enough to sit in a suite.
+    sleep 5
+    (cd "$ts_repo" && tokensave sync >/dev/null 2>&1) || true
+    fresh_u=$(fresh_field last_updated)
+    fresh_s=$(fresh_field last_sync_at)
+    if [[ -z "$fresh_s" || -z "$fresh_u" ]]; then
+      skip "graph freshness" "this tokensave reports no last_sync_at/last_updated"
+    elif [[ "$fresh_u0" != "$fresh_u" || $(( fresh_s - fresh_u )) -lt 4 ]]; then
+      # tokensave advanced both, so a no-op sync cannot separate the fields on
+      # this build. Nothing to assert: the check would pass on either.
+      skip "graph freshness" "a no-op sync moved last_updated too on this tokensave"
+    else
+      fresh_now=$(date +%s)
+      fresh_exp_sync=$(( fresh_now - fresh_s ))
+      fresh_exp_upd=$(( fresh_now - fresh_u ))
+      # The age out of a real graph-backed answer, in seconds as cs now prints
+      # it below a minute.
+      fresh_ans=$("$here/cs" callers ReserveAsync inventory-api-dotnet 2>&1)
+      fresh_got=$(printf '%s' "$fresh_ans" \
+                  | sed -n 's/.*last synced \([0-9][0-9]*\)s ago.*/\1/p' | head -1)
+      if [[ -z "$fresh_got" ]]; then
+        err "a graph answer did not report a sync age in seconds: $(printf '%s' "$fresh_ans" | grep -i 'last synced' | head -1)"
+        fail=$((fail + 1)); failed_ids+=("graph-freshness-answer")
+      else
+        d_sync=$(( fresh_got - fresh_exp_sync )); [[ $d_sync -lt 0 ]] && d_sync=$(( -d_sync ))
+        d_upd=$(( fresh_got - fresh_exp_upd )); [[ $d_upd -lt 0 ]] && d_upd=$(( -d_upd ))
+        if [[ $d_sync -lt $d_upd ]]; then
+          ok "a graph answer dates itself from last_sync_at, not last_updated (${fresh_got}s vs ${fresh_exp_upd}s)"
+          pass=$((pass + 1))
+        else
+          err "a graph answer reported ${fresh_got}s, which tracks last_updated (${fresh_exp_upd}s) not last_sync_at (${fresh_exp_sync}s)"
+          fail=$((fail + 1)); failed_ids+=("graph-freshness-answer")
+        fi
+      fi
+
+      # The same field feeds the engines table, where it is the fleet-wide
+      # staleness summary a reader checks before trusting any graph answer.
+      fresh_eng=$("$here/cs" engines 2>&1 | grep '^tokensave')
+      fresh_eng_got=$(printf '%s' "$fresh_eng" \
+                      | sed -n 's/.*last synced \([0-9][0-9]*\)s ago.*/\1/p' | head -1)
+      if [[ -n "$fresh_eng_got" && "$fresh_eng_got" -lt "$fresh_exp_upd" ]]; then
+        ok "cs engines ages a just-synced graph from its last verification"
+        pass=$((pass + 1))
+      else
+        err "cs engines aged a just-synced graph as stale: $fresh_eng"
+        fail=$((fail + 1)); failed_ids+=("graph-freshness-field")
+      fi
+    fi
+
     rm -rf "$ts_nodot" "$ts_nograph"
   fi
 fi
@@ -1621,14 +1758,107 @@ PROBE
   rm -rf "$fld_repo/.tokensave"
 fi
 
+# ---- --count on the text verbs ---------------------------------------------
+# The counts-first mode, for a caller that pays per hit. The rule being checked
+# is not "it prints numbers" but the two properties that make the numbers worth
+# reading: they come from the SAME search as the listing, and they carry no hit
+# bodies. A tally computed by a shortcut would be a different question under
+# this one's heading.
+cnt_out=$("$here/cs" text reservationId --fleet --count 2>&1); cnt_rc=$?
+lst_out=$("$here/cs" text reservationId --fleet 2>&1); lst_rc=$?
+cnt_total=$(printf '%s' "$cnt_out" | sed -n 's/^total: \([0-9][0-9]*\) hit(s).*/\1/p')
+lst_total=$(printf '%s' "$lst_out" | sed -n 's/.*· \([0-9][0-9]*\) hit(s).*/\1/p' | head -1)
+if [[ $cnt_rc -eq 0 && $lst_rc -eq 0 && -n "$cnt_total" && "$cnt_total" == "$lst_total" ]]; then
+  ok "cs text --count reports the same total the listing does ($cnt_total hits)"
+  pass=$((pass + 1))
+else
+  err "cs text --count total '$cnt_total' disagrees with the listing's '$lst_total'"
+  fail=$((fail + 1)); failed_ids+=("text-count-agrees")
+fi
+
+# No hit bodies on stdout. This is the whole cost argument: a `path:line: text`
+# line in the result stream means the caller paid for the hits anyway.
+cnt_stdout=$("$here/cs" text reservationId --fleet --count --quiet 2>/dev/null)
+if [[ -n "$cnt_stdout" ]] && ! printf '%s' "$cnt_stdout" | grep -qE '^[^:]+/[^:]+:[0-9]+:'; then
+  ok "cs text --count emits per-repo rows and no hit bodies"
+  pass=$((pass + 1))
+else
+  err "cs text --count put hit lines in the result stream"
+  fail=$((fail + 1)); failed_ids+=("text-count-no-bodies")
+fi
+
+# Every row's repo must be a repo the listing actually hit, and every hit repo
+# must have a row: a tally that drops a repo is the failure mode that matters,
+# because the repo names are what the caller acts on.
+cnt_repos=$(printf '%s' "$cnt_stdout" | sed -n 's/^\([^:]*\):.*/\1/p' | sort -u)
+lst_repos=$("$here/cs" text reservationId --fleet --quiet 2>/dev/null | cut -d/ -f1 | sort -u)
+if [[ -n "$cnt_repos" && "$cnt_repos" == "$lst_repos" ]]; then
+  ok "the tally names exactly the repos the listing hits"
+  pass=$((pass + 1))
+else
+  err "cs text --count named a different repo set than the listing"
+  fail=$((fail + 1)); failed_ids+=("text-count-repo-set")
+fi
+
+# Every narrowing the listing applies must reach the tally, or --count becomes a
+# cheaper answer to a WIDER question wearing this one's heading -- which is the
+# defect cs fields --count was built not to have. The probe plants the token
+# once in code and twice in prose, so the three verbs disagree by construction:
+# cs text counts all three, cs uses counts one, and --source-only removes the
+# .md. A tally taken from the raw search instead of the filtered hits shows up
+# here as cs uses reporting cs text's number.
+cnt_probe_repo="$FLEET_ROOT/fulfillment-worker-python"
+mkdir -p "$cnt_probe_repo/fulfillment"
+printf '# csCountProbe mentioned only in a comment\nvalue = "csCountProbe"\n' \
+  > "$cnt_probe_repo/fulfillment/count_probe.py"
+printf 'csCountProbe appears in this document too.\n' \
+  > "$cnt_probe_repo/count-probe.md"
+cnt_total_of() {  # <subcommand> [extra flag]
+  "$here/cs" "$1" csCountProbe --fleet --count ${2:-} 2>&1 \
+    | sed -n 's/^total: \([0-9][0-9]*\) .*/\1/p'
+}
+p_text=$(cnt_total_of text)
+p_uses=$(cnt_total_of uses)
+p_uses_src=$(cnt_total_of uses --source-only)
+p_uses_lst=$("$here/cs" uses csCountProbe --fleet --quiet 2>/dev/null | grep -c '')
+if [[ "$p_text" == "3" && "$p_uses" == "2" && "$p_uses_src" == "1" ]]; then
+  ok "the prose filter and --source-only narrow a tally as they narrow a listing (text 3, uses 2, uses+source-only 1)"
+  pass=$((pass + 1))
+else
+  err "a tally skipped a narrowing: text=$p_text uses=$p_uses uses+source-only=$p_uses_src (want 3/2/1)"
+  fail=$((fail + 1)); failed_ids+=("count-honours-narrowing")
+fi
+if [[ -n "$p_uses" && "$p_uses" == "$p_uses_lst" ]]; then
+  ok "cs uses --count agrees with the cs uses listing it replaces"
+  pass=$((pass + 1))
+else
+  err "cs uses --count reported $p_uses where its own listing has $p_uses_lst"
+  fail=$((fail + 1)); failed_ids+=("uses-count-agrees")
+fi
+rm -f "$cnt_probe_repo/fulfillment/count_probe.py" "$cnt_probe_repo/count-probe.md"
+
+# --word is the sharpest narrowing of the three, and the one a caller reaches
+# for precisely when the tally looked too big.
+w_cnt=$("$here/cs" uses reservationId --fleet --word --count 2>&1 \
+        | sed -n 's/^total: \([0-9][0-9]*\) .*/\1/p')
+w_lst=$("$here/cs" uses reservationId --fleet --word --quiet 2>/dev/null | grep -c '')
+if [[ -n "$w_cnt" && "$w_cnt" == "$w_lst" ]]; then
+  ok "--word narrows a --count answer exactly as it narrows the listing"
+  pass=$((pass + 1))
+else
+  err "cs uses --word --count reported $w_cnt where the listing has $w_lst"
+  fail=$((fail + 1)); failed_ids+=("uses-count-word")
+fi
+
 # A flag a subcommand cannot honour is refused, not dropped -- the rule --engine
 # already follows here. A silently ignored --count looks exactly like a --count
-# that was honoured and happened to change nothing.
-if "$here/cs" uses reservationId --fleet --count >/dev/null 2>&1; then
+# that was honoured and happened to change nothing. cs def is the check now that
+# the three text verbs answer it.
+if "$here/cs" def ReserveAsync --fleet --count >/dev/null 2>&1; then
   err "--count was silently accepted by a subcommand that cannot honour it"
   fail=$((fail + 1)); failed_ids+=("count-flag-dropped")
 else
-  ok "--count is refused by the subcommands that return hits, not tallies"
+  ok "--count is refused by the subcommands that return neither hits nor tallies"
   pass=$((pass + 1))
 fi
 
@@ -2248,6 +2478,20 @@ if printf '%s' "$seam_out" | grep -q 'producer with no consumer, or dead'; then
 else
   err "a substring match in an unrelated repo suppressed the orphan warning"
   fail=$((fail + 1)); failed_ids+=("seam-orphan-substring")
+fi
+
+# --count suppresses the hit BODIES and nothing else. The orphan warning is
+# computed from the hits rather than from what was printed, and it is the
+# finding this verb exists for -- so a counts-first caller, which is the one
+# least able to go looking, must still be told.
+seam_cnt=$("$here/cs" seam 'AccessionUpdateIn' --count 2>&1)
+if printf '%s' "$seam_cnt" | grep -q '^total: ' \
+   && printf '%s' "$seam_cnt" | grep -q 'producer with no consumer, or dead'; then
+  ok "cs seam --count still reports the orphan finding"
+  pass=$((pass + 1))
+else
+  err "cs seam --count dropped the orphan warning with the hit bodies"
+  fail=$((fail + 1)); failed_ids+=("seam-count-orphan")
 fi
 
 # Naming the repo is what lets a reader discount it, in the same spirit as the

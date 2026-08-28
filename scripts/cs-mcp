@@ -172,6 +172,33 @@ WORD_ARG = arg(
     type_="boolean",
 )
 
+# The counts-first mode, declared on the three verbs that return TEXT HITS.
+#
+# `--count` was `cs fields` only, and for a human at a terminal that was the
+# right call: scrolling past 200 lines is free. Over MCP it is not. Hits land in
+# a context window and are charged by the token, and the caller usually does not
+# know the distribution before asking -- which is the case where the cost is
+# incurred to learn something a tally would have said. One measured exploratory
+# cs_text over a 43-repo fleet returned 642 hits in 12 repos, showed 200, and
+# cost roughly 15,000 tokens for a query whose only purpose was to find out
+# which repo to read. The tally is a few hundred and names the repo.
+#
+# The property that makes it safe is the one cs fields --count already has: the
+# counts are the whole answer rather than a header over a listing, so there is
+# no truncation for them to be lost to. And they come from the same pipeline as
+# the listing, so `word` and `source_only` still narrow them.
+COUNT_TEXT_ARG = arg(
+    "count",
+    "Return the per-repo HIT TALLY with no hit bodies, instead of the hits. "
+    "Ask this FIRST for an exploratory query over the whole fleet: hits are "
+    "charged by the token and a truncated listing costs the full cap to learn "
+    "a distribution this answers in one line per repo. The counts come from the "
+    "same search as the listing, so word and source_only narrow them the same "
+    "way and the totals agree. Then rerun without it, having read where to look.",
+    required=False,
+    type_="boolean",
+)
+
 TOOLS = [
     # --- the questions ------------------------------------------------------
     ("cs_uses", "uses",
@@ -183,7 +210,8 @@ TOOLS = [
      [arg("query", "The string to find: an endpoint path, topic name, config key."),
       SCOPE_ARG,
       WORD_ARG,
-      SOURCE_ONLY_ARG]),
+      SOURCE_ONLY_ARG,
+      COUNT_TEXT_ARG]),
 
     ("cs_seam", "seam",
      "Which repos share this string, comments included — and warns when only "
@@ -191,7 +219,8 @@ TOOLS = [
      [arg("query", "The string that would form the seam."),
       SCOPE_ARG,
       WORD_ARG,
-      SOURCE_ONLY_ARG]),
+      SOURCE_ONLY_ARG,
+      COUNT_TEXT_ARG]),
 
     ("cs_text", "text",
      "Plain text or regex across every repo, comments included. The fallback "
@@ -199,7 +228,8 @@ TOOLS = [
      [arg("pattern", "A literal string or regex."),
       SCOPE_ARG,
       WORD_ARG,
-      SOURCE_ONLY_ARG]),
+      SOURCE_ONLY_ARG,
+      COUNT_TEXT_ARG]),
 
     ("cs_def", "def",
      "Where a symbol is defined, across the fleet or within one repo.",

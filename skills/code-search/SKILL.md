@@ -180,7 +180,13 @@ Five warnings `cs` emits that you must pass on rather than swallow:
   changes nothing and they say nothing about whether this search finished.
   `cs engines` names them. Report them to the owning repo, not in the answer.
 - **`showing N of M`** — capped at 200 results. The per-repo distribution of all
-  M is printed; use it to narrow, or pass `--all`.
+  M is printed; use it to narrow, or pass `--all`. If you did not already know
+  roughly where the hits were, ask the *next* exploratory question with
+  `--count` instead: `cs text|seam|uses <query> --count` returns the per-repo
+  tally and no hit bodies, from the same search, so the totals agree with the
+  listing's and every narrowing (`--word`, `--source-only`, the prose filter)
+  still applies. It is the difference between reading 200 hits to learn a
+  distribution and reading one line per repo.
 - **`degraded:`** — an engine was missing and `cs` fell back to another with a
   different pattern dialect. The results are not equivalent.
 - **`prose filtered except: <extensions>`** — `cs uses` met files in a language
