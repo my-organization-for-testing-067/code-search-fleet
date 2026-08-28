@@ -70,6 +70,8 @@ than a wrong one, because nothing reports it. `brew install coreutils` on macOS.
 | Which version each repo pins, and where they disagree | `cs versions [coordinate]` |
 | Who to ask about this repo or file | `cs owns [repo\|repo/path]` |
 | Who crashes if I add a field to a response | `cs strictness [repo]` |
+| Who even reads an error body, and who retries | `cs resilience [repo]` |
+| Who sets this config key, and who reads it | `cs values <KEY> [repo]` |
 | What the org has that the fleet does not | `cs gaps <query>` |
 | When a seam appeared, or last changed | `cs history <string> [repo]` |
 | What is actually being searched | `cs repos` |
@@ -171,6 +173,28 @@ stderr, so a per-file error becomes `PARTIAL` with the skipped paths named, and
 only a systemic failure refuses. Recursive `grep` skips such a file silently, so
 `cs` finds it separately on that backend: a negative has to mean the same thing
 whichever engine is installed.
+
+**And a dangling symlink is not a read failure either.** A symlink *committed to
+a repo* whose target is not in it is unreadable on every checkout but its
+author's, permanently — it is a property of the corpus, like an excluded
+directory or a repo that was never cloned. Measured on a 43-repo fleet, two of
+them put `PARTIAL` on 100% of answers, on every verb, naming the same two paths
+whether or not the query touched their repo. A warning that fires always is a
+warning nobody reads, and then the day it means an engine *timed out* is the day
+it is skipped. So the deterministic case is separated from the retryable one:
+
+| condition | deterministic? | would a rerun change it? | `PARTIAL`? |
+|---|---|---|---|
+| engine timeout | no | maybe | yes |
+| file unreadable (permissions, I/O) | no | maybe | yes |
+| dangling symlink committed to the repo | **yes** | **no** | **no** |
+
+Each answer carries a one-line count (`skipped: 2 dangling symlink(s) — a corpus
+property, not a read failure`); `cs engines` names them once, under `corpus:`,
+which is where fleet health belongs; and `--porcelain` reports them as
+`corpus_skipped`, separate from `skipped` and not folded into `partial`. The
+disclosure survives — silently narrowing the corpus is the opposite failure —
+and only its severity changes.
 
 ### And the metadata is available as data
 
@@ -337,6 +361,92 @@ tokensave 7.9.0:
   sample of an unknown total. That is reported as `PARTIAL` with the read count
   spelled `≥N`, never as a complete answer.
 
+### Who can even OBSERVE an error contract
+
+`cs strictness` answers *"who rejects an added field"*. There is a second
+question with the same shape, the same declared evidence, and a different class
+of review behind it: **will this consumer even read the response body?**
+
+Two findings it exists for. A producer shipped a partial-failure contract — a
+*"here is what already succeeded"* field, designed for a caller that reads it on
+error — and the consumer discarded the body and auto-retried. The field was
+worthless, and that half was never in the diff. And a producer changed an
+**error** shape, where the impact question is *"who parses error responses"* —
+which the additive/strictness framing does not fire on at all.
+
+The evidence is plentiful and declared. Across a 43-repo fleet: `raise_for_status`
+in 323 files, `tenacity` in 219, `@Retryable` in 10, `Retryer` in 1. Those 323
+raise on a non-2xx **without reading the body**, and none of them looks any
+different from an attentive consumer in a `cs uses` answer.
+
+```
+$ cs resilience --fleet
+fulfillment-worker-python: RETRIES, BODY DISCARDED — 1 raise-and-discard, 1 retry configuration(s)
+kit-service-python:        READS ERROR BODY — 1 site(s) read the error body
+pricing-lib-java:          UNKNOWN — no recognised error handling found
+```
+
+`RETRIES, BODY DISCARDED` is its own verdict rather than a shade of `DISCARDS`,
+because it is the one that turns a producer-side contract into a no-op. And
+`UNKNOWN` is **not** "reads it", for the same reason `UNKNOWN` is not `LENIENT`
+in `cs strictness`: undetermined is not safe. A retry configured at the
+*infrastructure* layer — a mesh, an ingress, a client-side load balancer —
+produces the same observable behaviour with nothing in the repo to find, and is
+named in every answer rather than silently missing.
+
+A wrong answer here is **quieter** than a wrong strictness answer, which is the
+argument for having it: a rejected field crashes the consumer loudly, while a
+discarded field simply never arrives and nobody gets paged.
+
+### The same split for a config key, across a repo boundary
+
+`cs fields` splits a field into writes and reads. A config key has the same two
+sides — except they sit on opposite sides of a **repo boundary**, and
+`cs uses <KEY>` returns them in one undifferentiated list. That shape hides the
+defect, because the interesting failure is not a missing reference. It is a
+**value mismatch across the seam**.
+
+The finding behind it: a cross-repo pair, both halves unusually well verified in
+isolation — the producer proved its chart rendered identically, the consumer
+proved its values parsed identically — with the defect sitting exactly between
+them, because the producer gated on specific tokens and the consumer passed a
+group-level name that was never one of them. Neither side's tests could see it.
+Nothing in either diff could.
+
+The two sides live in **different file kinds**, which is what makes the split
+cheap and a single sweep useless. Measured on a 43-repo fleet: a Spring profile
+selector in 10 manifests and 4 code files, a feature-flag prefix in 1 and 26, a
+log-level key in 15 and 58.
+
+```
+$ cs values ACME_TIER_SELECTOR --fleet
+web-monorepo-node/charts/x/values.yaml:1: [set] "group-name"   ...  <- NOT accepted by any read site
+web-monorepo-node/charts/x/templated.yaml:1: [set] (templated) {{ .Values.tier }}   ...
+inventory-api-dotnet/deploy/values-prod.yaml:2: [set] "alpha,beta"   ...
+checkout-service-kotlin/.../Tier.kt:5: [read] compares against: alpha | beta | gamma   ...
+set sites: 4 in 2 repo(s), 3 distinct literal value(s), 1 templated
+read sites: 1 in 1 repo(s), accepts 3 token(s): alpha | beta | gamma
+! 1 value(s) are SET but not accepted by any read site this could enumerate
+```
+
+The last line is the finding; everything above it is context. Three restraints
+keep it worth trusting:
+
+- **"Accepts" is only sometimes derivable.** A `switch`/`when` over string
+  literals is readable; a value passed to a framework, split on a separator, or
+  normalised first is not. Undeterminable is reported as `UNDETERMINABLE` and
+  the mismatch line does not fire at all — a guessed enumeration would turn this
+  into a generator of false findings about values that are fine.
+- **A templated set-site is named, not resolved.** `{{ .Values.x }}` is reported
+  as templated and never compared. Naming *which* sites are opaque is the useful
+  part: those are the ones a human has to open.
+- **A list value is checked token by token.** `"alpha,beta"` satisfies a reader
+  that accepts both, rather than being flagged because the whole string is not a
+  token.
+
+The sides are told apart by **file kind, not dataflow**, and the answer says so:
+a code file that sets the key at runtime is counted as a read site here.
+
 ### The corpus bounds a negative, not just the search
 
 Everything else here is about whether the *search* was sound — a zero is
@@ -406,6 +516,38 @@ request object *without* a field is exactly where a changed default becomes
 observable — so test code always stays in scope. `.sql`, `.yaml` and `.xml` count
 as source too: they have comment syntax, and a column named in a query is a real
 use.
+
+### Saved queries are consumers, and they fail silently
+
+One class of hit is neither source nor data: a **dashboard panel, alert rule or
+recording rule**. When a workload is renamed or split, the emitted
+`service.name` is a contract with every saved query that names it — and nothing
+in a code diff, a chart diff or a symbol graph can see that seam, because on one
+side it is a deployment identifier and on the other it is a string inside a
+query expression. A workload split once changed a job name, the dashboards and
+alerts kept querying the old one, and nothing broke loudly: the panel went flat
+and the alert never fired again.
+
+So `cs` labels them where they already turn up, rather than adding a verb for a
+corpus of a dozen files:
+
+```
+$ cs uses 'checkout-service' --fleet
+checkout-service-kotlin/alerts/rules.yaml:8: [alert rule] expr: up{job="checkout-service"} == 0
+web-monorepo-node/dashboards/service.json:8: [dashboard] { "expr": "sum(rate(http_requests_total{job=\"checkout-service\"}[5m]))" }
+! 2 of these file(s) are SAVED QUERIES, not code — a dashboard panel, alert or
+  recording rule naming this string will not error when it stops matching: the
+  panel goes flat and the alert never fires again
+```
+
+Classified by **content**, not by path — a dashboard lives wherever someone put
+it — with one grep per candidate file, memoised, and only for the extensions a
+saved query can live in.
+
+And `--source-only` no longer hides them. A Grafana dashboard is a `.json`,
+which the data/doc list drops, while an impact question is exactly the question
+a caller reaches for `--source-only` to ask: the flag is meant to remove
+fixtures and logs, not consumers. It says how many it kept for this reason.
 
 ### And the same graph answers the symbol half of a question
 
@@ -751,6 +893,35 @@ reads like the plugin is not installed rather than like the id is incomplete.
 
 Restart Claude Code afterwards; the CLI says so, and the previously loaded skill
 stays in the session until you do.
+
+**Verify by effect, not by the version string** — and the reason that advice
+exists is worth stating, because it was once not enough. The plugin cache keeps
+every version side by side and `claude plugin update` compares version strings,
+so a tree that ships new work under an unchanged version does not look broken
+from anywhere:
+
+```
+$ claude plugin update code-search@code-search-fleet
+✔ code-search is already at the latest version (1.11.0).
+$ grep -c 'cmd_gaps' <cache>/code-search/1.11.0/scripts/cs
+0
+```
+
+The update command is behaving correctly; the published `1.11.0` and the tree's
+`1.11.0` were different artifacts sharing a version string. A subcommand then
+works from a clone and errors from the plugin, *both reporting the same
+version*, which makes the usual debugging move actively misleading.
+
+So the version is now a CI gate rather than a habit: `scripts/check-version-bump`
+fails when anything under `scripts/` or `skills/` changes without
+`.claude-plugin/plugin.json` moving with it, and fails when the two manifests
+disagree with each other (they had drifted to 1.11.0 and 1.10.0 unnoticed —
+each is read by a different consumer, and neither reads the other). Run it by
+hand the same way CI does:
+
+```sh
+./scripts/check-version-bump          # against origin/main, or the previous commit
+```
 
 ### Running the scripts from a terminal
 

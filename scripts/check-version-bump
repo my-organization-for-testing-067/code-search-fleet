@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+#
+# check-version-bump [<base-ref>]
+#
+# Fail if the SHIPPED files changed without the plugin manifest version
+# changing with them.
+#
+# Why this is a check and not a habit: the plugin cache keeps every version
+# side by side and `claude plugin update` compares version STRINGS, so a tree
+# that ships new work under an unchanged version does not look broken from
+# anywhere. It looks like this:
+#
+#   $ claude plugin update code-search@code-search-fleet
+#   ✔ code-search is already at the latest version (1.11.0).
+#   $ grep -c 'cmd_gaps' <cache>/code-search/1.11.0/scripts/cs
+#   0
+#
+# The update command is behaving correctly -- the manifest says 1.11.0 and the
+# cache holds 1.11.0 -- but the published 1.11.0 and the tree's 1.11.0 are
+# different artifacts sharing a version string. A plugin user cannot reach the
+# new work and gets no indication that anything is missing, and the usual
+# debugging move (compare version strings) actively misleads: the same
+# subcommand works from a clone and errors from the plugin, both reporting the
+# same version.
+#
+# Ten commits and four new verbs went out that way once. The guidance we
+# already carry -- "upgrading the clone does not upgrade the tool you run; run
+# claude plugin update, then verify by EFFECT, not by the version string" --
+# is right and was not enough, because the update was a no-op.
+#
+# Same class as the skill-description-length gate: cheap, and it fires exactly
+# once per real mistake.
+set -uo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$here/.." && pwd)"
+manifest=".claude-plugin/plugin.json"
+market=".claude-plugin/marketplace.json"
+
+# What a plugin user actually receives. The manifests are excluded: changing
+# the version is the whole point, and a manifest-only commit needs no bump.
+SHIPPED_RE='^(scripts/|skills/|\.claude-plugin/marketplace\.json)'
+
+version_in() {  # <json text>
+  sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<< "$1" | head -1
+}
+
+die() { printf 'check-version-bump: %s\n' "$*" >&2; exit 1; }
+
+# The base to compare against. A PR has a merge base; a push to main has its
+# parent. Named explicitly in CI, guessed here so the check is runnable by hand.
+base="${1:-}"
+if [[ -z "$base" ]]; then
+  if git -C "$root" rev-parse --verify -q origin/main >/dev/null; then
+    base=$(git -C "$root" merge-base HEAD origin/main 2>/dev/null || echo "")
+  fi
+  [[ -n "$base" ]] || base=$(git -C "$root" rev-parse -q --verify HEAD^ 2>/dev/null || echo "")
+fi
+[[ -n "$base" ]] || { echo "no base commit to compare against (a root commit?) — nothing to check"; exit 0; }
+
+# 1. The two manifests must agree with each other. They drifted once (plugin
+#    1.11.0, marketplace 1.10.0) and nothing noticed, because each is read by a
+#    different consumer and neither reads the other.
+pv=$(version_in "$(cat "$root/$manifest")")
+mv_=$(version_in "$(sed -n '/"plugins"/,$p' "$root/$market")")
+[[ -n "$pv" ]] || die "no version found in $manifest"
+[[ -n "$mv_" ]] || die "no plugin version found in $market"
+if [[ "$pv" != "$mv_" ]]; then
+  die "the manifests disagree: $manifest says $pv, $market says $mv_
+  both are read, by different consumers, and neither reads the other"
+fi
+
+# 2. If nothing a user receives changed, there is nothing to bump for.
+# Two-dot against the working tree, not three-dot against HEAD: `base` is
+# already the merge base, and comparing the tree means this says the same thing
+# to a developer with uncommitted work as it does to CI on a checked-out PR.
+# ls-files --others as well as diff: `git diff` lists tracked files only, so a
+# commit that ADDS a shipped script -- the most bump-worthy change there is --
+# would otherwise pass while it was still untracked. CI sees it either way
+# because it checks out a commit; this is for the run before that.
+changed=$( { git -C "$root" diff --name-only "$base" 2>/dev/null
+             git -C "$root" ls-files --others --exclude-standard 2>/dev/null
+           } | sort -u | grep -E "$SHIPPED_RE" || true)
+if [[ -z "$changed" ]]; then
+  echo "no shipped file changed since ${base:0:12} — no version bump needed (at $pv)"
+  exit 0
+fi
+
+# 3. And if it did, the version has to have moved with it.
+base_pv=$(version_in "$(git -C "$root" show "$base:$manifest" 2>/dev/null || echo '')")
+if [[ -z "$base_pv" ]]; then
+  echo "no $manifest at ${base:0:12} — treating this as the first release (at $pv)"
+  exit 0
+fi
+if [[ "$base_pv" == "$pv" ]]; then
+  printf 'check-version-bump: shipped files changed but %s still says %s\n' "$manifest" "$pv" >&2
+  printf '%s\n' "$changed" | sed 's/^/    /' >&2
+  cat >&2 <<EOF
+  A plugin user installing from the marketplace cannot reach any of this: the
+  manifest says $pv and their cache holds $pv, so \`claude plugin update\`
+  correctly reports they are up to date. The published $pv and this tree's $pv
+  would be different artifacts sharing a version string, and comparing version
+  strings -- the usual way to debug it -- would say they match.
+
+  Bump "version" in $manifest and $market -- a new verb or flag is a MINOR
+  change, a behaviour change or fix is a PATCH -- and keep the two in step.
+EOF
+  exit 1
+fi
+
+echo "shipped files changed and the version moved: $base_pv -> $pv"
+exit 0

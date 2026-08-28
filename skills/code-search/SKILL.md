@@ -84,6 +84,12 @@ Run `cs which` for this table at any time.
 | What calls this symbol | `cs callers <symbol> <repo>` |
 | What this symbol calls | `cs callees <symbol> <repo>` |
 | What breaks if I change this symbol | `cs impact <symbol> <repo>` |
+| Who reads/writes this FIELD, fleet-wide | `cs fields <field> [repo]` |
+| Where a type is CONSTRUCTED, across every idiom | `cs constructs <Type> [repo]` |
+| Who CRASHES if I add a field to a response | `cs strictness [repo]` |
+| Who even READS an error body, and who retries | `cs resilience [repo]` |
+| Who SETS this config key, and who READS it | `cs values <KEY> [repo]` |
+| What matches ORG-WIDE that the fleet does not hold | `cs gaps <query>` |
 | What references this symbol (bridges DI) | `cs refs <symbol> <repo> <file>` |
 | Which repo publishes this package | `cs provides <coordinate>` |
 | Which repos depend on which | `cs deps [repo]` |
@@ -92,6 +98,16 @@ Run `cs which` for this table at any time.
 | When a seam appeared, or last changed | `cs history <string> [repo]` |
 | What is actually being searched right now | `cs repos` |
 | Which workspaces there are to search at all | `cs scopes` |
+
+**An API-impact review is four of these, not one.** `cs fields` finds who reads
+and writes it; `cs constructs` finds where a changed default is observable;
+`cs strictness` finds who *rejects* an added field; `cs resilience` finds who
+can even *observe* one added to an **error** body — a caller that raises on the
+status and retries never reads the payload, so the contract is a no-op for it
+and nothing errors. For a config key rather than a field, `cs values` is the
+same split across a repo boundary, and it reports which set values no read site
+accepts. Before reporting that nothing is affected, run `cs gaps`: a repo that
+was never cloned cannot be searched by any query.
 
 **Start cheap.** `cs uses`, `cs def`, and `cs seam` answer in well under a
 second. `cs impls` and `cs refs` start language servers and take minutes on a
@@ -155,9 +171,14 @@ Five warnings `cs` emits that you must pass on rather than swallow:
 
 - **`PARTIAL`** — the result is a subset, not an answer. Two causes: an engine
   hit its timeout (raise `CS_TIMEOUT` and rerun), or files could not be read and
-  were skipped. The skipped paths are always named — read them. Two dangling
-  symlinks cannot hide a symbol, so a negative is still worth something; a
-  skipped directory of 400 files is a different matter.
+  were skipped. The skipped paths are always named — read them. Two unreadable
+  files cannot hide a symbol, so a negative is still worth something; a skipped
+  directory of 400 files is a different matter.
+- **`skipped: N dangling symlink(s)`** — *not* `PARTIAL`, and not a warning to
+  pass on as one. These are symlinks committed to a repo whose targets are not
+  in it, so they are unreadable on every checkout, permanently: rerunning
+  changes nothing and they say nothing about whether this search finished.
+  `cs engines` names them. Report them to the owning repo, not in the answer.
 - **`showing N of M`** — capped at 200 results. The per-repo distribution of all
   M is printed; use it to narrow, or pass `--all`.
 - **`degraded:`** — an engine was missing and `cs` fell back to another with a
@@ -165,6 +186,14 @@ Five warnings `cs` emits that you must pass on rather than swallow:
 - **`prose filtered except: <extensions>`** — `cs uses` met files in a language
   its comment filter does not know, and passed them through unfiltered. Hits in
   those files may be comments. Treat them as `cs seam` hits, not `cs uses` hits.
+- **`N of these file(s) are SAVED QUERIES, not code`** — some hits are dashboard
+  panels, alert rules or recording rules, tagged `[dashboard]`, `[alert rule]`,
+  `[recording rule]` or `[saved query]` in the output. They are consumers of the
+  identifier, and they fail *silently*: renaming it does not error anywhere, the
+  panel just goes flat and the alert never fires again. Report them by name in a
+  rename's blast radius. `--source-only` keeps them even though a Grafana
+  dashboard is a `.json`. Much of an observability estate lives in the platform
+  rather than in git, so this is a floor on the exposure, never a ceiling.
 - **`non-default exclusion list`** — `CS_EXCLUDE_EXTRA` or `CS_EXCLUDE_REMOVE`
   is set, so the search was narrowed or widened relative to the default. `EXTRA`
   is the dangerous direction: it can hide the very declaration you are looking
@@ -234,6 +263,15 @@ ripgrep reports a dangling symlink with the same exit 2 it uses for a broken
 regex, and one such file on a real fleet would otherwise block every negative
 result on it. Those come back as a normal answer carrying `PARTIAL` and the
 skipped paths.
+
+A **dangling symlink committed to a repo** is a third thing again, and is not
+`PARTIAL`. It is deterministic: it is unreadable on every checkout that is not
+its author's, so it fails identically on every rerun and cannot distinguish a
+search that finished from one that did not. Two of them once put `PARTIAL` on
+100% of a 43-repo fleet's answers, on every verb, which is how readers learn to
+skip the line that matters. They are counted on each answer, named once by
+`cs engines`, and reported in `--porcelain` under `corpus_skipped` rather than
+`skipped`.
 
 ### `--porcelain` when you want the metadata as data
 

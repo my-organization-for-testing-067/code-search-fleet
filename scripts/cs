@@ -50,6 +50,14 @@
 #   cs strictness [repo]           which repos REJECT unknown fields on
 #                                  deserialization -- the other half of an
 #                                  API-impact review (declared)
+#   cs values <KEY> [repo]         which repos SET a config key and with what
+#                                  literals, and which repos READ it -- the
+#                                  same split cs fields makes, across a repo
+#                                  boundary, where a value MISMATCH hides
+#   cs resilience [repo]           what each repo does on a non-2xx: reads the
+#                                  error body, discards it, or discards it and
+#                                  retries -- who can even OBSERVE an error
+#                                  contract (declared)
 #   cs history <string> [repo]     when a seam entered or left history (git -S)
 #   cs repos                       what is in the current view, and from where
 #   cs scopes                      which workspaces exist to be searched
@@ -381,8 +389,11 @@ cs_emit_porcelain() {
   # PARTIAL covers every way a result can be a subset of the truth: an engine
   # that ran out of time, files it could not read, and an engine that truncated
   # its own output (cs fields -- tokensave cuts stdout at 15000 characters).
+  # reads_failed, not files_skipped: a dangling symlink committed to the repo is
+  # a corpus property and is reported in "corpus_skipped" below, where it does
+  # not devalue every negative the fleet produces.
   local partial=false
-  { timed_out || files_skipped || [[ "${CS_SOURCE_PARTIAL:-0}" -eq 1 ]]; } && partial=true
+  { timed_out || reads_failed || [[ "${CS_SOURCE_PARTIAL:-0}" -eq 1 ]]; } && partial=true
   printf '{'
   printf '"cs":1,'
   printf '"subcommand":%s,' "$(json_str "$CS_SUB")"
@@ -420,7 +431,10 @@ cs_emit_porcelain() {
   else printf '"truncated":false,'; fi
   printf '"returned":%s,' "$(printf '%s' "$CS_RESULTS" | grep -c '[^[:space:]]')"
   printf '"engine_errors":%s,' "$(engine_error_lines | json_lines)"
-  printf '"skipped":%s,'       "$(skipped_paths | json_lines)"
+  # Two fields, because they carry different advice. "skipped" is retryable and
+  # is what sets "partial"; "corpus_skipped" is deterministic and does not.
+  printf '"skipped":%s,'        "$(skipped_unreadable | json_lines)"
+  printf '"corpus_skipped":%s,' "$(skipped_dangling  | json_lines)"
   if [[ -n "$CS_EXCLUSION_NOTE" ]]; then
     printf '"exclusions":%s,' "$(json_str "$CS_EXCLUSION_NOTE")"
   else
@@ -597,8 +611,9 @@ cs_log_write() {  # cs_log_write <exit-code>
   # Codes, not sentences. The sentences carry paths and identifiers and would
   # put back exactly what CS_LOG_QUERY exists to keep out.
   CS_LOG_WARNS=""
-  timed_out     && cs_log_add_warn timeout
-  files_skipped && cs_log_add_warn skipped-files
+  timed_out       && cs_log_add_warn timeout
+  reads_failed    && cs_log_add_warn skipped-files
+  corpus_skipped  && cs_log_add_warn corpus-skips
   engine_failed && cs_log_add_warn engine-error
   [[ -n "$CS_DEGRADED" ]]       && cs_log_add_warn degraded
   [[ -n "$CS_TRUNCATED" ]]      && cs_log_add_warn truncated
@@ -622,7 +637,7 @@ cs_log_write() {  # cs_log_write <exit-code>
   ms_pair=$(cs_log_ms); ms="${ms_pair%% *}"; res="${ms_pair##* }"
 
   local partial=false
-  { timed_out || files_skipped; } && partial=true
+  { timed_out || reads_failed; } && partial=true
 
   local line
   line=$(printf '{"ts":%s,"v":%s,"sub":%s,"query":%s,"layer":%s,"kind":%s,"engine":%s,"outcome":%s,"refusal":%s,"hits":%s,"repos":%s,"ms":%s,"ms_res":%s,"partial":%s,"warnings":[%s]}' \
@@ -1020,6 +1035,53 @@ files_skipped() { [[ -s "$CS_SKIPPED_FLAG" ]]; }
 skipped_paths() { sed -e "s|^\./||" -e "s|^${view}/||" "$CS_SKIPPED_FLAG" 2>/dev/null | sort -u; }
 skipped_count() { skipped_paths | grep -c ''; }
 
+# ---- a corpus property is not a read failure -------------------------------
+# PARTIAL is the line that tells a reader "your negative is weak, do not
+# over-read it". It only works if it is rare. Measured 2026-08-27/28 on a
+# 43-repo fleet, it appeared on 100% of answers, on every verb, naming the same
+# two paths whether or not the query touched their repo -- two symlinks
+# COMMITTED to one repo whose targets are not on any machine but their author's
+# (one pointing at a sibling that was never committed, one into a home
+# directory on another laptop). A warning that fires always is a warning that
+# stops being read, and then the day it means an engine TIMED OUT is the day it
+# is skipped.
+#
+# The two are not the same kind of thing, and the difference is testable:
+#
+#   engine timeout                     not deterministic, might differ on retry
+#   unreadable: permission denied      not deterministic, might differ per user
+#   dangling symlink in the repo       DETERMINISTIC -- rerunning changes nothing
+#
+# The third is a property of the CORPUS, like a directory that is excluded or a
+# repo that was never cloned. It is disclosed -- silently narrowing the corpus
+# is the failure #13 records -- but as a counted fact, not as PARTIAL, and the
+# paths are listed once by `cs engines`, which is what owns fleet health, rather
+# than reprinted on every answer.
+#
+# `-e` follows the link, so `-L && ! -e` is exactly "points at nothing". An
+# intermediate component that is itself a symlink (the view's own repo links)
+# resolves before the test, so this reads the FINAL component only.
+is_dangling_link() { [[ -L "$view/$1" && ! -e "$view/$1" ]]; }
+
+skipped_dangling() {
+  local p
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && is_dangling_link "$p" && printf '%s\n' "$p"
+  done < <(skipped_paths)
+}
+# The retryable half: permission bits, a file deleted mid-scan, an I/O error.
+# These are what PARTIAL now means.
+skipped_unreadable() {
+  local p
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && ! is_dangling_link "$p" && printf '%s\n' "$p"
+  done < <(skipped_paths)
+}
+reads_failed()    { [[ -n "$(skipped_unreadable)" ]]; }
+corpus_skipped()  { [[ -n "$(skipped_dangling)" ]]; }
+dangling_count()  { skipped_dangling | grep -c ''; }
+unreadable_count(){ skipped_unreadable | grep -c ''; }
+
 # A per-file read error, across the three spellings that occur in practice:
 #   rg:    rg: ./path: No such file or directory (os error 2)
 #   grep:  grep: path: Permission denied
@@ -1186,19 +1248,27 @@ grep_fleet() {
 # the query found nothing and grep reported nothing. That is the one case where
 # a silent skip turns into a false "this is dead", and it keeps a whole extra
 # filesystem walk off every query that already has an answer.
-scan_unreadable_for_grep() {
-  [[ "$(text_engine)" == grep ]] || return 0
-  files_skipped && return 0
+# The walk itself, shared with `cs engines`, which lists these once for the
+# fleet rather than leaving each answer to reprint them.
+#
+# -L makes find follow symlinks, so one that still reports as -type l is a
+# symlink whose target does not resolve: exactly the file grep passed over.
+find_dangling_links() {
   local prune=() d first=1
   for d in ${CS_EXCLUDE_DIRS[@]+"${CS_EXCLUDE_DIRS[@]}"}; do
     if [[ $first -eq 1 ]]; then prune+=(-name "$d"); first=0
     else prune+=(-o -name "$d"); fi
   done
-  # -L makes find follow symlinks, so one that still reports as -type l is a
-  # symlink whose target does not resolve: exactly the file grep passed over.
+  find -L "$view"/*/ \( "${prune[@]}" \) -prune -o -type l -print 2>/dev/null
+}
+
+scan_unreadable_for_grep() {
+  [[ "$(text_engine)" == grep ]] || return 0
+  files_skipped && return 0
+  local d
   while IFS= read -r d; do
     [[ -n "$d" ]] && note_skipped "$d"
-  done < <(find -L "$view"/*/ \( "${prune[@]}" \) -prune -o -type l -print 2>/dev/null)
+  done < <(find_dangling_links)
 }
 ctags_bin() {
   # CS_CTAGS_BIN names the binary explicitly, and is authoritative: if it does
@@ -1558,14 +1628,141 @@ is_data_ext() {  # <ext>
   return 1
 }
 
+# ---- observability definitions are consumers too ---------------------------
+# When a workload is renamed or split, the emitted `service.name` (or job name,
+# or metric label) is a contract with every SAVED QUERY: dashboard panels, alert
+# and recording rules, log filters. Nothing in a code diff, a chart diff or a
+# symbol graph can see that seam -- on one side it is a deployment identifier
+# and on the other it is a string inside a query expression.
+#
+# The reported instance: a workload split changed the emitted job name, the
+# dashboards and alerts kept querying the old one, and the tell that it was
+# catchable is that the new name had been REPORTED a week earlier and simply
+# never connected to the queries hard-coding the old one.
+#
+# These fail in the quietest way this tool knows about. A renamed field crashes
+# a consumer; a renamed job name makes a panel go flat and an alert never fire
+# again. No error, no page, nothing to notice.
+#
+# The corpus is thin -- a dozen to fifteen files on a 43-repo fleet, and much of
+# the estate lives in the observability platform rather than in git at all --
+# which is why this is a LABEL on the answers that already return these files,
+# and not a verb of its own. Two things follow from the label, and both are the
+# point:
+#
+#   1. a reader scanning a rename's blast radius sees that a saved query is
+#      implicated, instead of inferring it from a file path;
+#   2. --source-only stops dropping them. An impact question is exactly the
+#      question you ask WITH --source-only, and a Grafana dashboard is a .json,
+#      which the data/doc list drops. That is the trap this closes.
+#
+# Classified by CONTENT, not by path: a dashboard lives wherever someone put it,
+# and `dashboards/` is a convention rather than a rule. One grep per candidate
+# FILE, memoised, and only for the handful of extensions a saved query can live
+# in -- so the cost is bounded by the number of distinct .json/.yaml paths in an
+# answer, not by its hit count.
+CS_OBS_MAP=""
+
+observability_kind_of() {  # <repo-relative path> -> kind on stdout, or 1
+  local p="$1" f="$view/$1" kind=""
+  case "$p" in
+    *.json|*.jsonnet|*.libsonnet)
+      # "panels" is the dashboard marker; schemaVersion pins it to Grafana's
+      # own export shape rather than any JSON that happens to have panels.
+      grep -qE '"(panels|schemaVersion)"[[:space:]]*:' "$f" 2>/dev/null && kind="dashboard" ;;
+    *.yaml|*.yml)
+      if grep -qE '^[[:space:]]*(kind:[[:space:]]*PrometheusRule|alerting:)' "$f" 2>/dev/null; then kind="alert rule"
+      elif grep -qE '^[[:space:]]*-?[[:space:]]*alert:[[:space:]]*[^[:space:]]' "$f" 2>/dev/null; then kind="alert rule"
+      elif grep -qE '^[[:space:]]*-?[[:space:]]*record:[[:space:]]*[^[:space:]]' "$f" 2>/dev/null; then kind="recording rule"
+      elif grep -qE '"(panels|schemaVersion)"[[:space:]]*:|grafana_dashboard' "$f" 2>/dev/null; then kind="dashboard"
+      # Last, and deliberately weakest: `expr:` alone is a saved query of some
+      # kind without saying which. Named as such rather than guessed at.
+      elif grep -qE '^[[:space:]]*expr:[[:space:]]*[^[:space:]]' "$f" 2>/dev/null; then kind="saved query"
+      fi ;;
+    *.tf|*.tfvars|*.hcl)
+      grep -q 'grafana_dashboard\|grafana_rule' "$f" 2>/dev/null && kind="dashboard" ;;
+    *) return 1 ;;
+  esac
+  [[ -n "$kind" ]] || return 1
+  printf '%s' "$kind"
+}
+
+# `<path>\t<kind>` for the observability files among a set of hits, written to a
+# file so awk can read it and so the classification is paid once per answer.
+# Empty file when there are none, which every reader treats as "no labels".
+build_obs_map() {  # <hits>
+  [[ -n "$CS_OBS_MAP" ]] || CS_OBS_MAP=$(cs_tmp cs-obs)
+  : > "$CS_OBS_MAP"
+  local p kind
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    kind=$(observability_kind_of "$p") || continue
+    printf '%s\t%s\n' "$p" "$kind" >> "$CS_OBS_MAP"
+  done < <(printf '%s\n' "$1" | awk '{ p = $0; sub(/:[0-9]+:.*$/, "", p); print p }' \
+           | grep -E '\.(json|jsonnet|libsonnet|ya?ml|tf|tfvars|hcl)$' | sort -u)
+}
+
+# The tag itself, in the shape cs constructs already uses: `path:line: [kind] …`.
+# Applied to what is EMITTED and not to `$hits`, so the whole-identifier and
+# composition analyses keep reading the text the engine actually matched.
+annotate_observability() {  # <hits> -> hits, tagged
+  [[ -n "$CS_OBS_MAP" && -s "$CS_OBS_MAP" ]] || { printf '%s' "$1"; return 0; }
+  printf '%s\n' "$1" | awk -F'\t' -v map="$CS_OBS_MAP" '
+    BEGIN {
+      while ((getline line < map) > 0) {
+        i = index(line, "\t")
+        if (i) kind[substr(line, 1, i - 1)] = substr(line, i + 1)
+      }
+      close(map)
+    }
+    {
+      p = $0; sub(/:[0-9]+:.*$/, "", p)
+      # `path:line: [kind] text`, the shape cs constructs already prints, with
+      # the leading indentation collapsed the same way it collapses it.
+      if ((p in kind) && match($0, /:[0-9]+:/)) {
+        head = substr($0, 1, RSTART + RLENGTH - 1)
+        rest = substr($0, RSTART + RLENGTH)
+        sub(/^[ \t]+/, "", rest)
+        $0 = head " [" kind[p] "] " rest
+      }
+      print
+    }' | grep -v '^$'
+}
+
+# Said once, under the hits, because the CONSEQUENCE is what a reader needs and
+# it does not fit in a tag.
+disclose_observability() {
+  [[ -n "$CS_OBS_MAP" && -s "$CS_OBS_MAP" ]] || return 0
+  local n; n=$(grep -c '' "$CS_OBS_MAP")
+  warn "$n of these file(s) are SAVED QUERIES, not code — a dashboard panel, alert or recording rule naming this string will not error when it stops matching: the panel goes flat and the alert never fires again"
+  cut -f1,2 "$CS_OBS_MAP" | sed 's/\t/   /' | head -10 | sed 's/^/  /' >&2
+  [[ "$n" -gt 10 ]] && info "  … and $((n - 10)) more"
+  info "  much of an observability estate lives in the platform rather than in git, where no query here can reach it — this is the part that is committed"
+}
+
 # Drop the data hits, for --source-only. Kept separate from the disclosure so
 # that the DEFAULT answer never silently loses a hit: this runs only when asked.
+#
+# Observability definitions are the one EXCEPTION, and it is not a special case
+# so much as the rule applied properly: a Grafana dashboard is a .json, so the
+# data/doc list drops it -- and an impact question ("who breaks if I rename
+# this") is precisely the question a caller reaches for --source-only to ask.
+# Silently discarding a whole class of consumer from the answer to that question
+# is the trap; the flag is meant to remove fixtures and logs, not consumers.
 source_only_hits() {  # hits on stdin
-  awk -v exts="$CS_DATA_EXTS" '
-    BEGIN { n = split(exts, a, " "); for (i = 1; i <= n; i++) drop[a[i]] = 1 }
+  awk -v exts="$CS_DATA_EXTS" -v map="${CS_OBS_MAP:-/dev/null}" '
+    BEGIN {
+      n = split(exts, a, " "); for (i = 1; i <= n; i++) drop[a[i]] = 1
+      while ((getline line < map) > 0) {
+        i2 = index(line, "\t")
+        if (i2) keep[substr(line, 1, i2 - 1)] = 1
+      }
+      close(map)
+    }
     {
       p = $0
       sub(/:[0-9]+:.*$/, "", p)
+      if (p in keep) { print; next }
       m = split(p, seg, "/")
       base = seg[m]
       ext = (match(base, /\.[^.\/]+$/)) ? tolower(substr(base, RSTART)) : "(none)"
@@ -1584,6 +1781,19 @@ apply_source_only() {  # <hits> -> hits, filtered when --source-only is on
   kept=$(printf '%s\n' "$1" | source_only_hits)
   n_after=$(printf '%s\n' "$kept" | grep -c '[^[:space:]]')
   warn "--source-only dropped $((n_before - n_after)) of $n_before hit(s) in data/doc files ($CS_DATA_EXTS) — a route in a .json config is a real seam and is gone from this answer too"
+  # Only the ones the extension list WOULD have dropped: an alert rule in a
+  # .yaml was never at risk, and counting it here would overstate the rescue.
+  local n_rescued=0
+  if [[ -n "$CS_OBS_MAP" && -s "$CS_OBS_MAP" ]]; then
+    n_rescued=$(cut -f1 "$CS_OBS_MAP" | awk -v exts="$CS_DATA_EXTS" '
+      BEGIN { n = split(exts, a, " "); for (i = 1; i <= n; i++) drop[a[i]] = 1 }
+      { m = split($0, seg, "/"); base = seg[m]
+        ext = (match(base, /\.[^.\/]+$/)) ? tolower(substr(base, RSTART)) : "(none)"
+        if (ext in drop) c++ }
+      END { print c + 0 }')
+  fi
+  [[ "$n_rescued" -gt 0 ]] && \
+    warn "  KEPT $n_rescued observability definition(s) the extension list would have dropped — a dashboard is a .json, and an impact question is exactly the question this flag is used to ask"
   printf '%s' "$kept"
 }
 
@@ -1607,7 +1817,9 @@ EOF
   [[ "$n_data" -gt 0 ]] || return 0
   data_list="${data_list%,}"
   local total=$((n_src + n_data)) msg
-  msg="composition: $n_src in source, $n_data in data/doc files ($(printf '%s' "${data_list# }" | sed 's/ \([0-9]\)/ \1/g')) — --source-only excludes the data half"
+  local excl="--source-only excludes the data half"
+  [[ -n "$CS_OBS_MAP" && -s "$CS_OBS_MAP" ]] && excl="$excl, except the observability definitions listed below"
+  msg="composition: $n_src in source, $n_data in data/doc files ($(printf '%s' "${data_list# }" | sed 's/ \([0-9]\)/ \1/g')) — $excl"
   # A warning when the data half DOMINATES, because that is the case where the
   # hit count misrepresents the answer; otherwise a plain note.
   if [[ $((n_data * 2)) -ge "$total" ]]; then
@@ -1866,11 +2078,17 @@ report_answer() {
   # Named, not merely counted. Two broken symlinks cannot hide a symbol; a
   # skipped directory of 400 files might, and only the paths let a reader tell
   # those apart. Capped so a fleet with thousands of them stays readable.
-  if files_skipped; then
-    local n; n=$(skipped_count)
+  if reads_failed; then
+    local n; n=$(unreadable_count)
     warn "$n file(s) could not be read and were skipped; this result is PARTIAL:"
-    skipped_paths | head -10 | sed 's/^/  /' >&2
+    skipped_unreadable | head -10 | sed 's/^/  /' >&2
     [[ "$n" -gt 10 ]] && info "  … and $((n - 10)) more"
+  fi
+  # A COUNT, not the paths: these are the same paths on every answer for as long
+  # as they are committed, and reprinting them was most of the noise that taught
+  # readers to skip this whole block. `cs engines` names them, once.
+  if corpus_skipped; then
+    info "skipped: $(dangling_count) dangling symlink(s) — a corpus property, not a read failure, so NOT partial (cs engines names them)"
   fi
   [[ $quiet -eq 1 || -z "$CS_KIND" ]] && return 0
   local line="${C_BOLD}answer:${C_OFF} $CS_KIND via $CS_ENGINE"
@@ -1905,6 +2123,57 @@ report_answer() {
     blind_spots "$CS_KIND" >&2
   else
     info "  ${C_BOLD}--why${C_OFF} for what a $CS_KIND answer cannot see"
+  fi
+}
+
+# Two labelled halves of one answer, capped SEPARATELY. cs fields established
+# why: its reads outnumbered its writes ~7:1, and a single budget over the
+# combined stream spent itself on reads and truncated the writes away -- the
+# half that answers "who observes a changed default". Each kind gets an equal
+# share, and a kind that does not use its share donates the remainder, so a
+# query with only one side still shows the full budget.
+#
+# cs fields keeps its own copy of this inline because its two halves come from
+# the graph already separated and it reports per-kind totals the graph gave it.
+# This is the same rule for a text-derived split.
+emit_two_kinds() {  # <regex-a> <regex-b> <hits>
+  local ra="$1" rb="$2" all="$3"
+  local a b n_a n_b cap half bud_a bud_b capped=""
+  a=$(printf '%s\n' "$all" | grep -E "$ra" || true)
+  b=$(printf '%s\n' "$all" | grep -E "$rb" || true)
+  n_a=$(printf '%s' "$a" | grep -c '[^[:space:]]' || true)
+  n_b=$(printf '%s' "$b" | grep -c '[^[:space:]]' || true)
+
+  cap="${CS_MAX_RESULTS:-200}"
+  if [[ "$cap" -le 0 ]]; then
+    bud_a=$n_a; bud_b=$n_b
+  else
+    half=$(( cap / 2 ))
+    bud_a=$half; bud_b=$(( cap - half ))
+    if [[ "$n_a" -lt "$bud_a" ]]; then bud_b=$(( cap - n_a )); bud_a=$n_a; fi
+    if [[ "$n_b" -lt "$bud_b" ]]; then bud_a=$(( cap - n_b )); bud_b=$n_b; fi
+  fi
+  # awk rather than head, for the reason emit_capped uses it: head closes the
+  # pipe at the cap and the builtin printf then reports EPIPE on stderr.
+  [[ "$n_a" -gt 0 ]] && capped=$(printf '%s\n' "$a" | awk -v n="$bud_a" 'NR<=n')
+  if [[ "$n_b" -gt 0 ]]; then
+    local part; part=$(printf '%s\n' "$b" | awk -v n="$bud_b" 'NR<=n')
+    capped="${capped:+$capped
+}$part"
+  fi
+  # Everything the two regexes did not claim, so a hit is never silently lost
+  # by falling between the labels.
+  local rest; rest=$(printf '%s\n' "$all" | grep -vE "$ra" | grep -vE "$rb" || true)
+  if [[ -n "$rest" ]]; then
+    capped="${capped:+$capped
+}$rest"
+  fi
+  emit_plain "$capped"
+  local shown; shown=$(printf '%s' "$capped" | grep -c '[^[:space:]]' || true)
+  local total; total=$(printf '%s' "$all" | grep -c '[^[:space:]]' || true)
+  if [[ "$shown" -lt "$total" ]]; then
+    CS_TRUNCATED="$total"
+    info "showing $shown of $total — the cap is applied per half, so neither side is truncated away by the other (--all, or CS_MAX_RESULTS)"
   fi
 }
 
@@ -2087,6 +2356,25 @@ cmd_engines() {
   # directory excluded by mistake looks exactly like a directory with no hits.
   printf 'skipping:    %s\n' "$(printf '%s ' ${CS_EXCLUDE_DIRS[@]+"${CS_EXCLUDE_DIRS[@]}"})"
   printf '             (CS_EXCLUDE_EXTRA adds, CS_EXCLUDE_REMOVE subtracts)\n'
+  # The other place results cannot come from, and the one that is a property of
+  # the corpus rather than of this machine: a symlink COMMITTED to a repo whose
+  # target is not in that repo is unreadable on every checkout but its author's,
+  # permanently. It is named here, once, so that per-answer output can carry a
+  # count instead of the paths -- see the note on is_dangling_link. This is the
+  # only place in cs that walks the fleet purely to report on it, which is why
+  # it lives in the diagnostic subcommand and not on the query path.
+  local dangling n_dangling
+  dangling=$(find_dangling_links | sed -e "s|^${view}/||" | sort -u)
+  n_dangling=$(printf '%s' "$dangling" | grep -c '[^[:space:]]')
+  if [[ "$n_dangling" -gt 0 ]]; then
+    printf 'corpus:      %s dangling symlink(s) — tracked in a repo, target absent on this machine, unreadable on every checkout\n' "$n_dangling"
+    printf '%s\n' "$dangling" | head -20 | sed 's/^/             /'
+    [[ "$n_dangling" -gt 20 ]] && printf '             … and %s more\n' "$((n_dangling - 20))"
+    printf '             these are NOT reported as PARTIAL: rerunning cannot change them, so they say nothing about whether a search finished\n'
+    printf '             remove them in the owning repo, or accept them — a query answer carries the count, not the paths\n'
+  else
+    printf 'corpus:      no dangling symlinks — every tracked file in the view is readable\n'
+  fi
   # Reported in both directions. A log nobody knows is running is the privacy
   # problem the opt-in default exists to avoid, and a log somebody believes is
   # running when it is not is how a measurement window turns out empty.
@@ -2117,6 +2405,9 @@ cmd_text() {
   [[ $# -ge 1 ]] || die "cs text <pattern>"
   answer textual "$(text_engine)" "regex"
   local out; out=$(grep_fleet regex "$1" | normalize)
+  # Before --source-only, deliberately: the map is what keeps a dashboard .json
+  # from being dropped by it.
+  build_obs_map "$out"
   out=$(apply_source_only "$out")
   if [[ -z "$out" ]]; then
     engines_ok_or_die text
@@ -2125,8 +2416,9 @@ cmd_text() {
          "cs calls '<pattern>'   (it may only appear as a call shape)"
     return $CS_EXIT_NO_HITS
   fi
-  emit_capped "$out"
+  emit_capped "$(annotate_observability "$out")"
   disclose_composition "$out"
+  disclose_observability
   report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
 }
 
@@ -2138,6 +2430,7 @@ cmd_seam() {
   answer textual "$(text_engine)" "literal, grouped by repo"
   local hits repos n
   hits=$(grep_fleet literal "$1" | normalize)
+  build_obs_map "$hits"
   hits=$(apply_source_only "$hits")
   if [[ -z "$hits" ]]; then
     info "no repo mentions '$1'"
@@ -2147,8 +2440,9 @@ cmd_seam() {
   fi
   repos=$(printf '%s\n' "$hits" | cut -d/ -f1 | sort -u)
   n=$(printf '%s\n' "$repos" | grep -c '')
-  emit_capped "$hits"
+  emit_capped "$(annotate_observability "$hits")"
   disclose_composition "$hits"
+  disclose_observability
   info ""
   info "${C_BOLD}$n repo(s):${C_OFF} $(printf '%s ' $repos)"
 
@@ -2216,6 +2510,8 @@ Which repos depend on which?                     cs deps [repo]
 Which version does each repo pin?                cs versions [coordinate]
 Who owns this repo, or this file?                cs owns [repo|repo/path]
 Who CRASHES if I add a field to a response?      cs strictness [repo]
+Who SETS this config key, and who READS it?      cs values <KEY> [repo]
+Who even READS an error body, and who retries?   cs resilience [repo]
 What does the fleet NOT hold that the org does?  cs gaps <query>
 When did this seam appear, or last change?       cs history <string> [repo]
 What am I actually searching right now?           cs repos
@@ -2243,6 +2539,14 @@ Symbol mode answers from a per-repo graph, so it sees ONE repo at ONE layer and
 there is no union of your ticket workspace and the fleet. Every such answer says
 which index answered and how old it is; read that line. The cross-repo half of
 the same question is cs uses, which searches the layered view.
+
+cs values is the same read/write split as cs fields, applied to a config key
+instead of a field -- and it crosses a REPO BOUNDARY, which is where the
+mismatch hides. The two sides live in different file kinds (manifests set,
+code reads), so one text sweep mixes deployment data with branching code and
+the counts alone cannot tell you whether the values line up. It reports the
+literals each side supplies and, only when the read side is genuinely
+enumerable, which set values no read site accepts.
 
 cs fields is the field-level half of the impact question, and it is the one
 graph verb that is FLEET-wide rather than per-repo: "who is affected if I change
@@ -2295,6 +2599,7 @@ cmd_uses() {
   filter_rc=$?
   # After the comment filter, not before: --source-only is about the FILE kind,
   # and stacking it on the prose filter keeps each stage's claim its own.
+  build_obs_map "$hits"
   hits=$(apply_source_only "$hits")
   unsupported=$(cut -f1 "$unsup_file" | sort -u | tr '\n' ' ' | sed 's/ $//')
   rm -f "$unsup_file"
@@ -2343,13 +2648,14 @@ cmd_uses() {
   elif [[ "$n_uses_word" -lt "$n_uses_all" ]]; then
     warn "$((n_uses_all - n_uses_word)) of $n_uses_all hit(s) matched INSIDE a longer identifier — not a use of this name (use --word to exclude them)"
   fi
-  emit_capped "$hits"
+  emit_capped "$(annotate_observability "$hits")"
   # The composition, next to the count. "In CODE" in this subcommand's own
   # description reads as a guarantee about file KIND; what it actually promises
   # is "with comments stripped where we know how", which is a different thing.
   # This line is what closes that gap in the answer itself rather than in a
   # separate command the caller has to already suspect they need.
   disclose_composition "$hits"
+  disclose_observability
   repos=$(printf '%s\n' "$hits" | cut -d/ -f1 | sort -u)
   info ""
   info "${C_BOLD}$(printf '%s\n' "$repos" | grep -c '') repo(s) use it:${C_OFF} $(printf '%s ' $repos)"
@@ -3418,6 +3724,12 @@ factory?|%s.$M($$$ARGS)'
 
 # Named in every answer. These are constructions no pattern here can find, and
 # a caller who does not know that will read the result as the complete set.
+# Matches the engine returned for a shape whose pattern no longer carried the
+# type name -- see ast_grep_matches.py. Tallied to a FILE because the search
+# runs inside `$(...)`: a counter incremented there dies with the subshell, the
+# same trap the comment on construct_shape_names records.
+CS_CONSTRUCT_DROPPED=""
+
 construct_blind_spots() {
   warn "shapes NOT searched, and a construction in any of them is missing from this answer:"
   warn "  cls(…) / self.__class__(…) inside the type's own module — a factory's own body"
@@ -3439,9 +3751,22 @@ constructs_via_ast_grep() {  # <type> [only-repo]
     # `new T($$$ARGS)new T($$$ARGS)`, which matches nothing anywhere.
     # shellcheck disable=SC2059
     local rendered; rendered=$(printf "$pat" "$type")
-    local raw rc err_f
+    local raw rc err_f rc_f
     err_f=$(cs_tmp cs-engerr)
-    raw=$( (cd "$view" && run_timed ast-grep --follow -p "$rendered") 2>"$err_f" ); rc=$?
+    rc_f=$(cs_tmp cs-engrc)
+    # --json=stream, not the plain output, because the type-name guard inside
+    # ast_grep_matches.py has to be applied per MATCH: a multi-line
+    # construction carries the type name on its first line only, and a
+    # line-wise test would discard the body of every real hit. The helper
+    # re-emits `path:line:source-line`, so everything downstream is unchanged.
+    #
+    # ast-grep's own status is written to a file rather than read from
+    # PIPESTATUS: this is an ASSIGNMENT whose right-hand side is a command
+    # substitution, so PIPESTATUS afterwards describes the assignment, not the
+    # pipeline inside it, and an engine failure would read as python's success.
+    raw=$( (cd "$view" && run_timed ast-grep --follow -p "$rendered" --json=stream; printf '%s' "$?" >"$rc_f") 2>"$err_f" \
+           | python3 "$lib_dir/ast_grep_matches.py" "$view" "$type" "$CS_CONSTRUCT_DROPPED" )
+    rc=$(cat "$rc_f" 2>/dev/null); rm -f "$rc_f"; [[ -n "$rc" ]] || rc=2
     note_search_result "$rc" "$err_f" ast-grep "matching the $shape shape for '$type'"
     rm -f "$err_f"
     searched="$searched $shape"
@@ -3476,6 +3801,17 @@ construct_shape_names() {
   printf '%s\n' "$CS_CONSTRUCT_SHAPES" | cut -d'|' -f1 | tr '\n' ' ' | sed 's/ $//'
 }
 
+# Said only when it fires, and never as PARTIAL: nothing was lost here. A drop
+# means the ENGINE returned a match the pattern's own type argument had been
+# parsed out of, and reporting the count keeps the guard from being a silent
+# narrowing of the corpus -- the failure #13 records, arriving from the other
+# side.
+construct_overmatch_note() {  # <n-dropped> <type>
+  [[ "${1:-0}" -gt 0 ]] || return 0
+  info "${C_BOLD}$1 engine match(es) dropped${C_OFF} — they did not contain '$2', so the shape's own type argument had not been applied to them"
+  info "  a pattern is re-parsed per language, and one that a grammar cannot express degenerates rather than erroring (markdown prose is the usual source)"
+}
+
 cmd_constructs() {
   [[ $# -ge 1 ]] || die "cs constructs <Type> [repo]
   every construction site of a type, across the shapes it can be built by"
@@ -3491,8 +3827,16 @@ cmd_constructs() {
   esac
   [[ -n "$only" && ! -d "$view/$only" ]] && die "no such repo: $only"
 
+  require_python3 constructs "holding each shape's pattern to its own type argument"
+
   answer structural "ast-grep" "construction shapes, unioned"
+  CS_CONSTRUCT_DROPPED=$(cs_tmp cs-constr-dropped)
   out=$(constructs_via_ast_grep "$type" "$only")
+  local n_dropped=0
+  if [[ -s "$CS_CONSTRUCT_DROPPED" ]]; then
+    n_dropped=$(awk '{ n += $1 } END { print n + 0 }' "$CS_CONSTRUCT_DROPPED")
+  fi
+  rm -f "$CS_CONSTRUCT_DROPPED"
 
   if [[ -z "$out" ]]; then
     engines_ok_or_die constructs
@@ -3501,6 +3845,7 @@ cmd_constructs() {
     # exactly where "no construction sites" would be read as "nothing builds
     # this", and the unsearched shapes are the reason that reading is unsafe.
     construct_blind_spots
+    construct_overmatch_note "$n_dropped" "$type"
     hint "cs uses '$type'         (a construction in an unsearched shape is still a mention)" \
          "cs def $type            (confirm the type exists and is spelled this way)"
     return $CS_EXIT_NO_HITS
@@ -3525,6 +3870,7 @@ cmd_constructs() {
   emit_capped "$out"
   info ""
   info "${C_BOLD}shapes searched:${C_OFF} $(construct_shape_names)"
+  construct_overmatch_note "$n_dropped" "$type"
   if [[ -n "$construct_field" ]]; then
     local n_absent
     n_absent=$(printf '%s\n' "$out" | grep -c 'ABSENT' || true)
@@ -3590,6 +3936,63 @@ cmd_strictness() {
     warn "a repo-level verdict is a ROLL-UP, not a per-consumer answer — for a MIXED repo the model list is what decides the review: cs strictness <repo>"
   fi
   warn "declared, not resolved: this reports what the config and model metadata SAY. A parser configured at runtime, a custom deserializer, or a framework default overridden in code is invisible here."
+  report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
+}
+
+# ---- cs resilience ---------------------------------------------------------
+# cs strictness answers "will this consumer REJECT an added field". There is a
+# second question with the same shape, the same declared-tier evidence, and a
+# different class of review behind it: WILL THIS CONSUMER EVEN READ THE BODY?
+#
+# Two findings it exists for. A producer shipped a partial-failure contract --
+# a "here is what already succeeded" field designed for a caller that reads it
+# on error -- and the consumer discarded the body and auto-retried; the field
+# was worthless and that half was never in the diff. And a producer changed an
+# ERROR shape, where the impact question is "who parses error responses", which
+# the additive/strictness framing does not fire on at all.
+#
+# The evidence is plentiful and declared. Across a 43-repo fleet:
+# raise_for_status 323 files, tenacity 219, @Retryable 10, Retryer 1. Those 323
+# raise on a non-2xx WITHOUT reading the body, and none of them looks any
+# different from an attentive consumer in a cs uses answer.
+#
+# A wrong answer here is QUIETER than a wrong strictness answer, which is the
+# argument for having it: a rejected field crashes the consumer loudly, while a
+# discarded field simply never arrives and nobody gets paged.
+cmd_resilience() {
+  require_python3 resilience "reading error handling and retry configuration"
+  local mode="audit" arg="${1:-}"
+  [[ -n "$arg" ]] && mode="repo"
+  [[ -n "$arg" && ! -d "$view/$arg" ]] && die "no such repo: $arg"
+  answer declared "error handlers + retry configuration" "$mode"
+
+  # Captured separately rather than with 2>&1, for the reason cs strictness
+  # does it: resilience.py writes the UNKNOWN roll-up and the infrastructure
+  # caveat to stderr on purpose, and merging the streams would put them on
+  # stdout as though they were verdicts.
+  local out rc err_file
+  err_file=$(cs_tmp cs-resil)
+  out=$(python3 "$lib_dir/resilience.py" "$view" "$mode" ${arg:+"$arg"} 2>"$err_file"); rc=$?
+  [[ "$rc" -eq 2 ]] && { cat "$err_file" >&2; rm -f "$err_file"; die "cs resilience: the scan did not run, so no repo's posture was determined
+  nothing here is a verdict -- an absent answer is not an attentive one"; }
+  if [[ -s "$err_file" ]]; then cat "$err_file" >&2; fi
+  rm -f "$err_file"
+
+  if [[ -z "$out" ]]; then
+    report_answer 0 0
+    hint "cs resilience           (the fleet-wide audit, if you asked about one repo)" \
+         "cs uses 'raise_for_status'       (the raw markers, unnormalised)" \
+         "cs strictness           (the other half: who REJECTS an added field)"
+    return $CS_EXIT_NO_HITS
+  fi
+  emit_capped "$out"
+
+  warn "UNKNOWN is NOT 'reads the error body'. It means no recognised error handling was found, and a consumer that never reads one looks exactly like a consumer this could not classify."
+  warn "RETRIES, BODY DISCARDED is the verdict that turns a producer-side contract into a no-op: a partial-failure field added to an error body never reaches a caller that raises and retries."
+  if [[ "$mode" == "audit" ]]; then
+    warn "a repo-level verdict is a ROLL-UP, not a per-client answer — for a MIXED repo the site list is what decides the review: cs resilience <repo>"
+  fi
+  warn "declared, not resolved: this reports what the handlers and configuration SAY. Which client a given call actually goes through, and whether the caught exception is re-read further up, are not visible here."
   report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
 }
 
@@ -3662,11 +4065,108 @@ cmd_gaps() {
   warn "application code and config only are DIFFERENT findings: a deployment manifest or README naming a service is not a caller, and cloning on a raw match would grow the fleet with the wrong half"
   warn "textual, not structural: this says a repo mentions the string, not that it calls, implements or deserializes anything"
   if [[ $suggest_clone -eq 1 ]]; then
+    # Split on the classification forge_gaps.py already made, rather than
+    # suggesting every row: the block above warns that a manifest naming a
+    # service is not a caller, and a paste-ready list that includes the
+    # CHANGELOGs contradicts that warning in the same answer.
+    local code_rows cfg_rows
+    code_rows=$(printf '%s\n' "$out" | grep -F '[application code' || true)
+    cfg_rows=$(printf '%s\n' "$out" | grep -vF '[application code' || true)
+    [[ $suggest_clone_all -eq 1 ]] && { code_rows="$out"; cfg_rows=""; }
+
     info ""
-    info "${C_BOLD}to close the gap — registration is just a clone:${C_OFF}"
-    printf '%s\n' "$out" | sed -n 's/^\([^:]*\):.*/  git -C "$FLEET_ROOT" clone <forge-url>\/\1/p' >&2
+    if [[ -n "$code_rows" ]]; then
+      info "${C_BOLD}to close the gap — registration is just a clone:${C_OFF}"
+      printf '%s\n' "$code_rows" | sed -n 's/^\([^:]*\):.*/  git -C "$FLEET_ROOT" clone <forge-url>\/\1/p' >&2
+    else
+      info "${C_BOLD}no clone suggested:${C_OFF} every repo above matched only in config or docs"
+      info "  that is still a bound on the negative — it is just not a caller to clone"
+    fi
+    if [[ -n "$cfg_rows" ]]; then
+      info ""
+      info "${C_BOLD}also matched, probably not worth cloning${C_OFF} — config or docs only, no application code:"
+      printf '%s\n' "$cfg_rows" | sed -n 's/^\([^:]*\):.*/  \1/p' >&2
+      info "  --suggest-clone=all emits clone commands for these too"
+    fi
   fi
   report_answer "$(n_hits_in "$out")" "$(n_hits_in "$out")"
+}
+
+# ---- cs values -------------------------------------------------------------
+# `cs fields` split a field into writes and reads, and that split was the whole
+# value. A config key has the same two sides -- except they sit on opposite
+# sides of a REPO BOUNDARY, and `cs uses <KEY>` returns them in one
+# undifferentiated list.
+#
+# That shape hides the defect, because the interesting failure is not a missing
+# reference. It is a VALUE MISMATCH across the seam: a cross-repo pair, both
+# halves unusually well verified in isolation -- the producer proved its chart
+# rendered identically, the consumer proved its values parsed identically --
+# with the defect sitting exactly between them, because the producer gated on
+# specific tokens and the consumer passed a group-level name that was never one
+# of them. Neither side's tests could see it. Nothing in either diff could.
+#
+# The two sides live in DIFFERENT FILE KINDS, which is what makes the split
+# cheap and what makes a single text sweep useless: measured on a 43-repo
+# fleet, a Spring profile selector was in 10 manifests and 4 code files, a
+# feature-flag prefix in 1 and 26, a log-level key in 15 and 58. The counts
+# alone say nothing about whether the two agree.
+cmd_values() {
+  [[ $# -ge 1 ]] || die "cs values <KEY> [repo]
+  which repos SET a config key, with what literals, and which repos READ it"
+  require_python3 values "splitting set-sites from read-sites and reading the literals"
+  local key="$1" only="${2:-}" hits out err_f rc
+  [[ -n "$only" && ! -d "$view/$only" ]] && die "no such repo: $only"
+  case "${force_engine:-}" in
+    ""|rg|ripgrep|grep|posix) ;;
+    *) die "cs values has no engine named '$force_engine'
+  it is a text sweep classified afterwards, and answers from: $(text_engine)" ;;
+  esac
+
+  # `textual`, and the note says why it is not stronger. The set side is
+  # manifest data and would pass for `declared`; the read side is a text match
+  # over branching code and is not. Labelling the ANSWER by its weaker half is
+  # the same rule cs applies everywhere else -- a mixed answer is worth what its
+  # weakest evidence is worth.
+  answer textual "$(text_engine)" "set/read split by file kind"
+  hits=$(grep_fleet literal "$key" | normalize)
+  [[ -n "$only" ]] && hits=$(printf '%s\n' "$hits" | grep "^$only/" || true)
+
+  if [[ -z "$hits" ]]; then
+    engines_ok_or_die values
+    report_answer 0 0
+    hint "cs uses '$key'          (the undifferentiated list, if the split found nothing)" \
+         "cs seam '$key'          (which repos share it at all, comments included)"
+    return $CS_EXIT_NO_HITS
+  fi
+
+  err_f=$(cs_tmp cs-values)
+  out=$(printf '%s\n' "$hits" | python3 "$lib_dir/config_values.py" "$view" "$key" 2>"$err_f"); rc=$?
+  if [[ "$rc" -gt 1 ]]; then
+    rm -f "$err_f"
+    die "cs values: config_values.py exited $rc, so nothing was classified
+  the hits were found and then not read -- this is a refusal, not an empty
+  answer, and nothing here is ruled out
+  weaker but available now: cs uses '$key'"
+  fi
+  if [[ -z "$out" ]]; then
+    rm -f "$err_f"
+    engines_ok_or_die values
+    report_answer 0 0
+    return $CS_EXIT_NO_HITS
+  fi
+
+  # Capped PER KIND, for the reason cs fields caps per kind: the two sides are
+  # heavily unequal in either direction (10 set / 4 read for one key, 1 / 26 for
+  # another), so one budget over the combined stream would spend itself on
+  # whichever side happens to be larger and truncate the other away entirely.
+  emit_two_kinds ': \[set\]' ': \[read\]' "$out"
+
+  cat "$err_f" >&2
+  rm -f "$err_f"
+  warn "the two sides are told apart by FILE KIND, not by dataflow: a code file that SETS the key at runtime is counted as a read site here, and a manifest that only documents it is counted as a set site"
+  warn "a set-site's literal is what the file SAYS. It is not what the process receives: an env var, a later overlay, or a values file merged on top can replace it, and none of that is visible to a text sweep."
+  report_answer "$(n_hits_in "$out")" "$(n_repos_in "$out")"
 }
 
 cmd_refs() {
@@ -3926,8 +4426,19 @@ source_only=0
 count_mode=0
 # cs constructs only: which field to mark present/ABSENT on each site.
 construct_field=""
-# cs gaps only: print the clone commands that would close the gap.
+# cs gaps only: print the clone commands that would close the gap. A SUGGESTION
+# IS A DEFAULT, AND DEFAULTS GET FOLLOWED, so it defaults to the application-code
+# half only -- the same half the verb's own warning says is the right one. The
+# config-only repos are still printed, under their own heading, because "this
+# matched but is probably not worth cloning" is a finding too; they are just not
+# in the block a reader can paste. --suggest-clone=all restores the old
+# behaviour for anyone who wants it.
+#
+# The asymmetry is why this is not tidiness: cloning too little leaves a blind
+# spot that surfaces as a false negative, while cloning too much degrades every
+# refresh and every graph sync for everyone, and is never revisited.
 suggest_clone=0
+suggest_clone_all=0
 # Env as well as a flag: a caller wrapping cs in a script it does not control
 # can set CS_JSON=1 once rather than threading a flag through every call site.
 case "${CS_JSON:-0}" in 1|true|yes) porcelain=1 ;; esac
@@ -3953,6 +4464,11 @@ for a in "$@"; do
     --count) count_mode=1 ;;
     --field=*) construct_field="${a#--field=}" ;;
     --suggest-clone) suggest_clone=1 ;;
+    --suggest-clone=code) suggest_clone=1 ;;
+    --suggest-clone=all) suggest_clone=1; suggest_clone_all=1 ;;
+    --suggest-clone=*) die "--suggest-clone takes 'code' (the default) or 'all', not '${a#--suggest-clone=}'
+  code: only the repos matched from application code
+  all:  every matched repo, including the ones matched only in config or docs" ;;
     *) args+=("$a") ;;
   esac
 done
@@ -4003,6 +4519,8 @@ case "$sub" in
   fields)  cmd_fields "$@" ;;
   constructs) cmd_constructs "$@" ;;
   strictness) cmd_strictness "$@" ;;
+  values)  cmd_values "$@" ;;
+  resilience) cmd_resilience "$@" ;;
   gaps)    cmd_gaps "$@" ;;
   refs)    cmd_refs "$@" ;;
   history) cmd_history "$@" ;;

@@ -869,11 +869,18 @@ rm -rf "$brokenlib"
 # WITH hits answered normally — so on a real 37-repo fleet with two broken
 # symlinks in someone else's repo, no negative result was obtainable at all.
 #
+# There are then THREE conditions here, not two, and the third is what the rest
+# of this block is about:
+#
+#   engine timeout                     not deterministic   PARTIAL
+#   unreadable: permission denied      not deterministic   PARTIAL
+#   dangling symlink committed to it   DETERMINISTIC       not PARTIAL
+#
 # A committed symlink whose target does not exist on this machine is near
 # universal on multi-repo checkouts, which is why it is seeded here rather than
 # left to chance. Seeded and removed in-place, like the .github parity probe:
-# baking it into build-fixtures would attach a PARTIAL warning to every other
-# check in this file.
+# baking it into build-fixtures would attach a warning to every other check in
+# this file.
 info ""
 info "${C_BOLD}unreadable files${C_OFF}"
 dangle_repo="$FLEET_ROOT/inventory-api-dotnet"
@@ -882,24 +889,63 @@ ln -sf ../../nonexistent/import "$dangle_repo/src/import"
 
 # The headline: a negative must still be obtainable.
 dang_out=$("$here/cs" uses 'cs-absent-probe-dangling-xyzzy' 2>&1); dang_rc=$?
-if [[ $dang_rc -eq 2 ]] && printf '%s' "$dang_out" | grep -q 'PARTIAL'; then
-  ok "a dangling symlink yields a PARTIAL zero-hit answer, not a refusal"
+if [[ $dang_rc -eq 2 ]] && printf '%s' "$dang_out" | grep -q 'dangling symlink'; then
+  ok "a dangling symlink yields a zero-hit answer, not a refusal"
   pass=$((pass + 1))
 elif [[ $dang_rc -eq 1 ]]; then
   err "one unreadable file made a zero-hit query refuse (exit 1)"
   fail=$((fail + 1)); failed_ids+=("unreadable-refuses")
 else
-  err "a dangling symlink produced exit $dang_rc with no PARTIAL warning"
-  fail=$((fail + 1)); failed_ids+=("unreadable-not-partial")
+  err "a dangling symlink produced exit $dang_rc with no disclosure"
+  fail=$((fail + 1)); failed_ids+=("unreadable-not-disclosed")
 fi
 
-# Counted is not enough: two broken symlinks cannot hide a symbol, a skipped
-# directory of 400 files might, and only the paths let a reader tell them apart.
-if printf '%s' "$dang_out" | grep -q 'CLAUDE.local.md'; then
-  ok "the skipped paths are named, not merely counted"; pass=$((pass + 1))
+# The severity, which is the whole of #38. PARTIAL is the line that says "your
+# negative is weak"; it only works if it is rare, and a committed dangling
+# symlink makes it fire on 100% of a fleet's answers forever. A rerun cannot
+# change one, so it says nothing about whether this search finished.
+if printf '%s' "$dang_out" | grep -q 'PARTIAL'; then
+  err "a committed dangling symlink was reported as PARTIAL — it is deterministic, so a rerun cannot change it"
+  fail=$((fail + 1)); failed_ids+=("dangling-marked-partial")
 else
-  err "skipped files were counted but not named"
-  fail=$((fail + 1)); failed_ids+=("unreadable-unnamed")
+  ok "a dangling symlink is disclosed without claiming the result is PARTIAL"
+  pass=$((pass + 1))
+fi
+
+# Disclosed, but ONCE for the fleet rather than on every answer: repeating the
+# same two paths verbatim in every response is most of the noise that taught
+# readers to skip the block. cs engines owns fleet health, so it names them.
+# Captured first, then tested. Piping `cs engines` into `grep -q` under
+# `set -o pipefail` reports FAILURE ON SUCCESS -- grep exits at its first match
+# and cs dies of SIGPIPE mid-write -- which is the hazard the timeout probe
+# above already documents the hard way.
+dang_engines=$("$here/cs" engines 2>&1 || true)
+if matches "$dang_out" 'CLAUDE\.local\.md'; then
+  err "a per-answer result reprinted the dangling paths instead of counting them"
+  fail=$((fail + 1)); failed_ids+=("dangling-paths-per-answer")
+elif matches "$dang_engines" 'CLAUDE\.local\.md'; then
+  ok "the dangling paths are named once by cs engines, and counted per answer"
+  pass=$((pass + 1))
+else
+  err "the dangling paths are counted but named nowhere — cs engines must list them"
+  fail=$((fail + 1)); failed_ids+=("dangling-unnamed")
+fi
+
+# The envelope keeps the two apart as data, not only as prose: a caller that
+# branches on `partial` must not be tripped by a corpus property.
+dang_json=$("$here/cs" uses 'cs-absent-probe-dangling-xyzzy' --porcelain --quiet 2>/dev/null)
+if printf '%s' "$dang_json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["partial"] is False, "a dangling symlink set partial in the envelope"
+assert any("CLAUDE.local.md" in p for p in d["corpus_skipped"]), d["corpus_skipped"]
+assert not d["skipped"], d["skipped"]
+' 2>/dev/null; then
+  ok "the envelope separates corpus_skipped from skipped, and neither sets partial here"
+  pass=$((pass + 1))
+else
+  err "the porcelain envelope folds a corpus property into skipped/partial"
+  fail=$((fail + 1)); failed_ids+=("dangling-envelope")
 fi
 
 # A negative has to mean the same thing whichever backend is installed.
@@ -909,10 +955,11 @@ if [[ -x "$(command -v rg 2>/dev/null || true)" ]]; then
   for eng in ripgrep grep; do
     o=$(CS_TEXT_ENGINE=$eng "$here/cs" uses 'cs-absent-probe-dangling-xyzzy' 2>&1); r=$?
     [[ $r -eq 2 ]] || dang_bad+=("$eng:exit$r")
-    printf '%s' "$o" | grep -q 'CLAUDE.local.md' || dang_bad+=("$eng:silent")
+    printf '%s' "$o" | grep -q '2 dangling symlink' || dang_bad+=("$eng:silent")
+    printf '%s' "$o" | grep -q 'PARTIAL' && dang_bad+=("$eng:partial")
   done
   if [[ ${#dang_bad[@]} -eq 0 ]]; then
-    ok "both backends report the skipped file on the same fleet"; pass=$((pass + 1))
+    ok "both backends report the same dangling-symlink count on the same fleet"; pass=$((pass + 1))
   else
     err "backends disagree about skipped files: ${dang_bad[*]}"
     fail=$((fail + 1)); failed_ids+=("unreadable-backend-parity")
@@ -926,26 +973,41 @@ fi
 refuses "a bad regex still refuses even with unreadable files present" "engine failed\|regex" \
   "$here/cs" text 'foo['
 
-# And a query that DOES find things still says the answer is incomplete.
+# ---- and the RETRYABLE half still says PARTIAL, on an answer with hits -----
+# The separation above is only safe if the other half is untouched. A file the
+# process cannot open is not deterministic -- it depends on this machine, this
+# user, this moment -- so it stays PARTIAL, and stays PARTIAL on a query that
+# found plenty, which is where a subset most easily reads as the whole truth.
 #
 # Only asserted on the ripgrep backend, and that asymmetry is deliberate: rg
 # names the unreadable file in its own stderr, so cs gets this for free, while
 # recursive grep says nothing and cs has to walk the fleet to find out. That
 # walk is run only when the query found nothing -- a negative is where a silent
 # skip becomes a false "this is dead", and a result WITH hits already gives the
-# reader something to look at. Paying for a second filesystem walk on every
-# grep query that already has an answer is not worth it.
-if have_rg_binary_here; then
+# reader something to look at.
+unreadable_file="$dangle_repo/src/cs-unreadable-probe.cs"
+printf '// orders.reserved.v1\n' > "$unreadable_file"
+chmod 000 "$unreadable_file" 2>/dev/null || true
+if ! have_rg_binary_here; then
+  skip "partial-with-hits" "no ripgrep binary; grep reports skips only on a negative"
+elif head -c1 "$unreadable_file" >/dev/null 2>&1; then
+  # Running as root, or on a filesystem that ignores the mode bits. There is no
+  # unreadable file to test with, and asserting anyway would fail for a reason
+  # that has nothing to do with cs.
+  skip "partial-with-hits" "this user can read a mode-000 file (root?)"
+else
   dang_hits=$(CS_TEXT_ENGINE=ripgrep "$here/cs" seam 'orders.reserved.v1' 2>&1); dang_hrc=$?
-  if [[ $dang_hrc -eq 0 ]] && printf '%s' "$dang_hits" | grep -q 'PARTIAL'; then
-    ok "a result with hits still reports the skipped files"; pass=$((pass + 1))
+  if [[ $dang_hrc -eq 0 ]] && printf '%s' "$dang_hits" | grep -q 'PARTIAL' \
+     && printf '%s' "$dang_hits" | grep -q 'cs-unreadable-probe.cs'; then
+    ok "an unreadable file still makes a result WITH hits PARTIAL, and is named"
+    pass=$((pass + 1))
   else
     err "a partial result with hits did not say it was partial (exit $dang_hrc)"
     fail=$((fail + 1)); failed_ids+=("unreadable-hits-partial")
   fi
-else
-  skip "partial-with-hits" "no ripgrep binary; grep reports skips only on a negative"
 fi
+chmod 644 "$unreadable_file" 2>/dev/null || true
+rm -f "$unreadable_file"
 
 rm -f "$dangle_repo/CLAUDE.local.md" "$dangle_repo/src/import"
 
@@ -2416,6 +2478,197 @@ rm -rf "$nohash"
 # The constant-path index the old code wrote, in case this machine has one.
 rm -f "${TMPDIR:-/tmp}/cs-tags-.tags"
 
+# ---- cs values: the two sides of a config key ------------------------------
+# cs fields split a field into writes and reads, and that split was the whole
+# value. A config key has the same two sides -- except they sit across a REPO
+# BOUNDARY, and cs uses returns them in one undifferentiated list.
+#
+# The motivating finding: a cross-repo pair, both halves unusually well verified
+# in isolation, with the defect exactly between them because the producer gated
+# on specific tokens and the consumer passed a group-level name that was never
+# one of them. Neither side's tests could see it; nothing in either diff could.
+info ""
+info "${C_BOLD}cs values${C_OFF}"
+mkdir -p "$FLEET_ROOT/inventory-api-dotnet/deploy" "$FLEET_ROOT/web-monorepo-node/charts"
+printf 'env:\n  VALPROBE_SELECTOR: alpha\n' \
+  > "$FLEET_ROOT/inventory-api-dotnet/deploy/valprobe-dev.yaml"
+printf 'env:\n  VALPROBE_SELECTOR: "alpha,beta"\n' \
+  > "$FLEET_ROOT/inventory-api-dotnet/deploy/valprobe-prod.yaml"
+printf 'VALPROBE_SELECTOR: group-name\n' \
+  > "$FLEET_ROOT/web-monorepo-node/charts/valprobe.yaml"
+printf 'VALPROBE_SELECTOR: "{{ .Values.tier }}"\n' \
+  > "$FLEET_ROOT/web-monorepo-node/charts/valprobe-tmpl.yaml"
+cat > "$FLEET_ROOT/checkout-service-kotlin/src/main/kotlin/com/acme/checkout/ValProbe.kt" <<'PROBE'
+package com.acme.checkout
+
+object ValProbe {
+    fun resolve(env: Map<String, String>): Int =
+        when (env["VALPROBE_SELECTOR"]) {
+            "alpha" -> 1
+            "beta" -> 2
+            "gamma" -> 3
+            else -> 0
+        }
+}
+PROBE
+printf '# VALPROBE_SELECTOR picks the tier.\n' \
+  > "$FLEET_ROOT/pricing-lib-java/VALPROBE.md"
+
+val_out=$("$here/cs" values VALPROBE_SELECTOR --fleet 2>&1); val_rc=$?
+# The split itself, which is the cheap version and most of the value: manifests
+# SET, code READS, and a README does neither.
+if [[ $val_rc -eq 0 ]] \
+   && matches "$val_out" 'valprobe-dev\.yaml:[0-9]+: \[set\] "alpha"' \
+   && matches "$val_out" 'ValProbe\.kt:[0-9]+: \[read\]' \
+   && matches "$val_out" 'VALPROBE\.md:[0-9]+: \[doc\]'; then
+  ok "cs values splits a config key into set-sites, read-sites and mentions"
+  pass=$((pass + 1))
+else
+  err "cs values did not split the two sides of a config key (exit $val_rc)"
+  fail=$((fail + 1)); failed_ids+=("values-split")
+fi
+
+# THE finding. Everything else in the answer is context: a value that is SET and
+# that no read site accepts is the mismatch nobody's tests can see. Asserted on
+# the RESULT LINE as well as the summary, because over a machine interface the
+# summary is on stderr and the result stream is all a caller gets.
+if matches "$val_out" 'group-name.*NOT accepted by any read site' \
+   && matches "$val_out" 'SET but not accepted'; then
+  ok "a value set by one repo and accepted by no reader is reported as a finding"
+  pass=$((pass + 1))
+else
+  err "cs values did not flag a set value that no read site accepts"
+  fail=$((fail + 1)); failed_ids+=("values-mismatch-finding")
+fi
+
+# A list value satisfies the read side when every TOKEN is accepted -- otherwise
+# every comma-separated setting would be a false finding, and a verb that cries
+# wolf on correct configuration is worse than no verb.
+if ! matches "$val_out" 'alpha,beta.*NOT accepted'; then
+  ok "a comma-separated value is checked token by token, not as one string"
+  pass=$((pass + 1))
+else
+  err "a list value whose tokens are all accepted was reported as a mismatch"
+  fail=$((fail + 1)); failed_ids+=("values-list-tokens")
+fi
+
+# A templated set-site is reported AS templated, never resolved and never
+# compared: naming which sites are opaque is the useful part, because those are
+# the ones a human has to open.
+if matches "$val_out" 'valprobe-tmpl\.yaml:[0-9]+: \[set\] \(templated\)' \
+   && ! matches "$val_out" 'valprobe-tmpl.*NOT accepted'; then
+  ok "a templated value is named as templated, not resolved or compared"
+  pass=$((pass + 1))
+else
+  err "a templated set-site was resolved or compared as if it were a literal"
+  fail=$((fail + 1)); failed_ids+=("values-templated")
+fi
+
+# And the restraint that keeps the finding trustworthy: when the read side is
+# not enumerable, the mismatch line must NOT fire. A guessed enumeration would
+# turn this into a generator of false findings about values that are fine.
+cat > "$FLEET_ROOT/checkout-service-kotlin/src/main/kotlin/com/acme/checkout/ValProbe.kt" <<'PROBE'
+package com.acme.checkout
+
+object ValProbe {
+    fun resolve(env: Map<String, String>): List<String> =
+        env["VALPROBE_SELECTOR"].orEmpty().split(",").map { it.trim() }
+}
+PROBE
+undet_out=$("$here/cs" values VALPROBE_SELECTOR --fleet 2>&1)
+if matches "$undet_out" 'accepts: UNDETERMINABLE' \
+   && ! matches "$undet_out" 'SET but not accepted'; then
+  ok "an unenumerable read side reports UNDETERMINABLE and asserts no mismatch"
+  pass=$((pass + 1))
+else
+  err "cs values invented an enumeration the read side does not support"
+  fail=$((fail + 1)); failed_ids+=("values-undeterminable")
+fi
+
+rm -f "$FLEET_ROOT/inventory-api-dotnet/deploy/valprobe-dev.yaml" \
+      "$FLEET_ROOT/inventory-api-dotnet/deploy/valprobe-prod.yaml" \
+      "$FLEET_ROOT/web-monorepo-node/charts/valprobe.yaml" \
+      "$FLEET_ROOT/web-monorepo-node/charts/valprobe-tmpl.yaml" \
+      "$FLEET_ROOT/checkout-service-kotlin/src/main/kotlin/com/acme/checkout/ValProbe.kt" \
+      "$FLEET_ROOT/pricing-lib-java/VALPROBE.md"
+
+# ---- cs resilience: who can even OBSERVE an error contract ------------------
+# cs strictness answers "who REJECTS an added field". This is the second
+# question with the same shape: a field added to an ERROR body is invisible to a
+# caller that raises on the status and never touches the payload, and a retried
+# request is a different failure mode from a rejected one. Across a 43-repo
+# fleet: raise_for_status in 323 files, tenacity in 219.
+info ""
+info "${C_BOLD}cs resilience${C_OFF}"
+cat > "$FLEET_ROOT/fulfillment-worker-python/fulfillment/resprobe.py" <<'PROBE'
+import requests
+from tenacity import retry
+
+
+@retry
+def fetch(url):
+    response = requests.get(url)
+    response.raise_for_status()
+    return response.json()
+PROBE
+cat > "$FLEET_ROOT/kit-service-python/kit_service/resprobe.py" <<'PROBE'
+import requests
+
+
+def fetch(url):
+    response = requests.get(url)
+    if response.status_code >= 400:
+        return {"error": response.json()}
+    return response.json()
+PROBE
+
+res_out=$("$here/cs" resilience --fleet 2>&1); res_rc=$?
+# The three states that decide an impact review, and the third is the one that
+# turns a producer-side contract into a no-op.
+if [[ $res_rc -eq 0 ]] \
+   && matches "$res_out" 'fulfillment-worker-python: RETRIES, BODY DISCARDED' \
+   && matches "$res_out" 'kit-service-python: READS ERROR BODY'; then
+  ok "cs resilience tells reading the error body from discarding and retrying"
+  pass=$((pass + 1))
+else
+  err "cs resilience did not classify the error posture (exit $res_rc)"
+  fail=$((fail + 1)); failed_ids+=("resilience-verdicts")
+fi
+
+# UNKNOWN is not "reads it", for the same reason UNKNOWN is not LENIENT in
+# cs strictness: undetermined is not safe, and collapsing the two manufactures
+# exactly the false comfort this family of verbs exists to avoid.
+if matches "$res_out" 'UNKNOWN' && matches "$res_out" "UNKNOWN is not 'reads it'"; then
+  ok "UNKNOWN is reported as undetermined, not folded into an attentive verdict"
+  pass=$((pass + 1))
+else
+  err "cs resilience did not keep UNKNOWN distinct from reading the error body"
+  fail=$((fail + 1)); failed_ids+=("resilience-unknown-distinct")
+fi
+
+# The blind spot it cannot see, named in every answer: an infrastructure-layer
+# retry produces the same observable behaviour with nothing in the repo to find.
+if matches "$res_out" 'INFRASTRUCTURE layer'; then
+  ok "cs resilience names the retry layer it cannot see"; pass=$((pass + 1))
+else
+  err "cs resilience answered without naming its infrastructure blind spot"
+  fail=$((fail + 1)); failed_ids+=("resilience-infra-caveat")
+fi
+
+# The per-repo mode is what a MIXED or discarding repo is actually reviewed
+# against -- a roll-up is a summary, and the decisions it feeds are per client.
+res_one=$("$here/cs" resilience fulfillment-worker-python --fleet 2>&1)
+if matches "$res_one" 'resprobe\.py:[0-9]+: raise_for_status' \
+   && matches "$res_one" 'resprobe\.py:[0-9]+: retry configured'; then
+  ok "the per-repo mode lists the sites behind the verdict"; pass=$((pass + 1))
+else
+  err "cs resilience <repo> did not list its per-site evidence"
+  fail=$((fail + 1)); failed_ids+=("resilience-per-repo-evidence")
+fi
+
+rm -f "$FLEET_ROOT/fulfillment-worker-python/fulfillment/resprobe.py" \
+      "$FLEET_ROOT/kit-service-python/kit_service/resprobe.py"
+
 # ---- cs gaps: the corpus bound ---------------------------------------------
 # Every other guard here is about whether the SEARCH was sound. This is the one
 # dishonest negative none of them can catch: a fleet holding 43 of an org's 365
@@ -2476,6 +2729,62 @@ if [[ $gaps_rc -eq 0 ]] \
 else
   err "cs gaps did not bound the negative correctly (exit $gaps_rc)"
   fail=$((fail + 1)); failed_ids+=("gaps-subtract-and-classify")
+fi
+
+# --suggest-clone is a DEFAULT, and defaults get followed. It used to emit a
+# clone command for every matched repo, including the CHANGELOG and docs rows --
+# contradicting the warning printed three lines above it in the same answer, and
+# doing so in the expensive direction: cloning too little leaves a blind spot
+# that shows up as a false negative, while cloning too much degrades every fleet
+# refresh and graph sync for everyone and is never revisited.
+sc_out=$(CS_ORG=acme CS_FORGE_BIN="$gaps_bin/forge-ok" "$here/cs" gaps reservationId --fleet --suggest-clone 2>&1)
+sc_clones=$(printf '%s\n' "$sc_out" | grep 'clone <forge-url>' || true)
+if matches "$sc_clones" 'orders-client' && ! matches "$sc_clones" 'infra-manifests' \
+   && matches "$sc_out" 'probably not worth cloning'; then
+  ok "--suggest-clone suggests the application-code half and lists the rest apart"
+  pass=$((pass + 1))
+else
+  err "--suggest-clone offered to clone a repo that matched only in config or docs"
+  printf '%s\n' "$sc_clones" | sed 's/^/    /' >&2
+  fail=$((fail + 1)); failed_ids+=("gaps-suggest-clone-config-only")
+fi
+
+# …and the opt-in that restores the old behaviour for anyone who wants it.
+sca_out=$(CS_ORG=acme CS_FORGE_BIN="$gaps_bin/forge-ok" "$here/cs" gaps reservationId --fleet --suggest-clone=all 2>&1)
+sca_clones=$(printf '%s\n' "$sca_out" | grep 'clone <forge-url>' || true)
+if matches "$sca_clones" 'orders-client' && matches "$sca_clones" 'infra-manifests'; then
+  ok "--suggest-clone=all still offers every matched repo"; pass=$((pass + 1))
+else
+  err "--suggest-clone=all did not restore the unfiltered suggestion list"
+  fail=$((fail + 1)); failed_ids+=("gaps-suggest-clone-all")
+fi
+
+# The flag exists, works, and is in cs-mcp's passthrough allowlist -- and over
+# MCP a caller can only send what the SCHEMA names, so an undeclared flag is the
+# same as an absent one. This is the third time that shape has been filed.
+mcp_sc=$(printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"v","version":"0"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+  | python3 "$here/cs-mcp" 2>/dev/null \
+  | python3 -c '
+import json, sys
+for line in sys.stdin:
+    try:
+        m = json.loads(line)
+    except ValueError:
+        continue
+    tools = (m.get("result") or {}).get("tools")
+    if not tools:
+        continue
+    for t in tools:
+        if t["name"] == "cs_gaps":
+            print(" ".join(sorted(t["inputSchema"]["properties"])))
+' || true)
+if matches "$mcp_sc" 'suggest_clone'; then
+  ok "cs_gaps declares suggest_clone, so an MCP caller can reach it"; pass=$((pass + 1))
+else
+  err "suggest_clone is implemented and plumbed but not declared on cs_gaps (got: $mcp_sc)"
+  fail=$((fail + 1)); failed_ids+=("gaps-mcp-suggest-clone-undeclared")
 fi
 
 # THE rule of this verb: a forge that fails must REFUSE, never report zero. A
@@ -2751,9 +3060,68 @@ PROBE
     fail=$((fail + 1)); failed_ids+=("constructs-disclosure")
   fi
 
+  # The DISCRIMINATING CONTROL, and the one that catches a shape which ignores
+  # its own type argument. A pattern is re-parsed per language, and a grammar
+  # that cannot express `new T(…)` does not reject the pattern -- it parses it
+  # into whatever nodes it does have. In markdown, whose inline content is
+  # opaque, `new T($$$ARGS)` collapsed to roughly "a paragraph with brackets in
+  # it" and matched PROSE: a type existing nowhere in a 43-repo fleet returned
+  # 167 hits, all .md, all tagged [ctor-new] -- the same 167 the real query
+  # returned, 93% of its volume. The seed below is that exact degenerate shape.
+  #
+  # A type that exists nowhere must return NOTHING. Anything else means the
+  # engine, not cs, decided what the query was.
+  cat > "$FLEET_ROOT/fulfillment-worker-python/ctorprose.md" <<'PROSE'
+# Notes
+
+A paragraph mentioning ($$$ cost) and nothing else, about nginx caching.
+PROSE
+  none_out=$("$here/cs" constructs ZzzNoSuchTypeAnywhere --fleet 2>&1)
+  none_hits=$(printf '%s\n' "$none_out" | grep -c '^[^ ].*:[0-9]*: \[' || true)
+  if [[ "$none_hits" -eq 0 ]]; then
+    ok "a type that exists nowhere returns nothing — each shape honours its type argument"
+    pass=$((pass + 1))
+  else
+    err "cs constructs returned $none_hits hit(s) for a type that exists nowhere"
+    printf '%s\n' "$none_out" | grep '^[^ ].*:[0-9]*: \[' | head -5 | sed 's/^/    /' >&2
+    fail=$((fail + 1)); failed_ids+=("constructs-ignores-type-argument")
+  fi
+
+  # Dropped, and SAID so. A silent narrowing is the failure #13 records arriving
+  # from the other side, and the count is what tells a reader the engine
+  # over-matched rather than the corpus being empty.
+  #
+  # Guarded on the seed actually degenerating HERE. Whether a grammar collapses
+  # this pattern is a property of the ast-grep build, so asserting the
+  # disclosure on a version that does not over-match would fail for a reason
+  # that has nothing to do with cs -- the hazard the timeout probe above
+  # documents. If the engine behaves, there is nothing to disclose.
+  ag_prose=$(cd "$FLEET_ROOT" && ast-grep --follow -p 'new ZzzNoSuchTypeAnywhere($$$ARGS)' 2>/dev/null || true)
+  if ! matches "$ag_prose" 'ctorprose\.md'; then
+    skip "constructs over-match disclosure" "this ast-grep does not degenerate the pattern in markdown"
+  elif matches "$none_out" 'engine match\(es\) dropped'; then
+    ok "an engine over-match is discarded and disclosed, not silently swallowed"
+    pass=$((pass + 1))
+  else
+    err "the degenerate markdown match was not reported as dropped"
+    fail=$((fail + 1)); failed_ids+=("constructs-overmatch-undisclosed")
+  fi
+
+  # And the real query is unaffected by the guard: the seeded prose must not
+  # cost CtorProbe any of its three sites.
+  guard_out=$("$here/cs" constructs CtorProbe --fleet --quiet 2>/dev/null || true)
+  if [[ "$(printf '%s\n' "$guard_out" | grep -c 'ctorprobe.py')" -ge 3 ]] \
+     && ! matches "$guard_out" 'ctorprose\.md'; then
+    ok "the guard drops the degenerate match and keeps every real one"
+    pass=$((pass + 1))
+  else
+    err "the type-argument guard changed the real answer"
+    fail=$((fail + 1)); failed_ids+=("constructs-guard-overreach")
+  fi
+  rm -f "$FLEET_ROOT/fulfillment-worker-python/ctorprose.md"
+
   # The blind spots have to be on the ZERO answer too. That is precisely where
   # "no construction sites" gets read as "nothing builds this".
-  none_out=$("$here/cs" constructs ZzzNoSuchTypeAnywhere --fleet 2>&1)
   if printf '%s' "$none_out" | grep -q 'shapes NOT searched'; then
     ok "a zero-hit construct answer still names what it did not search"
     pass=$((pass + 1))
@@ -2901,6 +3269,88 @@ fi
 rm -rf "$FLEET_ROOT/web-monorepo-node/compositionprobe" \
        "$FLEET_ROOT/web-monorepo-node/src/compositionprobe.ts" \
        "$FLEET_ROOT/web-monorepo-node/src/__tests__"
+
+# ---- observability definitions are consumers, and they fail silently -------
+# When a workload is renamed or split, the emitted job name is a contract with
+# every SAVED QUERY that names it -- dashboard panels, alert and recording
+# rules. Nothing in a code diff, a chart diff or a symbol graph can see that
+# seam: on one side it is a deployment identifier, on the other a string inside
+# a query expression. A workload split changed a job name, the dashboards and
+# alerts kept querying the old one, and nothing broke loudly -- the panel went
+# flat and the alert never fired again.
+#
+# The corpus is thin (a dozen files on a 43-repo fleet, and much of an estate
+# lives in the platform rather than in git), so this is a LABEL on the answers
+# that already return these files, not a verb.
+info ""
+info "${C_BOLD}observability definitions${C_OFF}"
+mkdir -p "$FLEET_ROOT/web-monorepo-node/dashboards" "$FLEET_ROOT/checkout-service-kotlin/alerts"
+cat > "$FLEET_ROOT/web-monorepo-node/dashboards/obsprobe.json" <<'PROBE'
+{
+  "schemaVersion": 39,
+  "panels": [
+    { "targets": [ { "expr": "sum(rate(http_total{job=\"ObsProbeToken\"}[5m]))" } ] }
+  ]
+}
+PROBE
+cat > "$FLEET_ROOT/checkout-service-kotlin/alerts/obsprobe.yaml" <<'PROBE'
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+spec:
+  groups:
+    - name: probe
+      rules:
+        - alert: ObsProbeDown
+          expr: up{job="ObsProbeToken"} == 0
+PROBE
+printf 'const OBS = "ObsProbeToken";\n' > "$FLEET_ROOT/web-monorepo-node/src/obsprobe.ts"
+
+obs_out=$("$here/cs" uses ObsProbeToken --fleet 2>&1)
+# The tag, in the shape cs constructs already uses, so a reader scanning a
+# rename's blast radius sees a saved query is implicated instead of inferring
+# it from a file path.
+if matches "$obs_out" 'obsprobe\.json:[0-9]+: \[dashboard\]' \
+   && matches "$obs_out" 'obsprobe\.yaml:[0-9]+: \[alert rule\]' \
+   && matches "$obs_out" 'SAVED QUERIES, not code'; then
+  ok "dashboard panels and alert rules are labelled in a text answer"
+  pass=$((pass + 1))
+else
+  err "an observability definition arrived as an undifferentiated hit"
+  fail=$((fail + 1)); failed_ids+=("observability-unlabelled")
+fi
+
+# Classified by CONTENT, not by path: a dashboard lives wherever someone put it,
+# and `dashboards/` is a convention rather than a rule. A .json in the same
+# directory that is NOT a saved query must not pick up the label.
+printf '{"name":"ObsProbeToken","version":"1"}\n' \
+  > "$FLEET_ROOT/web-monorepo-node/dashboards/notadashboard.json"
+obs_content=$("$here/cs" uses ObsProbeToken --fleet 2>&1)
+if ! matches "$obs_content" 'notadashboard\.json:[0-9]+: \['; then
+  ok "the label is content-based: a plain .json under dashboards/ is not tagged"
+  pass=$((pass + 1))
+else
+  err "an ordinary .json was labelled an observability definition by its path"
+  fail=$((fail + 1)); failed_ids+=("observability-path-guess")
+fi
+rm -f "$FLEET_ROOT/web-monorepo-node/dashboards/notadashboard.json"
+
+# THE trap this closes. A Grafana dashboard is a .json, which the data/doc list
+# drops -- and an impact question is exactly the question a caller reaches for
+# --source-only to ask. The flag is meant to remove fixtures and logs, not
+# consumers.
+obs_src=$("$here/cs" uses ObsProbeToken --fleet --source-only 2>&1)
+if matches "$obs_src" 'obsprobe\.json:[0-9]+: \[dashboard\]' \
+   && matches "$obs_src" 'observability definition'; then
+  ok "--source-only keeps observability definitions, and says that it did"
+  pass=$((pass + 1))
+else
+  err "--source-only silently dropped a dashboard, which is a consumer of the identifier"
+  fail=$((fail + 1)); failed_ids+=("source-only-drops-observability")
+fi
+
+rm -rf "$FLEET_ROOT/web-monorepo-node/dashboards" \
+       "$FLEET_ROOT/web-monorepo-node/src/obsprobe.ts" \
+       "$FLEET_ROOT/checkout-service-kotlin/alerts"
 
 # ---- porcelain -------------------------------------------------------------
 # The exit code separated a refusal from an honest zero; everything else needed

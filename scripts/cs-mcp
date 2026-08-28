@@ -155,7 +155,10 @@ SOURCE_ONLY_ARG = arg(
     "source_only",
     "Exclude data and doc files (.csv .json .txt .tsv .lock .log .rst .md) from "
     "the hits. Off by default, because a route in an appsettings.json is a real "
-    "seam. Composition is reported either way.",
+    "seam. Composition is reported either way. Observability definitions "
+    "(dashboard panels, alert and recording rules) are kept even when their "
+    "extension is on that list — they are consumers of an identifier, and this "
+    "flag is what an impact question is asked with.",
     required=False,
     type_="boolean",
 )
@@ -300,6 +303,33 @@ TOOLS = [
       arg("repo", "Limit to this repo, and list its per-model evidence "
                   "instead of the roll-up.", required=False)]),
 
+    # The other half of the same review, and the one a search verb cannot
+    # answer: not "who rejects an added field" but "who can even OBSERVE one".
+    ("cs_resilience", "resilience",
+     "What each repo does on a non-2xx: READS ERROR BODY / DISCARDS / RETRIES, "
+     "BODY DISCARDED / MIXED / UNKNOWN per repo. Use when changing an ERROR "
+     "shape or adding a partial-failure field: a caller that raises on the "
+     "status and retries never sees the body, so the contract is a no-op for "
+     "it and nothing errors. UNKNOWN means undetermined, not attentive.",
+     [SCOPE_ARG,
+      arg("repo", "Limit to this repo, and list its per-site evidence instead "
+                  "of the roll-up.", required=False)]),
+
+    # The same read/write split cs_fields makes, applied to a config key and
+    # therefore ACROSS a repo boundary -- which is where the mismatch hides,
+    # because the two sides live in different file kinds and no single sweep
+    # can tell you whether their literals agree.
+    ("cs_values", "values",
+     "Which repos SET a config key or env var, with what literal values, and "
+     "which repos READ it — split into set-sites and read-sites the way "
+     "cs_fields splits a field. Use for a config key instead of cs_uses: the "
+     "failure is a VALUE MISMATCH across the seam, not a missing reference, "
+     "and an undifferentiated list hides it. Reports which set values no read "
+     "site accepts, but only when the read side is genuinely enumerable.",
+     [arg("key", "The config key or environment variable name."),
+      SCOPE_ARG,
+      arg("repo", "Limit to this repo directory name.", required=False)]),
+
     # The CORPUS bound, not a search result. The only tool here that needs
     # network, and the only one whose absence leaves a question unanswerable
     # rather than answered worse.
@@ -309,7 +339,19 @@ TOOLS = [
      "a repo that was never cloned cannot be searched by any query. Needs a "
      "forge CLI and network, and refuses rather than degrading to a fleet-only "
      "answer.",
-     [arg("query", "The string to search for org-wide."), SCOPE_ARG]),
+     [arg("query", "The string to search for org-wide."),
+      SCOPE_ARG,
+      # #24 again, and the third time this shape has been filed: the flag was
+      # implemented, worked on the CLI, and was already in the passthrough
+      # allowlist -- only this declaration was missing, and over MCP an
+      # undeclared flag is the same as an absent one, because a caller can only
+      # send what the schema names.
+      arg("suggest_clone",
+          "Also print the clone command for each repo the fleet is missing — "
+          "the application-code matches only, which is the half the answer's "
+          "own warning says is worth cloning. Config-only matches are still "
+          "listed, under a separate heading, without a clone command.",
+          required=False, type_="boolean")]),
 
     ("cs_refs", "refs",
      "What references this symbol, resolved by a language server — bridges "
@@ -730,6 +772,8 @@ def call_tool(name, arguments):
         flags.append("--source-only")
     if arguments.get("count"):
         flags.append("--count")
+    if arguments.get("suggest_clone"):
+        flags.append("--suggest-clone")
     # A value flag, not a boolean: cs constructs takes --field=<name>.
     if arguments.get("field_name"):
         flags.append("--field=" + str(arguments["field_name"]))

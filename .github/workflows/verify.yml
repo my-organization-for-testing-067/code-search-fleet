@@ -26,6 +26,29 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The gate below diffs against the base of the change, so the history
+          # has to be there. The default shallow clone has one commit and no
+          # merge base, and the check would report "nothing to compare".
+          fetch-depth: 0
+
+      # Before the engines are installed, because it needs none of them and a
+      # version that cannot reach its users is a shipping failure whatever the
+      # suites say. Ten commits and four new verbs once went out under an
+      # unchanged version string: the marketplace cache held the old artifact,
+      # `claude plugin update` correctly said "already at the latest version",
+      # and comparing version strings -- the usual way to debug that -- said
+      # the two matched.
+      - name: Check the plugin version moved with the shipped files
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          [ -n "$base" ] || base="${{ github.event.before }}"
+          case "$base" in ""|0000000000000000000000000000000000000000) base="" ;; esac
+          if [ -n "$base" ] && git cat-file -e "$base^{commit}" 2>/dev/null; then
+            ./scripts/check-version-bump "$(git merge-base HEAD "$base")"
+          else
+            ./scripts/check-version-bump
+          fi
 
       # Best-effort by design. Every engine here is OPTIONAL -- cs routes around
       # whatever is missing, verify-engines reports it as MISSING rather than
