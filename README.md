@@ -943,7 +943,7 @@ blind spots, verification.
 This repo is its own marketplace:
 
 ```sh
-claude plugin marketplace add my-organization-for-testing-067/code-search-fleet
+claude plugin marketplace add agent-toolworks/code-search-fleet
 claude plugin install code-search@code-search-fleet
 ```
 
